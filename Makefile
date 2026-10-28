@@ -149,7 +149,7 @@ run: all
 new-env:
 	@test -n "$(NAME)" || { echo "Usage: make new-env NAME=<name>"; exit 1; }
 	@test ! -e env/$(NAME) || { echo "env/$(NAME) already exists"; exit 1; }
-	cp -R env/sample env/$(NAME)
+	cp -R env/demo env/$(NAME)
 	@echo ""
 	@echo "Created env/$(NAME) from the sample template."
 	@echo " env/$(NAME)/chiffon.conf: edit this file to configure the environment (ARCH, DEVICE, FS, SIZE, MBR, CMDLINE)"
