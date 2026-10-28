@@ -85,7 +85,6 @@ OBJ := $(patsubst %.c,$(B)/%.o,$(SRC_K)) $(patsubst %.S,$(B)/%.o,$(SRC_S)) \
        $(patsubst $(BOARD_DIR)/%,$(B)/board/%.o,$(basename $(SRC_B)))
 OBJ := $(sort $(OBJ))
 
-# ---- userland: env/<ENV>/src/*.c -> built with libk.h ("init" -> /sbin/init, others -> /bin/<name>) ----
 # compiler for user programs (override e.g. UCC="clang --target=aarch64-linux-gnu")
 UCC ?= $(CROSS)gcc
 UCFLAGS := -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie -O2 \
@@ -122,7 +121,7 @@ $(B)/%.o: %.S
 	$(CC) $(CFLAGS) -DINITRD_FILE='"$(abspath $(B)/initramfs.cpio)"' -c $< -o $@
 $(B)/kernel/initrd.o: $(B)/initramfs.cpio
 
-$(B)/userland/%: $(ENVDIR)/src/%.c userland/libk.h
+$(B)/userland/%: $(ENVDIR)/src/%.c userland/libchiffon.h
 	@mkdir -p $(dir $@)
 	$(UCC) $(UCFLAGS) -o $@ $<
 
