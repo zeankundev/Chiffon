@@ -9,10 +9,10 @@ else
 endif
 NEEDS_ENV := $(filter-out help new-env new-device clean,$(or $(MAKECMDGOALS),all))
 ifneq ($(NEEDS_ENV),)
-	ifeq ($(wildcard $(ENVDIR)/chiffon.conf),)
-		$(error Environment '$(ENV)' not found. Please run 'make new-env ENV=$(ENV)' first.)
-	endif
-	include $(ENVDIR)/chiffon.conf
+  ifeq ($(wildcard $(ENVDIR)/chiffon.conf),)
+    $(error No environment 'env/$(ENV)/chiffon.conf'. Create one with:  make new-env NAME=$(ENV))
+  endif
+  include $(ENVDIR)/chiffon.conf
 endif
 ARCH   := $(strip $(or $(ARCH),auto))
 ifeq ($(ARCH),auto)
