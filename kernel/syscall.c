@@ -535,6 +535,6 @@ void syscall_dispatch(struct trapframe *tf) {
     check_killed();
 }
 void trap_user_fault(struct trapframe *tf, const char *why, uintptr_t addr, int sig) {
-    kprintf("[chiffon] user fault: pc=%p addr=%p\n", (void *)TF_PC(tf), (void *)TF_FAULT(tf));
+    kprintf("[chiffon] user fault: pid %d, %s at 0x%lx, rip 0x%lx\n", cur->pid, why, addr, TF_PC(tf));
     proc_exit(sig);
 }
