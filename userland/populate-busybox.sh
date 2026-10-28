@@ -3,7 +3,7 @@ ROOT=${1:?usage: populate-busybox.sh ROOTFS}
 BB=${BUSYBOX:-$(command -v busybox || true)}
 [ -n "$BB" ] && [ -f "$BB" ] || { echo "populate-busybox: no BusyBox found. Set BUSYBOX=/path/to/static/busybox (see README)." >&2; exit 1; }
 if command -v readelf >/dev/null 2>&1 && readelf -l "$BB" 2>/dev/null | grep -q INTERP; then
-    echo "populate-busybox: $BB is dynamically linked; Kestrel needs a STATIC BusyBox." >&2; exit 1
+    echo "populate-busybox: $BB is dynamically linked; Chiffon needs a STATIC BusyBox." >&2; exit 1
 fi
 if [ -n "$ARCH" ] && command -v readelf >/dev/null 2>&1; then
     m=$(readelf -h "$BB" 2>/dev/null | sed -n 's/^ *Machine: *//p')

@@ -1,4 +1,4 @@
-/* x86_64 implementation of the Kestrel architecture shim. */
+
 #include "kernel.h"
 
 extern char boot_pml4[];

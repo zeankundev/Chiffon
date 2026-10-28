@@ -1,5 +1,4 @@
-/* aarch64 implementation of the Kestrel CPU/arch shim (EL1, 4 KiB pages, TTBR0 user / TTBR1 kernel).
- * Everything platform-specific (UART, interrupt controller, timer, disk, power) lives in a board. */
+
 #include "kernel.h"
 
 extern char vectors[], trap_return[];
