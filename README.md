@@ -52,8 +52,9 @@ Built-in services: `fb` (info / fill / pan) and `console` (write / size / clear 
   | `bochs-vbe` | `drivers/x86_64/` | QEMU `-vga std` / Bochs / VirtualBox; sets the mode (`video=WxH`, default 1024x768), double-height virtual screen for page flipping |
   | `multiboot-fb` | `drivers/x86_64/` | adopts a linear framebuffer provided by GRUB (`gfxpayload`) |
   | `vga-text` | `drivers/x86_64/` | legacy 80x25 text buffer, used when no graphics framebuffer is available |
-  | `ramfb` | `drivers/aarch64/` | QEMU `virt` via fw_cfg (`-device ramfb`) |
-* Input: `ps2-kbd` (IRQ1, scancode set 1, US layout, arrows / Home / End / F-keys as VT100 sequences)
+  | `ramfb` | `drivers/aarch64/` | QEMU `virt` via fw_cfg (`-device ramfb`); pair with `-device virtio-keyboard-device` for typing |
+* Input: `ps2-kbd` on x86_64 (IRQ1) and `virtio-kbd` on aarch64 (virtio-input over virtio-mmio, polled; QEMU forwards
+  window/VNC keystrokes to it). Both share the key translation in `kernel/kbd.c` (US layout, arrows / Home / End / F-keys as VT100 sequences)
   feeds the same tty line discipline as the serial port, so the on-screen console is fully interactive.
   Serial remains available as a second console.
 

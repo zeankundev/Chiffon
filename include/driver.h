@@ -32,3 +32,6 @@ size_t drivers_dump(char *buf, size_t n);
 #define NIRQ 32
 int  irq_register(unsigned irq, void (*fn)(unsigned irq));
 void irq_dispatch(unsigned irq);
+
+/* keyboard drivers report keys here (kernel/kbd.c): scancode-set-1 numbering, release flag, E0 flag */
+void kbd_scancode(unsigned char sc, int release, int e0);
