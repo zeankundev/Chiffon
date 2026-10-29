@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include "arch.h"
 #include "board.h"
+#include "ipc.h"
 
 typedef long ssize_t;
 typedef long off_t;
@@ -97,7 +98,7 @@ void *krealloc(void *p, size_t n);
 
 enum { P_UNUSED, P_EMBRYO, P_RUNNABLE, P_RUNNING, P_SLEEPING, P_ZOMBIE };
 
-struct vma { uintptr_t start, end; };
+struct vma { uintptr_t start, end; int dev; };   /* dev: maps device memory (never freed to the pmm) */
 struct mm {
     uintptr_t root;
     struct vma vma[NVMA];
@@ -119,6 +120,9 @@ struct proc {
     uint64_t sigh[65];
     struct arch_uctx uctx;
     char name[16];
+    /* IPC: a blocked ipc_call() waits for its reply here */
+    int ipc_waiting, ipc_have_reply, ipc_wait_port;
+    struct chi_ipc_msg ipc_rep;
 };
 extern struct proc *cur;
 extern struct proc ptable[NPROC];
@@ -143,13 +147,14 @@ void init_exited(int wstatus);
 void check_killed(void);
 
 int  mm_map(struct mm *mm, uintptr_t va, size_t len);
+int  mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa);   /* map device memory (e.g. /dev/fb0) */
 void mm_free(struct mm *mm);
 int  mm_unmap(struct mm *mm, uintptr_t va, size_t len);
 int  mm_copyout(struct mm *mm, uintptr_t va, const void *src, size_t len);
 int  uok(uintptr_t va, size_t len);
 int  ustrcpy(char *dst, uintptr_t usrc, size_t max);
 
-enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY };
+enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB };
 struct node {
     char *path; uint32_t mode; int dev;
     uint8_t *data; size_t size, cap; int is_static;
@@ -213,6 +218,7 @@ int  vfs_symlink(const char *target, const char *abs);
 void procfs_refresh(void);
 
 void tty_init(void);
+void console_services_init(void);
 void tty_input(int c);
 void console_poll(void);
 ssize_t tty_read(void *buf, size_t n, int nonblock);
@@ -222,3 +228,9 @@ int  tty_readable(void);
 
 void syscall_dispatch(struct trapframe *tf);
 void trap_user_fault(struct trapframe *tf, const char *why, uintptr_t addr, int sig);
+
+#include "driver.h"
+#include "console.h"
+#include "fb.h"
+#include "vt.h"
+#include "font.h"

@@ -78,7 +78,7 @@ DISKIMG := $(if $(filter initramfs,$(FS)),,$(B)/disk.img)
 DISK    := $(DISKIMG)
 DISKARGS = $(if $(DISK),$(DISKARGS_FMT))
 
-SRC_K := $(wildcard kernel/*.c) $(wildcard arch/$(ARCH)/*.c)
+SRC_K := $(wildcard kernel/*.c) $(wildcard arch/$(ARCH)/*.c) $(wildcard drivers/$(ARCH)/*.c)
 SRC_S := $(wildcard arch/$(ARCH)/*.S) kernel/initrd.S
 SRC_B := $(wildcard $(BOARD_DIR)/*.c) $(wildcard $(BOARD_DIR)/*.S)
 OBJ := $(patsubst %.c,$(B)/%.o,$(SRC_K)) $(patsubst %.S,$(B)/%.o,$(SRC_S)) \
@@ -89,7 +89,7 @@ OBJ := $(sort $(OBJ))
 UCC ?= $(CROSS)gcc
 UCFLAGS := -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie -O2 \
            $(shell $(UCC) -fno-tree-loop-distribute-patterns -E -x c /dev/null -o /dev/null 2>/dev/null && echo -fno-tree-loop-distribute-patterns) \
-           -Wno-unused-command-line-argument -Iuserland
+           -Wno-unused-command-line-argument -Iuserland -Iinclude
 USER_SRC := $(wildcard $(ENVDIR)/src/*.c)
 USER_BIN := $(patsubst $(ENVDIR)/src/%.c,$(B)/userland/%,$(USER_SRC))
 ENV_FILES := $(shell find $(ENVDIR)/rootfs -type f 2>/dev/null) $(wildcard $(ENVDIR)/build.sh)
@@ -146,6 +146,11 @@ run: all
 	@$(if $(QEMU_CMD),,$(error Board '$(DEVICE)' has no QEMU_CMD in $(BOARD_DIR)/board.mk; run the kernel image on your hardware))
 	$(QEMU_CMD) $(if $(CMDLINE),-append "$(CMDLINE)")
 
+# same machine with a graphical window: framebuffer console + PS/2 keyboard (serial stays on this terminal)
+run-gfx: all
+	@$(if $(QEMU_GFX_CMD),,$(error Board '$(DEVICE)' has no QEMU_GFX_CMD in $(BOARD_DIR)/board.mk))
+	$(QEMU_GFX_CMD) $(if $(CMDLINE),-append "$(CMDLINE)")
+
 new-env:
 	@test -n "$(NAME)" || { echo "Usage: make new-env NAME=<name>"; exit 1; }
 	@test ! -e env/$(NAME) || { echo "env/$(NAME) already exists"; exit 1; }
@@ -173,8 +178,9 @@ help:
 	@echo "- make [ENV=demo] : build the kernel and disk image for the given environment (default: demo)"
 	@echo "- make new-env NAME=<name> : create a new environment with the given name"
 	@echo "- make new-device DEVICE=<name> : create a new device for the current environment"
-	@echo "- make run [ENV=demo] : run the kernel in QEMU (if supported by the board)"
+	@echo "- make run [ENV=demo] : run the kernel in QEMU on the serial console (if supported by the board)"
+	@echo "- make run-gfx [ENV=demo] : run the kernel in QEMU with a window (framebuffer console + keyboard)"
 	@echo "- make clean : remove all build artifacts"
 	@echo ""
 	@echo "Environment configuration: env/<ENV>/chiffon.conf"
-.PHONY: all run new-env new-device clean help FORCE
+.PHONY: all run run-gfx new-env new-device clean help FORCE

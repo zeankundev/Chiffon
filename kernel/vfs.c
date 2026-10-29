@@ -205,6 +205,7 @@ ssize_t file_read(struct file *f, void *buf, size_t n) {
     case DEV_NULL: return 0;
     case DEV_ZERO: memset(buf, 0, n); return n;
     case DEV_TTY: return tty_read(buf, n, f->flags & O_NONBLOCK);
+    case DEV_FB: { ssize_t r = fb_read(f->off, buf, n); if (r > 0) f->off += r; return r; }
     }
     if (nd->lazy && node_load(nd)) return -EIO;
     if (f->off >= nd->size) return 0;
@@ -221,6 +222,7 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
     switch (nd->dev) {
     case DEV_NULL: case DEV_ZERO: return n;
     case DEV_TTY: return tty_write(buf, n);
+    case DEV_FB: { ssize_t r = fb_write(f->off, buf, n); if (r > 0) f->off += r; return r; }
     }
     if (f->flags & O_APPEND) f->off = nd->size;
     ssize_t r = node_write(nd, f->off, buf, n);
@@ -354,6 +356,7 @@ void vfs_load_cpio(const void *cpio, size_t size) {
 void vfs_finish(void) {
     mkdev("/dev/console", DEV_TTY); mkdev("/dev/tty", DEV_TTY); mkdev("/dev/ttyS0", DEV_TTY);
     mkdev("/dev/null", DEV_NULL); mkdev("/dev/zero", DEV_ZERO);
+    if (fb_primary()) { mkdev("/dev/fb0", DEV_FB); struct node *fn = node_find("/dev/fb0"); if (fn) fn->size = fb_primary()->info.size; }
     if (!node_find("/dev")) node_create("/dev", S_IFDIR | 0755);
     if (!node_find("/tmp")) node_create("/tmp", S_IFDIR | 01777);
 }

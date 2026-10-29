@@ -9,6 +9,7 @@
 #include "drivers/ns16550_io.h"
 #include "drivers/pic_pit.h"
 #include "drivers/ata_pio.h"
+#include "drivers/x86_platform.h"
 
 #define COM1 0x3F8
 static uintptr_t ram_end;
@@ -20,6 +21,7 @@ void board_early_init(uintptr_t mbi) {
     uint64_t upper_kb = (m[0] & 1) ? m[2] : 64 * 1024;
     ram_end = 0x100000 + upper_kb * 1024;
     if (ram_end > 0xC0000000UL) ram_end = 0xC0000000UL;           /* stay below the PCI hole */
+    mb_fb_boot_info(m);                              /* framebuffer from the bootloader, if any */
     if (m[0] & 4) {
         const char *c = P2V(m[4]);
         size_t i = 0;
@@ -32,11 +34,18 @@ const char *board_cmdline(void) { return cmdline_buf; }
 void board_console_putc(int c) { ns16550_io_putc(COM1, c); }
 int board_console_getc(void) { return ns16550_io_getc(COM1); }
 
-void board_init(void) { pic_pit_init(HZ); kprintf("board: x86_64 %s (PIC/PIT/COM1/ATA)\n", BOARD_NAME); }
+void board_init(void) {
+    pic_pit_init(HZ);
+    driver_note("ns16550", "COM1 serial console 115200 8N1", DRV_CHAR);
+    driver_note("pic-pit", "8259 PIC + 8254 PIT, 100 Hz tick", DRV_MISC);
+    driver_note("ata-pio", "legacy ATA PIO disk (primary master)", DRV_BLOCK);
+    kprintf("board: x86_64 %s (PIC/PIT/COM1/ATA)\n", BOARD_NAME);
+}
 void board_irq(struct trapframe *tf) {
     unsigned v = tf->trapno;
     pic_eoi(v);
     if (v == 32) timer_tick(TF_FROM_USER(tf));
+    else irq_dispatch(v - 32);                       /* drivers registered with irq_register() */
 }
 
 void board_poweroff(void) {

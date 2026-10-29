@@ -25,6 +25,12 @@ void procfs_refresh(void) {
     ksnprintf(buf, sizeof buf, "MemTotal:       %8lu kB\nMemFree:        %8lu kB\nMemAvailable:   %8lu kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n", tot, fr, fr);
     put("/proc/meminfo", buf);
     put("/proc/version", "Chiffon " VERSION " (" ARCH_NAME ")\n");
+    {
+        static char big[2048];
+        drivers_dump(big, sizeof big); put("/proc/drivers", big);
+        ipc_dump(big, sizeof big); put("/proc/ipc", big);
+        fb_dump(big, sizeof big); put("/proc/fb", big);
+    }
 
     int alive[NPROC] = {0};
     for (int i = 0; i < NPROC; i++) {

@@ -7,7 +7,13 @@ SECTIONS
     . = KOFF + LOAD_ADDR;
     .text : AT(ADDR(.text) - KOFF) { KEEP(*(.text.boot)) *(.text .text.*) }
     . = ALIGN(4096);
-    .rodata : AT(ADDR(.rodata) - KOFF) { *(.rodata .rodata.*) . = ALIGN(4096); *(.initrd) }
+    .rodata : AT(ADDR(.rodata) - KOFF) {
+        *(.rodata .rodata.*)
+        . = ALIGN(8);
+        __kdrivers_start = .; KEEP(*(.kdrivers)) __kdrivers_end = .;      /* see include/driver.h */
+        . = ALIGN(4096);
+        *(.initrd)
+    }
     .data : AT(ADDR(.data) - KOFF) { *(.data .data.*) }
     . = ALIGN(4096);
     .bss : AT(ADDR(.bss) - KOFF) {

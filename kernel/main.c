@@ -111,6 +111,9 @@ void kmain(uintptr_t bootinfo) {
 
     arch_init();
     board_init();
+    ipc_init();
+    console_services_init();
+    drivers_init();                                  /* PCI, keyboard, display, ... (bound to the console + IPC services) */
     tty_init();
     vfs_init();
 

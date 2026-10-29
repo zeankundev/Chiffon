@@ -35,6 +35,9 @@ int board_console_getc(void) { return pl011_getc(UART_BASE); }
 void board_init(void) {
     gicv2_init(GICD_BASE, GICC_BASE, TIMER_INTID);
     armtimer_start(HZ);
+    driver_note("pl011", "PL011 UART console", DRV_CHAR);
+    driver_note("gicv2+timer", "GICv2 + ARM generic timer, 100 Hz tick", DRV_MISC);
+    driver_note("virtio-blk", "virtio-mmio block device", DRV_BLOCK);
     kprintf("board: aarch64 qemu-virt (RAM %lu MiB @ %lx)\n", (unsigned long)(ram_size >> 20), (unsigned long)ram_base);
 }
 void board_irq(struct trapframe *tf) {

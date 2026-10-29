@@ -1,11 +1,13 @@
 #pragma once
 typedef unsigned long size_t;
 typedef long ssize_t;
+#include "uapi/chiffon_abi.h"
 
 #if defined(__x86_64__)
 enum { CF_read = 0, CF_write = 1, CF_close = 3, CF_clone = 56, CF_execve = 59, CF_exit = 60, CF_wait4 = 61,
        CF_uname = 63, CF_getcwd = 79, CF_chdir = 80, CF_reboot = 169, CF_getdents64 = 217, CF_openat = 257,
-       CF_mkdirat = 258, CF_pipe2 = 293, CF_dup3 = 292, CF_getpid = 39 };
+       CF_mkdirat = 258, CF_pipe2 = 293, CF_dup3 = 292, CF_getpid = 39,
+       CF_ioctl = 16, CF_mmap = 9, CF_munmap = 11, CF_nanosleep = 35 };
 static inline long ksys(long n, long a, long b, long c, long d, long e, long f) {
     register long r10 __asm__("r10") = d, r8 __asm__("r8") = e, r9 __asm__("r9") = f;
     long ret;
@@ -16,7 +18,8 @@ __asm__(".globl _start\n_start:\n xor %ebp,%ebp\n mov (%rsp),%rdi\n lea 8(%rsp),
 #elif defined(__aarch64__)
 enum { CF_read = 63, CF_write = 64, CF_close = 57, CF_clone = 220, CF_execve = 221, CF_exit = 93, CF_wait4 = 260,
        CF_uname = 160, CF_getcwd = 17, CF_chdir = 49, CF_reboot = 142, CF_getdents64 = 61, CF_openat = 56,
-       CF_mkdirat = 34, CF_pipe2 = 59, CF_dup3 = 24, CF_getpid = 172 };
+       CF_mkdirat = 34, CF_pipe2 = 59, CF_dup3 = 24, CF_getpid = 172,
+       CF_ioctl = 29, CF_mmap = 222, CF_munmap = 215, CF_nanosleep = 101 };
 static inline long ksys(long n, long a, long b, long c, long d, long e, long f) {
     register long x8 __asm__("x8") = n, x0 __asm__("x0") = a, x1 __asm__("x1") = b, x2 __asm__("x2") = c,
                   x3 __asm__("x3") = d, x4 __asm__("x4") = e, x5 __asm__("x5") = f;
@@ -51,6 +54,23 @@ static inline int chiffon_pipe(int fds[2]) { return ksys(CF_pipe2, (long)fds, 0,
 static inline int chiffon_dup2(int a, int b) { return ksys(CF_dup3, a, b, 0, 0, 0, 0); }
 static inline __attribute__((noreturn)) void chiffon_exit(int c) { for (;;) ksys(CF_exit, c, 0, 0, 0, 0, 0); }
 static inline __attribute__((noreturn)) void chiffon_poweroff(void) { for (;;) ksys(CF_reboot, 0xfee1dead, 672274793, 0x4321fedc, 0, 0, 0); }
+static inline long chiffon_ioctl(int fd, unsigned long cmd, void *arg) { return ksys(CF_ioctl, fd, cmd, (long)arg, 0, 0, 0); }
+/* returns the mapping address, or a small negative errno */
+static inline long chiffon_mmap(void *addr, size_t len, int prot, int flags, int fd, long off) { return ksys(CF_mmap, (long)addr, len, prot, flags, fd, off); }
+static inline int chiffon_munmap(void *addr, size_t len) { return ksys(CF_munmap, (long)addr, len, 0, 0, 0, 0); }
+static inline int chiffon_sleep_ms(unsigned ms) { long ts[2] = { ms / 1000, (long)(ms % 1000) * 1000000L }; return ksys(CF_nanosleep, (long)ts, 0, 0, 0, 0, 0); }
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define MAP_SHARED 1
+
+/* IPC (see include/uapi/chiffon_abi.h) */
+static inline long chiffon_ipc_create(const char *name) { return ksys(CSYS_ipc_create, (long)name, 0, 0, 0, 0, 0); }
+static inline long chiffon_ipc_lookup(const char *name) { return ksys(CSYS_ipc_lookup, (long)name, 0, 0, 0, 0, 0); }
+static inline long chiffon_ipc_close(long port) { return ksys(CSYS_ipc_close, port, 0, 0, 0, 0, 0); }
+static inline long chiffon_ipc_send(long port, const struct chi_ipc_msg *m, int flags) { return ksys(CSYS_ipc_send, port, (long)m, flags, 0, 0, 0); }
+static inline long chiffon_ipc_recv(long port, struct chi_ipc_msg *m, int flags) { return ksys(CSYS_ipc_recv, port, (long)m, flags, 0, 0, 0); }
+static inline long chiffon_ipc_call(long port, const struct chi_ipc_msg *req, struct chi_ipc_msg *rep) { return ksys(CSYS_ipc_call, port, (long)req, (long)rep, 0, 0, 0); }
+static inline long chiffon_ipc_reply(const struct chi_ipc_msg *rep) { return ksys(CSYS_ipc_reply, (long)rep, 0, 0, 0, 0, 0); }
 
 /* minimal string helpers (also satisfy compiler-generated calls) */
 void *memset(void *d, int c, size_t n) { unsigned char *p = d; while (n--) *p++ = c; return d; }

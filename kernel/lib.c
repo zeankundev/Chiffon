@@ -45,7 +45,7 @@ char *strrchr(const char *s, int c) {
 struct sink { char *buf; size_t pos, cap; };
 static void put(struct sink *s, char c) {
     if (s->buf) { if (s->pos + 1 < s->cap) s->buf[s->pos] = c; }
-    else { if (c == '\n') board_console_putc('\r'); board_console_putc(c); }
+    else { if (c == '\n') console_putc('\r'); console_putc(c); }
     s->pos++;
 }
 static void putnum(struct sink *s, unsigned long long v, int base, int neg, int width, int zero, int left, int upper) {
@@ -75,7 +75,13 @@ static void vfmt(struct sink *s, const char *f, va_list ap) {
         case 'x': case 'X': putnum(s, lng ? va_arg(ap, unsigned long) : va_arg(ap, unsigned), 16, 0, width, zero, left, *f == 'X'); break;
         case 'p': put(s, '0'); put(s, 'x'); putnum(s, (uintptr_t)va_arg(ap, void *), 16, 0, 0, 0, 0, 0); break;
         case 'c': put(s, (char)va_arg(ap, int)); break;
-        case 's': { const char *t = va_arg(ap, const char *); if (!t) t = "(null)"; while (*t) put(s, *t++); break; }
+        case 's': {
+            const char *t = va_arg(ap, const char *); if (!t) t = "(null)";
+            int pad = width - (int)strlen(t);
+            if (!left) while (pad-- > 0) put(s, ' ');
+            while (*t) put(s, *t++);
+            if (left) while (pad-- > 0) put(s, ' ');
+            break; }
         case '%': put(s, '%'); break;
         default: put(s, '%'); if (*f) put(s, *f); else f--; break;
         }
@@ -96,5 +102,6 @@ void panic(const char *fmt, ...) {
     kprintf("\n>>>> CRITICAL KERNEL PANIC: ");
     va_start(ap, fmt); vfmt(&s, fmt, ap); va_end(ap);
     kprintf("\r\n");
+    console_flush();                                    /* make sure the message reaches the screen */
     arch_halt();
 }

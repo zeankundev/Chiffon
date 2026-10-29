@@ -34,8 +34,8 @@ void tty_init(void) {
 }
 
 static void out(int c) {
-    if (c == '\n' && (tio.oflag & OPOST) && (tio.oflag & ONLCR)) board_console_putc('\r');
-    board_console_putc(c);
+    if (c == '\n' && (tio.oflag & OPOST) && (tio.oflag & ONLCR)) console_putc('\r');
+    console_putc(c);
 }
 static void echo_char(int c) {
     if (!(tio.lflag & ECHO)) return;
@@ -87,6 +87,8 @@ void tty_input(int c) {
 void console_poll(void) {
     int c;
     while ((c = board_console_getc()) >= 0) tty_input(c);
+    drivers_poll();                                   /* input drivers that also poll (PS/2 keyboard) */
+    console_flush();                                  /* paint what changed on the framebuffer / VGA console */
 }
 
 int tty_readable(void) { return ihead != itail || ((tio.lflag & ICANON) && eof_flag); }
@@ -138,7 +140,14 @@ long tty_ioctl(unsigned long cmd, uintptr_t arg) {
         return 0;
     case 0x5413: {                                 /* TIOCGWINSZ */
         if (!uok(arg, 8)) return -EFAULT;
-        uint16_t *w = (uint16_t *)arg; w[0] = 24; w[1] = 80; w[2] = w[3] = 0; return 0; }
+        uint16_t *w = (uint16_t *)arg; int c = 80, r = 24; vt_size(&c, &r);
+        w[0] = r; w[1] = c; w[2] = w[3] = 0; return 0; }
+    case CHI_KDSETMODE:                            /* a graphics program takes over the screen */
+        if (arg != CHI_KD_TEXT && arg != CHI_KD_GRAPHICS) return -EINVAL;
+        vt_set_graphics(arg == CHI_KD_GRAPHICS); return 0;
+    case CHI_KDGETMODE:
+        if (!uok(arg, 4)) return -EFAULT;
+        *(int *)arg = vt_graphics(); return 0;
     case 0x5414: return 0;                         /* TIOCSWINSZ */
     case 0x541B:                                   /* FIONREAD */
         if (!uok(arg, 4)) return -EFAULT;

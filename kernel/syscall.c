@@ -92,7 +92,7 @@ static long sys_iov(long fd, uintptr_t uiov, long cnt, int wr) {
 static long sys_lseek(long fd, long off, int whence) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (f->type != F_NODE || f->node->dev) return -ESPIPE;
+    if (f->type != F_NODE || (f->node->dev && f->node->dev != DEV_FB)) return -ESPIPE;
     long base = whence == 0 ? 0 : whence == 1 ? (long)f->off : whence == 2 ? (long)f->node->size : -1;
     if (base < 0 || base + off < 0) return -EINVAL;
     f->off = base + off;
@@ -157,6 +157,7 @@ static long sys_ioctl(long fd, unsigned long cmd, uintptr_t arg) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
     if (f->type == F_NODE && f->node->dev == DEV_TTY) return tty_ioctl(cmd, arg);
+    if (f->type == F_NODE && f->node->dev == DEV_FB) return fb_ioctl(cmd, arg);
     return -ENOTTY;
 }
 
@@ -272,6 +273,13 @@ static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, l
         addr = m->mmap_next;
         if (addr + len > USER_STACK_TOP - STACK_SIZE * 8) return -ENOMEM;
         m->mmap_next += len;
+    }
+    if (f && f->node->dev == DEV_FB) {                  /* map the framebuffer's pixel memory straight into the process */
+        struct fb_device *d = fb_primary();
+        if (!d) return -ENODEV;
+        if ((uint64_t)off & (PAGE_SIZE - 1) || (uint64_t)off + len > ((uint64_t)d->info.size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE) return -EINVAL;
+        int e = mm_map_dev(m, addr, len, d->info.phys + off);
+        return e ? e : (long)addr;
     }
     int r = mm_map(m, addr, len);
     if (r) return r;
@@ -494,6 +502,10 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         *(uint16_t *)((char *)s + 80) = NPROC; *(uint32_t *)((char *)s + 104) = 1;
         return 0; }
     case SYS_reboot: board_poweroff();
+
+    case CSYS_ipc_create: case CSYS_ipc_lookup: case CSYS_ipc_close: case CSYS_ipc_send:
+    case CSYS_ipc_recv: case CSYS_ipc_call: case CSYS_ipc_reply:
+        return ipc_syscall(no, a0, a1, a2);
 
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:

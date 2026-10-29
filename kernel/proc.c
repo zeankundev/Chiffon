@@ -11,15 +11,19 @@ static uint8_t kstacks[NPROC][KSTACK_SIZE] __attribute__((aligned(16)));
 #define PGDN(x) ((x) & ~(PAGE_SIZE - 1))
 #define PGUP(x) (((x) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 
-static void vma_add(struct mm *mm, uintptr_t s, uintptr_t e) {
+static void vma_add(struct mm *mm, uintptr_t s, uintptr_t e, int dev) {
     for (int i = 0; i < mm->nvma; i++)
-        if (mm->vma[i].end == s) { mm->vma[i].end = e; return; }
-    if (mm->nvma < NVMA) mm->vma[mm->nvma++] = (struct vma){s, e};
+        if (mm->vma[i].end == s && mm->vma[i].dev == dev) { mm->vma[i].end = e; return; }
+    if (mm->nvma < NVMA) mm->vma[mm->nvma++] = (struct vma){s, e, dev};
+}
+static int vma_is_dev(struct mm *mm, uintptr_t a) {
+    for (int i = 0; i < mm->nvma; i++) if (a >= mm->vma[i].start && a < mm->vma[i].end) return mm->vma[i].dev;
+    return 0;
 }
 int mm_map(struct mm *mm, uintptr_t va, size_t len) {
     uintptr_t s = PGDN(va), e = PGUP(va + len);
     if (e > USER_TOP || e < s || (e - s) / PAGE_SIZE > pmm_free_count()) return -ENOMEM;
-    vma_add(mm, s, e);
+    vma_add(mm, s, e, 0);
     for (uintptr_t a = s; a < e; a += PAGE_SIZE) {
         if (arch_translate(mm->root, a)) continue;
         uintptr_t pa = pmm_alloc();
@@ -28,11 +32,26 @@ int mm_map(struct mm *mm, uintptr_t va, size_t len) {
     }
     return 0;
 }
+/* Map physical device memory (framebuffer) at va.  The pages are not owned by the process: they are
+ * shared on fork and never handed back to the page allocator. */
+int mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa) {
+    uintptr_t s = PGDN(va), e = PGUP(va + len);
+    if (e > USER_TOP || e < s || (pa & (PAGE_SIZE - 1))) return -EINVAL;
+    if (mm->nvma >= NVMA) return -ENOMEM;
+    for (uintptr_t a = s; a < e; a += PAGE_SIZE)
+        if (arch_translate(mm->root, a) || arch_map(mm->root, a, pa + (a - s))) {
+            for (uintptr_t u = s; u < a; u += PAGE_SIZE) arch_unmap(mm->root, u);
+            return -ENOMEM;
+        }
+    vma_add(mm, s, e, 1);
+    return 0;
+}
 int mm_unmap(struct mm *mm, uintptr_t va, size_t len) {
     uintptr_t s = PGDN(va), e = PGUP(va + len);
     for (uintptr_t a = s; a < e; a += PAGE_SIZE) {
+        int dev = vma_is_dev(mm, a);
         uintptr_t pa = arch_unmap(mm->root, a);
-        if (pa) pmm_free(pa);
+        if (pa && !dev) pmm_free(pa);
     }
     for (int i = 0; i < mm->nvma; i++) {
         struct vma *v = &mm->vma[i];
@@ -40,7 +59,7 @@ int mm_unmap(struct mm *mm, uintptr_t va, size_t len) {
         if (v->start >= s && v->end <= e) { mm->vma[i--] = mm->vma[--mm->nvma]; }
         else if (v->start >= s) v->start = e;
         else if (v->end <= e) v->end = s;
-        else if (mm->nvma < NVMA) { mm->vma[mm->nvma++] = (struct vma){e, v->end}; v->end = s; }
+        else if (mm->nvma < NVMA) { mm->vma[mm->nvma++] = (struct vma){e, v->end, v->dev}; v->end = s; }
     }
     return 0;
 }
@@ -49,7 +68,7 @@ void mm_free(struct mm *mm) {
     for (int i = 0; i < mm->nvma; i++)
         for (uintptr_t a = mm->vma[i].start; a < mm->vma[i].end; a += PAGE_SIZE) {
             uintptr_t pa = arch_unmap(mm->root, a);
-            if (pa) pmm_free(pa);
+            if (pa && !mm->vma[i].dev) pmm_free(pa);
         }
     arch_aspace_free(mm->root);
     memset(mm, 0, sizeof *mm);
@@ -169,6 +188,10 @@ int proc_fork(struct trapframe *tf) {
         for (uintptr_t a = pm->vma[i].start; a < pm->vma[i].end; a += PAGE_SIZE) {
             uintptr_t src = arch_translate(pm->root, a);
             if (!src || arch_translate(cm->root, a)) continue;
+            if (pm->vma[i].dev) {
+                if (arch_map(cm->root, a, src)) { mm_free(cm); c->state = P_UNUSED; return -ENOMEM; }
+                continue;
+            }
             uintptr_t dst = pmm_alloc();
             if (!dst) { mm_free(cm); c->state = P_UNUSED; return -ENOMEM; }
             memcpy(P2V(dst), P2V(src), PAGE_SIZE);
@@ -193,6 +216,7 @@ void proc_exit(int wstatus) {
     struct proc *p = cur;
     int was_init = (p->pid == init_pid);
     if (was_init) init_exited(wstatus);
+    ipc_proc_exit(p);
     for (int i = 0; i < NOFILE; i++) if (p->fd[i]) { file_close(p->fd[i]); p->fd[i] = 0; }
     arch_aspace_switch(arch_kernel_root());
     mm_free(&p->mm);
