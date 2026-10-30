@@ -28,7 +28,7 @@ ifeq ($(filter $(ARCH),x86_64 aarch64),)
   $(error ARCH must be x86_64 or aarch64 (got '$(ARCH)'))
 endif
 ifeq ($(filter $(FS),ext2 ext3 ext4 initramfs),)
-  $(error FS must be ext2, ext3, ext4 or initramfs (got '$(FS)'). Other filesystems need a kernel driver: docs/ADDING-A-FILESYSTEM.md)
+  $(error FS must be ext2, ext3, ext4 or initramfs (got '$(FS)'). Other filesystems need a kernel driver — see kernel/fs_driver.h)
 endif
 
 # ---- board: custom (env/<ENV>/device/<DEVICE>) wins over built-in (device/<ARCH>/<DEVICE>) ----
@@ -173,7 +173,7 @@ new-device:
 clean:
 	@rm -rf $(BUILD)
 help:
-	@echo "Chiffon - a small Unix-like microkernel + OS (c) 2026 zeankun"
+	@echo "Chiffon - a small Unix-like monolithic kernel with an IPC layer (hybrid goal pending) + OS (c) 2026 zeankun"
 	@echo ""
 	@echo "- make [ENV=demo] : build the kernel and disk image for the given environment (default: demo)"
 	@echo "- make new-env NAME=<name> : create a new environment with the given name"
