@@ -24,6 +24,7 @@ typedef long off_t;
 #define ENOMEM 12
 #define EACCES 13
 #define EFAULT 14
+#define EBUSY 16
 #define EEXIST 17
 #define ENODEV 19
 #define ENOTDIR 20
@@ -64,6 +65,13 @@ typedef long off_t;
 #define STACK_SIZE (128 * 1024)
 #define USER_STACK_TOP 0x00007FFFFFFFF000UL
 #define MMAP_BASE      0x0000002000000000UL
+
+#define MAX_PROC_CAPS 8
+struct proc_cap {
+    uint32_t type;
+    uintptr_t base;
+    size_t size;
+};
 
 void *memset(void *, int, size_t);
 void *memcpy(void *, const void *, size_t);
@@ -123,10 +131,23 @@ struct proc {
     /* IPC: a blocked ipc_call() waits for its reply here */
     int ipc_waiting, ipc_have_reply, ipc_wait_port;
     struct chi_ipc_msg ipc_rep;
+    /* Hybrid driver capabilities */
+    int is_driver_loader;
+    int ncaps;
+    struct proc_cap caps[MAX_PROC_CAPS];
 };
 extern struct proc *cur;
 extern struct proc ptable[NPROC];
 extern volatile uint64_t ticks;
+
+/* Hybrid driver subsystem */
+int  cap_check(struct proc *p, uint32_t type, uintptr_t val1, size_t val2);
+long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2);
+long dev_mmap_phys(uintptr_t phys, size_t len);
+long dev_irq_claim(unsigned irq);
+long dev_irq_wait(unsigned irq);
+long dev_info_query(int type, void *uinfo);
+void dev_driver_cleanup(struct proc *p);
 
 void sched_init(void);
 void scheduler(void) __attribute__((noreturn));

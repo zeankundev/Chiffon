@@ -22,6 +22,36 @@ typedef __UINT64_TYPE__ chi_u64;
 #define CSYS_ipc_call    1005   /* (port, const msg *req, msg *rep)     -> 0 | -errno            */
 #define CSYS_ipc_reply   1006   /* (const msg *rep)  rep->dst = pid of the caller (msg.src)      */
 
+/* Capabilities & userspace driver syscalls (Hybrid kernel model) */
+#define CSYS_cap_grant   1010   /* (pid, cap_type, val1, val2)          -> 0 | -errno            */
+#define CSYS_dev_map     1011   /* (phys, len)                          -> va | -errno           */
+#define CSYS_irq_claim   1012   /* (irq)                                -> 0 | -errno            */
+#define CSYS_irq_wait    1013   /* (irq, flags)                         -> 0 | -errno            */
+#define CSYS_dev_info    1014   /* (dev_type, void *info)               -> 0 | -errno            */
+
+#define CHI_CAP_MMIO     1      /* MMIO physical mapping */
+#define CHI_CAP_IRQ      2      /* Hardware IRQ binding */
+#define CHI_CAP_DRIVER   4      /* Register / supersede driver IPC services */
+#define CHI_CAP_LOADER   8      /* Grant capabilities to other processes */
+
+#define DEV_TYPE_FB      1      /* Primary framebuffer */
+#define DEV_TYPE_UART    2      /* Primary serial / UART */
+
+struct chi_dev_fb_info {
+    chi_u64 phys;
+    chi_u64 size;
+    chi_u32 width;
+    chi_u32 height;
+    chi_u32 pitch;
+    chi_u32 bpp;
+};
+
+struct chi_dev_uart_info {
+    chi_u64 phys;
+    chi_u64 size;
+    chi_u32 irq;
+};
+
 #define IPC_NONBLOCK     1
 #define IPC_NAME_MAX     24     /* including the NUL */
 #define IPC_DATA_MAX     48
@@ -36,19 +66,28 @@ struct chi_ipc_msg {
     chi_u8  data[IPC_DATA_MAX];
 };
 
-/* Well-known kernel services (registered by the drivers that own the hardware). */
+/* Well-known services (registered by kernel or userspace driver servers). */
 #define IPC_SVC_FB       "fb"
 #define IPC_SVC_CONSOLE  "console"
+#define IPC_SVC_LOADER   "driver.loader"
 
 /* "fb": data[] layouts are arrays of chi_u32 (native endian) */
 #define FB_OP_INFO   1      /* reply: w, h, pitch, bpp, vw, vh, xoff, yoff, size           (36 bytes) */
 #define FB_OP_FILL   2      /* req:   x, y, w, h, 0xRRGGBB                                 (20 bytes) */
 #define FB_OP_PAN    3      /* req:   x, y  (page flip / scroll the visible window)         (8 bytes) */
+#define FB_OP_CRASH  999    /* test operation: induce intentional server termination */
+
 /* "console": */
 #define CON_OP_WRITE    1   /* req: up to IPC_DATA_MAX bytes of text (VT100 sequences allowed)  */
 #define CON_OP_SIZE     2   /* reply: cols, rows                                               */
 #define CON_OP_CLEAR    3   /* clear the screen and home the cursor                            */
 #define CON_OP_GRAPHICS 4   /* req: u32 0 = text mode, 1 = graphics (console stops drawing)    */
+
+/* "driver.loader": */
+#define DRV_OP_STATUS   1   /* reply: status code & driver flags                               */
+#define DRV_OP_LOAD     2   /* req: driver name to start                                       */
+#define DRV_OP_CRASH    3   /* trigger driver crash test                                       */
+#define DRV_OP_BENCH    4   /* run latency benchmark                                           */
 
 /* ------------------------------------------------------------------------------------------
  * /dev/fb0 -- Linux-compatible ioctls and structures (so existing tools/programs work)

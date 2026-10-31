@@ -28,7 +28,7 @@ ifeq ($(filter $(ARCH),x86_64 aarch64),)
   $(error ARCH must be x86_64 or aarch64 (got '$(ARCH)'))
 endif
 ifeq ($(filter $(FS),ext2 ext3 ext4 initramfs),)
-  $(error FS must be ext2, ext3, ext4 or initramfs (got '$(FS)'). Other filesystems need a kernel driver — see kernel/fs_driver.h)
+  $(error FS must be ext2, ext3, ext4 or initramfs (got '$(FS)'))
 endif
 
 # ---- board: custom (env/<ENV>/device/<DEVICE>) wins over built-in (device/<ARCH>/<DEVICE>) ----

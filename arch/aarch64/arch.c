@@ -19,6 +19,8 @@ int arch_map_device(uintptr_t pa, size_t len) {
 
 void arch_init(void) {
     __asm__ volatile("msr vbar_el1,%0; isb" :: "r"((uint64_t)vectors));
+    /* Allow EL0 to read the physical timer counter and frequency for IPC benchmarking */
+    __asm__ volatile("msr cntkctl_el1, %0; isb" :: "r"((uint64_t)(1 << 1)));
     kprintf("arch: aarch64 vectors ready\n");
 }
 

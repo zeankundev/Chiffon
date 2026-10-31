@@ -79,7 +79,7 @@ int main(int argc, char **argv, char **envp) {
         av[ac] = 0;
         if (!ac) continue;
         if (!chiffon_strcmp(av[0], "help"))
-            chiffon_puts("builtins: help echo pwd cd ls cat env uname poweroff exit\nanything else is looked up in $PATH\n");
+            chiffon_puts("builtins: help echo pwd cd ls cat env uname poweroff exit\nuserland: drvloader fbserver ipcdemo fbdemo\nanything else is looked up in $PATH\n");
         else if (!chiffon_strcmp(av[0], "echo")) { for (int i = 1; i < ac; i++) { chiffon_puts(av[i]); chiffon_puts(i + 1 < ac ? " " : ""); } chiffon_puts("\n"); }
         else if (!chiffon_strcmp(av[0], "pwd")) { char b[256]; if (chiffon_getcwd(b, sizeof b) > 0) { chiffon_puts(b); chiffon_puts("\n"); } }
         else if (!chiffon_strcmp(av[0], "cd")) { if (chiffon_chdir(ac > 1 ? av[1] : "/") < 0) chiffon_puts("cd: failed\n"); }

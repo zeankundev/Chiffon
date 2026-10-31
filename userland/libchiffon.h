@@ -72,6 +72,56 @@ static inline long chiffon_ipc_recv(long port, struct chi_ipc_msg *m, int flags)
 static inline long chiffon_ipc_call(long port, const struct chi_ipc_msg *req, struct chi_ipc_msg *rep) { return ksys(CSYS_ipc_call, port, (long)req, (long)rep, 0, 0, 0); }
 static inline long chiffon_ipc_reply(const struct chi_ipc_msg *rep) { return ksys(CSYS_ipc_reply, (long)rep, 0, 0, 0, 0, 0); }
 
+/* Driver capabilities & hardware device operations */
+static inline long chiffon_cap_grant(int pid, unsigned int type, unsigned long val1, unsigned long val2) {
+    return ksys(CSYS_cap_grant, pid, type, val1, val2, 0, 0);
+}
+static inline long chiffon_dev_map(unsigned long phys, size_t len) {
+    return ksys(CSYS_dev_map, phys, len, 0, 0, 0, 0);
+}
+static inline long chiffon_irq_claim(unsigned int irq) {
+    return ksys(CSYS_irq_claim, irq, 0, 0, 0, 0, 0);
+}
+static inline long chiffon_irq_wait(unsigned int irq) {
+    return ksys(CSYS_irq_wait, irq, 0, 0, 0, 0, 0);
+}
+static inline long chiffon_dev_info(int type, void *info) {
+    return ksys(CSYS_dev_info, type, (long)info, 0, 0, 0, 0);
+}
+static inline int chiffon_kill(int pid, int sig) {
+#if defined(__x86_64__)
+    return ksys(62 /* SYS_kill */, pid, sig, 0, 0, 0, 0);
+#elif defined(__aarch64__)
+    return ksys(129 /* SYS_kill */, pid, sig, 0, 0, 0, 0);
+#endif
+}
+
+static inline unsigned long chiffon_cycles(void) {
+#if defined(__aarch64__)
+    unsigned long val;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(val));
+    return val;
+#elif defined(__x86_64__)
+    unsigned int lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((unsigned long)hi << 32) | lo;
+#else
+    return 0;
+#endif
+}
+
+static inline unsigned long chiffon_timer_freq(void) {
+#if defined(__aarch64__)
+    unsigned long freq;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    return freq ? freq : 62500000UL;
+#elif defined(__x86_64__)
+    return 2000000000UL;
+#else
+    return 1000000UL;
+#endif
+}
+
 /* minimal string helpers (also satisfy compiler-generated calls) */
 void *memset(void *d, int c, size_t n) { unsigned char *p = d; while (n--) *p++ = c; return d; }
 void *memcpy(void *d, const void *s, size_t n) { unsigned char *a = d; const unsigned char *b = s; while (n--) *a++ = *b++; return d; }

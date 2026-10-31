@@ -507,6 +507,17 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case CSYS_ipc_recv: case CSYS_ipc_call: case CSYS_ipc_reply:
         return ipc_syscall(no, a0, a1, a2);
 
+    case CSYS_cap_grant:
+        return cap_grant((int)a0, (uint32_t)a1, (uintptr_t)a2, (size_t)a3);
+    case CSYS_dev_map:
+        return dev_mmap_phys((uintptr_t)a0, (size_t)a1);
+    case CSYS_irq_claim:
+        return dev_irq_claim((unsigned)a0);
+    case CSYS_irq_wait:
+        return dev_irq_wait((unsigned)a0);
+    case CSYS_dev_info:
+        return dev_info_query((int)a0, (void *)a1);
+
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:
         if (a0 == 0x1002) { cur->uctx.fs_base = a1; arch_uctx_restore(&cur->uctx); return 0; }

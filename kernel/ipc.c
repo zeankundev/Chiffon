@@ -20,7 +20,19 @@ static int name_ok(const char *n) { size_t l = strlen(n); return l > 0 && l < IP
 
 static long port_new(const char *name, int owner, ipc_handler svc) {
     if (!name_ok(name)) return -EINVAL;
-    for (int i = 0; i < NPORT; i++) if (ports[i].used && !strcmp(ports[i].name, name)) return -EEXIST;
+    for (int i = 0; i < NPORT; i++) {
+        if (ports[i].used && !strcmp(ports[i].name, name)) {
+            /* If it's a kernel service and caller has CHI_CAP_DRIVER, allow driver takeover */
+            if (ports[i].svc && cap_check(cur, CHI_CAP_DRIVER, 0, 0)) {
+                ports[i].svc = 0;
+                ports[i].owner = owner;
+                ports[i].head = 0;
+                ports[i].count = 0;
+                return i + 1;
+            }
+            return -EEXIST;
+        }
+    }
     for (int i = 0; i < NPORT; i++) {
         if (ports[i].used) continue;
         memset(&ports[i], 0, sizeof ports[i]);
@@ -93,7 +105,7 @@ static long ipc_recv_k(long id, struct chi_ipc_msg *out, int flags) {
 
 static long ipc_call_k(long id, const struct chi_ipc_msg *req, struct chi_ipc_msg *rep) {
     struct port *pt = by_id(id);
-    if (!pt) return -ENOENT;
+    if (!pt) return -EPIPE;
     if (req->len > IPC_DATA_MAX) return -EINVAL;
     if (pt->svc) { run_service(pt, req, rep); return 0; }   /* rep->tag = handler status */
     if (!cur) return -EINVAL;

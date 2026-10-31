@@ -204,6 +204,9 @@ int proc_fork(struct trapframe *tf) {
     memcpy(c->sigh, cur->sigh, sizeof c->sigh);
     memcpy(c->name, cur->name, sizeof c->name);
     c->umask = cur->umask; c->pgid = cur->pgid; c->ppid = cur->pid;
+    c->is_driver_loader = cur->is_driver_loader;
+    c->ncaps = cur->ncaps;
+    memcpy(c->caps, cur->caps, sizeof cur->caps);
     arch_uctx_save(&cur->uctx);
     c->uctx = cur->uctx;
     c->tf = arch_kstack_setup((uintptr_t)c->kstack + KSTACK_SIZE, &c->ksp, tf);
@@ -217,6 +220,7 @@ void proc_exit(int wstatus) {
     int was_init = (p->pid == init_pid);
     if (was_init) init_exited(wstatus);
     ipc_proc_exit(p);
+    dev_driver_cleanup(p);
     for (int i = 0; i < NOFILE; i++) if (p->fd[i]) { file_close(p->fd[i]); p->fd[i] = 0; }
     arch_aspace_switch(arch_kernel_root());
     mm_free(&p->mm);
@@ -384,6 +388,7 @@ int proc_spawn_init(const char *path, char **argv, char **envp, const char *cons
     }
     p->tf = arch_kstack_setup((uintptr_t)p->kstack + KSTACK_SIZE, &p->ksp, &tf);
     strlcpy(p->name, "init", sizeof p->name);
+    p->is_driver_loader = 1;
     p->state = P_RUNNABLE;
     init_pid = p->pid;
     return p->pid;
