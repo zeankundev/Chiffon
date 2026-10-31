@@ -4,3 +4,4 @@ bootlog*
 env/busybox/busybox-git
 # My testing/larp environment
 env/testenv
+env/milkos
