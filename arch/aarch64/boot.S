@@ -21,6 +21,26 @@
     .word 0
     .globl _start
 _start:
+    /* Check current exception level. If EL2 (e.g. on real Pi / QEMU raspi), drop to EL1 */
+    mrs x1, CurrentEL
+    lsr x1, x1, #2
+    cmp x1, #2
+    b.ne 1f
+
+    /* In EL2: configure HCR_EL2 (set RW bit 31 so EL1 is AArch64) */
+    mov x1, #(1 << 31)
+    msr hcr_el2, x1
+
+    /* Set up SPSR_EL2 to return to EL1h (all interrupts masked: D, A, I, F = 0x3c5) */
+    mov x1, #0x3c5
+    msr spsr_el2, x1
+
+    /* Set ELR_EL2 to continue at 1f in EL1 */
+    adr x1, 1f
+    msr elr_el2, x1
+    eret
+
+1:
     mov x19, x0
     mov x1, #(3 << 20)                   /* CPACR_EL1.FPEN: FP/SIMD allowed */
     msr cpacr_el1, x1
