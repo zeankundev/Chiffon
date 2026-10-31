@@ -170,6 +170,11 @@ new-device:
 	cp -R device/$(ARCH)/$(or $(BASE),qemu) env/$(ENV)/device/$(DEVICE)
 	@sed -i 's|^DEVICE=.*|DEVICE=$(DEVICE)|; s|^ARCH=.*|ARCH=$(ARCH)|' env/$(ENV)/chiffon.conf
 	@echo "Created env/$(ENV)/device/$(DEVICE)"
+# Raspberry Pi with no SD card: stage kernel8.img + config.txt + firmware for rpiboot.
+#   make ENV=rpi bootdir FIRMWARE=/path/to/raspberrypi-firmware/boot
+FIRMWARE ?=
+bootdir: all
+	sh tools/rpi-stage.sh "$(KERNEL)" "$(BOARD_DIR)" "$(FIRMWARE)" "$(B)/boot"
 clean:
 	@rm -rf $(BUILD)
 help:
@@ -180,7 +185,8 @@ help:
 	@echo "- make new-device DEVICE=<name> : create a new device for the current environment"
 	@echo "- make run [ENV=demo] : run the kernel in QEMU on the serial console (if supported by the board)"
 	@echo "- make run-gfx [ENV=demo] : run the kernel in QEMU with a window (framebuffer console + keyboard)"
+	@echo "- make bootdir [ENV=rpi] FIRMWARE=<dir> : stage a Raspberry Pi boot directory for rpiboot"
 	@echo "- make clean : remove all build artifacts"
 	@echo ""
 	@echo "Environment configuration: env/<ENV>/chiffon.conf"
-.PHONY: all run run-gfx new-env new-device clean help FORCE
+.PHONY: all run run-gfx new-env new-device bootdir clean help FORCE

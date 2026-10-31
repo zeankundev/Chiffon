@@ -1,0 +1,7 @@
+# Chiffon on Raspberry Pi Zero 2W: headless, no SD card, console over the USB data port.
+arm_64bit=1
+kernel=kernel8.img
+# No armstub= line: the firmware's built-in stub enters the kernel at EL2 and boot.S drops to EL1.
+# The data port is the USB OTG controller in peripheral (gadget) mode.
+# The mini UART stays available for debugging; this fixes the core clock it needs.
+enable_uart=1

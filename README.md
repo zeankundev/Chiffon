@@ -30,5 +30,14 @@ ipcdemo               # Run IPC client demo (connects to user-space fb service)
 - **Concurrency**: Kernel currently assumes a single CPU; SMP locking is scheduled for Phase 3/4.
 - **Fixed Limits**: `NPROC = 32`, `NOFILE = 32`.
 
+## Raspberry Pi Zero 2W (headless, USB console)
+No SD card and no USB-UART adapter. The kernel boots from its embedded initramfs (`env/rpi`), and the console is a CDC-ACM serial port on the board's **DATA** port (use the port next to the PWR port, not PWR):
+```bash
+make ENV=rpi                                   # kernel + initramfs for rpi-zero2w
+make ENV=rpi bootdir FIRMWARE=/path/to/firmware/boot   # stage kernel8.img, config.txt, firmware
+sudo rpiboot ...                               # serve the staged directory (see usbboot's README for -d)
+```
+The Pi shows up as a serial port: `COMx` on Windows (usbser.sys, built in), `/dev/ttyACMn` on Linux, at any baud rate. The driver is in `device/aarch64/rpi-zero2w/usb_dwc2.c`: a polled DWC2 slave-mode gadget, so throughput is limited by the 100 Hz tick.
+
 ## Contributing with AI
 Yes, you are **allowed and encouraged** to deliver AI-generated code changes. Please verify and document implementation details in [AGENTS.md](AGENTS.md) and [PLAN.md](PLAN.md).

@@ -1,6 +1,7 @@
 /* Raspberry Pi Zero 2W board configuration for Chiffon
  * SoC: BCM2837B0 (quad Cortex-A53, 512 MiB RAM)
- * Serial: AUX Mini UART on GPIO 14 (TXD) and GPIO 15 (RXD) -> USB-TTL to host Pi 5 minicom
+ * Console: USB OTG data port as CDC-ACM (usb_dwc2.c), the primary console; no adapter needed.
+ * Serial: AUX Mini UART on GPIO 14/15 is still driven for debugging, but is not required.
  * Timer: ARMv8 generic physical timer via Core Local Interrupt Controller (0x40000000)
  */
 #include "kernel.h"
@@ -16,6 +17,9 @@
 void rpi_uart_init(void);
 void rpi_uart_putc(int c);
 int  rpi_uart_getc(void);
+
+/* USB CDC-ACM console (device/aarch64/rpi-zero2w/usb_dwc2.c) */
+int  usb_cdc_getc(void);
 
 /* Default to 512 MiB RAM starting at 0x00000000 */
 static uintptr_t ram_base = 0x00000000UL;
@@ -58,7 +62,9 @@ void board_console_putc(int c) {
 }
 
 int board_console_getc(void) {
-    return rpi_uart_getc();
+    int c = usb_cdc_getc();                  /* primary: USB CDC-ACM port (usb_dwc2.c) */
+    if (c >= 0) return c;
+    return rpi_uart_getc();                  /* secondary: mini UART, if a USB-UART is wired anyway */
 }
 
 void board_init(void) {
