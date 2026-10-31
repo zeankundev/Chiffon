@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 OUT=build/chiffon.img; FS=ext4; SIZE=; MBR=0; LABEL=chiffon; ROOT=
+# The kernel's write-back log (kernel/persist.c) lives in the last 4 MiB of the disk, outside the
+# filesystem.  Keep this equal to PST_RESERVE_SECTORS / 2048.  PERSIST_MB=0 builds a plain image without it.
+PERSIST_MB=${PERSIST_MB:-4}
 usage() { sed -n '2,10p' "$0" >&2; exit 1; }
 while getopts r:o:f:s:pl: o; do
     case $o in r) ROOT=$OPTARG;; o) OUT=$OPTARG;; f) FS=$OPTARG;; s) SIZE=$OPTARG;; p) MBR=1;; l) LABEL=$OPTARG;; *) usage;; esac
@@ -19,20 +22,22 @@ if [ -z "$SIZE" ]; then
     SIZE=$(( used / 1024 * 2 + 32 ))M
 fi
 case $SIZE in *[Gg]) mb=$(( ${SIZE%[Gg]} * 1024 ));; *[Mm]) mb=${SIZE%[Mm]};; *) mb=$SIZE;; esac
+fsmb=$(( mb - PERSIST_MB ))
+[ "$fsmb" -ge 2 ] || { echo "mkimage: SIZE ${SIZE} is too small for a filesystem plus the ${PERSIST_MB} MiB log" >&2; exit 1; }
 OPTS="-q -F -t $FS -L $LABEL -d $ROOT"
 [ "$FS" = ext4 ] && [ -z "$KEEP_JOURNAL" ] && OPTS="$OPTS -O ^has_journal"   # kernel mounts read-only; journal is dead weight
 rm -f "$OUT"
 if [ "$MBR" = 1 ]; then
     truncate -s $(( mb + 1 ))M "$OUT"
-    $MKE2FS $OPTS -E offset=1048576 "$OUT" ${mb}M
+    $MKE2FS $OPTS -E offset=1048576 "$OUT" ${fsmb}M
     # MBR: partition 1, type 0x83, starts at LBA 2048
     le32() { printf "\\$(printf %03o $(($1 & 255)))\\$(printf %03o $(($1 >> 8 & 255)))\\$(printf %03o $(($1 >> 16 & 255)))\\$(printf %03o $(($1 >> 24 & 255)))"; }
-    { printf '\000\000\000\000\203\376\377\377'; le32 2048; le32 $(( mb * 2048 )); } > "$OUT.mbr"
+    { printf '\000\000\000\000\203\376\377\377'; le32 2048; le32 $(( fsmb * 2048 )); } > "$OUT.mbr"
     dd if="$OUT.mbr" of="$OUT" bs=1 seek=446 conv=notrunc 2>/dev/null
     printf '\125\252' | dd of="$OUT" bs=1 seek=510 conv=notrunc 2>/dev/null
     rm -f "$OUT.mbr"
 else
     truncate -s ${mb}M "$OUT"
-    $MKE2FS $OPTS "$OUT"
+    $MKE2FS $OPTS "$OUT" ${fsmb}M
 fi
-echo "mkimage: wrote $OUT ($FS, ${mb}M$( [ "$MBR" = 1 ] && echo ', MBR partition 1'))"
+echo "mkimage: wrote $OUT ($FS, ${fsmb}M filesystem$( [ "$PERSIST_MB" -gt 0 ] && echo " + ${PERSIST_MB}M write-back log" )$( [ "$MBR" = 1 ] && echo ', MBR partition 1'))"

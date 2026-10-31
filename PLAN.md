@@ -88,9 +88,9 @@ Define "true hybrid kernel" before starting. Proposed definition for this projec
 - **Exit:** BusyBox `sh` runs pipes and a background job and handles Ctrl-C, under the QEMU test.
 
 ### Phase 7 — Writable persistent storage (needed for "workable")
-- Add ext2 write support first (simplest). Then decide whether ext4 journaling is needed, or whether `FS=ext4` should be documented as read-only.
-- Until this is done, state in README that writes are not persisted.
-- **Exit:** a file written in the guest survives a reboot under QEMU.
+- **Status (partial):** changes are saved through a write-ahead log in the last 4 MiB of the disk (`kernel/persist.c`), so a file written in the guest survives a reboot under QEMU, on aarch64 and x86_64. The ext filesystem itself is still read-only. Native ext2 writes and ext4 journaling are not started, and `FS=ext4` stays read-only on disk.
+- Open: the log holds about 2 MiB of changed data. Larger changes cannot be saved. Compaction is simple (rewrite the live state into the other slot). Recovery covers torn records via CRC.
+- **Exit:** a file written in the guest survives a reboot under QEMU. Met for the log design; the ext2-write item above is not done.
 
 ## 4. Open questions for the maintainer
 - Is "true hybrid" the definition in Phase 6, or do you want a stricter one (for example, the scheduler in user space)?

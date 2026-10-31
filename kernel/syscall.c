@@ -210,7 +210,10 @@ static long sys_mkdir(uintptr_t up, int mode) {
     char *s = strrchr(par, '/'); if (s == par) par[1] = 0; else *s = 0;
     struct node *pn = node_find(par);
     if (!pn || !S_ISDIR(pn->mode)) return -ENOENT;
-    return node_create(abs, S_IFDIR | (mode & ~cur->umask & 0777)) ? 0 : -ENOMEM;
+    struct node *n = node_create(abs, S_IFDIR | (mode & ~cur->umask & 0777));
+    if (!n) return -ENOMEM;
+    persist_node_created(n);
+    return 0;
 }
 static long sys_unlink(uintptr_t up, int rmdir) {
     char p[PATH_MAX], abs[PATH_MAX];
@@ -223,7 +226,9 @@ static long sys_unlink(uintptr_t up, int rmdir) {
         if (!rmdir) return -EISDIR;
         if (!node_is_empty_dir(n)) return -ENOTEMPTY;
     } else if (rmdir) return -ENOTDIR;
-    return node_unlink(n);
+    if ((r = node_unlink(n))) return r;
+    persist_deleted(abs);
+    return 0;
 }
 static long sys_rename(uintptr_t a, uintptr_t b) {
     char p[PATH_MAX], q[PATH_MAX], x[PATH_MAX], y[PATH_MAX];
@@ -247,6 +252,14 @@ static long sys_chmod(uintptr_t up, int mode) {
     struct node *n = node_find(abs);
     if (!n) return -ENOENT;
     n->mode = (n->mode & S_IFMT) | (mode & 07777);
+    persist_chmod(n);
+    return 0;
+}
+
+static long sys_fsync(long fd) {
+    struct file *f = getfd(fd);
+    if (!f) return -EBADF;
+    if (f->type == F_NODE && f->node && !f->node->unlinked) return persist_flush(f->node);
     return 0;
 }
 
@@ -442,6 +455,8 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_symlinkat: return sys_symlink(a0, a2);
     case SYS_fchmodat: return sys_chmod(a1, a2);
     case SYS_fchmod: return 0;
+    case SYS_fsync: case SYS_fdatasync: return sys_fsync(a0);
+    case SYS_sync: return persist_sync_all();
     case SYS_umask: { int o = cur->umask; cur->umask = a0 & 0777; return o; }
     case SYS_ppoll: {
         long ms = -1;
@@ -501,7 +516,7 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         s[0] = ticks / HZ; s[4] = pmm_total_count() * PAGE_SIZE; s[5] = pmm_free_count() * PAGE_SIZE;
         *(uint16_t *)((char *)s + 80) = NPROC; *(uint32_t *)((char *)s + 104) = 1;
         return 0; }
-    case SYS_reboot: board_poweroff();
+    case SYS_reboot: kernel_poweroff();
 
     case CSYS_ipc_create: case CSYS_ipc_lookup: case CSYS_ipc_close: case CSYS_ipc_send:
     case CSYS_ipc_recv: case CSYS_ipc_call: case CSYS_ipc_reply:

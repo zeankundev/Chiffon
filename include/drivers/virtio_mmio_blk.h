@@ -50,14 +50,15 @@ static int vblk_init_at(uintptr_t base) {
     vio_ready = vio_sectors != 0;
     return vio_ready ? 0 : -1;
 }
-static int vblk_request(uint64_t lba, void *buf, uint32_t nsect) {
+static int vblk_request(uint64_t lba, void *buf, uint32_t nsect, int write) {
     volatile struct vdesc *d = (volatile struct vdesc *)vq_mem;
     volatile uint16_t *avail = (volatile uint16_t *)(vq_mem + 128);
     volatile uint16_t *used = (volatile uint16_t *)(vq_mem + 4096);
-    vreq_hdr.type = 0; vreq_hdr.res = 0; vreq_hdr.sector = lba;
+    vreq_hdr.type = write ? 1 : 0; vreq_hdr.res = 0; vreq_hdr.sector = lba;   /* 1 = VIRTIO_BLK_T_OUT */
     vreq_status = 0xFF;
     d[0].addr = V2P((uintptr_t)&vreq_hdr); d[0].len = 16; d[0].flags = 1; d[0].next = 1;
-    d[1].addr = V2P((uintptr_t)buf); d[1].len = nsect * 512; d[1].flags = 1 | 2; d[1].next = 2;
+    d[1].addr = V2P((uintptr_t)buf); d[1].len = nsect * 512;
+    d[1].flags = write ? 1 : (1 | 2); d[1].next = 2;                         /* device reads on write, writes on read */
     d[2].addr = V2P((uintptr_t)&vreq_status); d[2].len = 1; d[2].flags = 2; d[2].next = 0;
     avail[2 + (vavail_idx % VQN)] = 0;
     DSB();
@@ -70,13 +71,15 @@ static int vblk_request(uint64_t lba, void *buf, uint32_t nsect) {
     DSB();
     return vreq_status == 0 ? 0 : -1;
 }
-static int vblk_read(uint64_t lba, void *buf, uint32_t n) {
+static int vblk_xfer(uint64_t lba, void *buf, uint32_t n, int write) {
     if (!vio_ready || lba + n > vio_sectors) return -1;
     uint8_t *b = buf;
     while (n) {
         uint32_t c = n > 64 ? 64 : n;
-        if (vblk_request(lba, b, c)) return -1;
+        if (vblk_request(lba, b, c, write)) return -1;
         lba += c; n -= c; b += c * 512;
     }
     return 0;
 }
+static int vblk_read(uint64_t lba, void *buf, uint32_t n) { return vblk_xfer(lba, buf, n, 0); }
+static int vblk_write(uint64_t lba, const void *buf, uint32_t n) { return vblk_xfer(lba, (void *)buf, n, 1); }

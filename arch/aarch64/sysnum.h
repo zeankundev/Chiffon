@@ -10,6 +10,9 @@
 #define SYS_renameat 38
 #define SYS_faccessat 48
 #define SYS_chdir 49
+#define SYS_sync 81
+#define SYS_fsync 82
+#define SYS_fdatasync 83
 #define SYS_fchmod 52
 #define SYS_fchmodat 53
 #define SYS_openat 56

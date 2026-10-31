@@ -192,4 +192,19 @@ static int ext_mount(uint64_t base) {
     return 0;
 }
 
-const struct fs_driver ext_driver = { "ext2/3/4", ext_probe, ext_mount, ext_read };
+/* Where the filesystem ends, and a 64-bit id from its UUID.  The persistence log uses both. */
+static int ext_ident(uint64_t base, uint64_t *end, uint64_t *fsid) {
+    uint8_t sb[1024];
+    if (board_blk_read(base + 2, sb, 2)) return -EIO;
+    uint32_t bs = 1024u << le32(sb + 24);
+    if (bs > 65536) return -EINVAL;
+    uint32_t rev = le32(sb + 76), inc = rev ? le32(sb + 96) : 0;
+    uint64_t blocks = le32(sb + 4) | ((inc & 0x80) ? (uint64_t)le32(sb + 0x150) << 32 : 0);
+    *end = base + blocks * (bs / 512);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < 16; i++) { h ^= sb[104 + i]; h *= 0x100000001b3ULL; }
+    *fsid = h;
+    return 0;
+}
+
+const struct fs_driver ext_driver = { "ext2/3/4", ext_probe, ext_mount, ext_read, ext_ident };

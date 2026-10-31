@@ -25,6 +25,25 @@ static int ata_init(void) {
     ata_ready = ata_nsect != 0;
     return ata_ready ? 0 : -1;
 }
+static int ata_write(uint64_t lba, const void *buf, uint32_t n) {
+    if (!ata_ready || lba + n > ata_nsect || lba + n > 0x0FFFFFFF) return -1;
+    const uint8_t *b = buf;
+    while (n) {
+        uint32_t c = n > 128 ? 128 : n;
+        outb(0x1F6, 0xE0 | ((lba >> 24) & 0xF));
+        outb(0x1F2, c); outb(0x1F3, lba); outb(0x1F4, lba >> 8); outb(0x1F5, lba >> 16);
+        outb(0x1F7, 0x30);                                              /* WRITE SECTORS */
+        for (int i = 0; i < 4; i++) inb(0x3F6);
+        for (uint32_t i = 0; i < c; i++) {
+            if (ata_wait(1)) return -1;
+            for (int w = 0; w < 256; w++) outw(0x1F0, ((const uint16_t *)b)[w]);
+            b += 512;
+        }
+        lba += c; n -= c;
+    }
+    outb(0x1F7, 0xE7);                                                  /* CACHE FLUSH */
+    return ata_wait(0) ? -1 : 0;
+}
 static int ata_read(uint64_t lba, void *buf, uint32_t n) {
     if (!ata_ready || lba + n > ata_nsect || lba + n > 0x0FFFFFFF) return -1;
     uint8_t *b = buf;

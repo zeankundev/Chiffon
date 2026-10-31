@@ -75,3 +75,4 @@ int board_blk_init(void) {
 }
 uint64_t board_blk_sectors(void) { return vio_sectors; }
 int board_blk_read(uint64_t lba, void *buf, uint32_t n) { return vblk_read(lba, buf, n); }
+int board_blk_write(uint64_t lba, const void *buf, uint32_t n) { return vblk_write(lba, buf, n); }

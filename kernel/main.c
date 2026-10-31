@@ -3,6 +3,12 @@
 extern const uint8_t _initrd_start[], _initrd_end[];
 
 static const char *on_exit_policy = "poweroff";
+
+void kernel_poweroff(void) {
+    int r = persist_sync_all();
+    if (r) kprintf("[persist] warning: some changes were not saved\n");
+    board_poweroff();
+}
 static int respawns;
 static uint64_t respawn_t0;
 
@@ -77,7 +83,7 @@ void init_exited(int wstatus) {
         arch_halt();
     }
     kprintf("[chiffon] system powering off\n");
-    board_poweroff();
+    kernel_poweroff();
 }
 
 static void load_config(void) {

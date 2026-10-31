@@ -154,7 +154,7 @@ void proc_signal(struct proc *p, int sig) {
     if (sig <= 0 || sig > 64) return;
     if (p->pid == init_pid && (sig == 10 || sig == 12 || sig == 15)) {
         kprintf("[chiffon] powering off\n");
-        board_poweroff();
+        kernel_poweroff();
     }
     if (sig != 9 && p->sigh[sig]) return;
     switch (sig) {

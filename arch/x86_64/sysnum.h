@@ -44,6 +44,9 @@
 #define SYS_symlink 88
 #define SYS_readlink 89
 #define SYS_chmod 90
+#define SYS_fsync 74
+#define SYS_fdatasync 75
+#define SYS_sync 162
 #define SYS_fchmod 91
 #define SYS_umask 95
 #define SYS_gettimeofday 96

@@ -38,6 +38,7 @@ typedef long off_t;
 #define ENAMETOOLONG 36
 #define ENOSYS 38
 #define ENOTEMPTY 39
+#define ENOSPC 28
 #define ELOOP 40
 
 #define S_IFMT  0170000
@@ -181,12 +182,18 @@ struct node {
     uint8_t *data; size_t size, cap; int is_static;
     uint32_t ino, mtime;
     const struct fs_driver *fs; uint32_t fs_ino; int lazy;
+    int refs;        /* open file descriptions that use this node */
+    int unlinked;    /* removed from the tree; freed when the last open file closes */
+    int base;        /* 1 = unchanged since the disk was mounted (never written to the log) */
+    int unflushed;   /* contents changed since they were last written to the persistence log */
 };
 struct fs_driver {
     const char *name;
     int (*probe)(uint64_t base_lba);
     int (*mount)(uint64_t base_lba);
     int (*read)(struct node *n, void *buf);
+    /* optional: filesystem identity for the persistence log */
+    int (*ident)(uint64_t base_lba, uint64_t *fs_end_lba, uint64_t *fsid);
 };
 extern const struct fs_driver ext_driver;
 enum { F_NODE = 1, F_PIPE_R, F_PIPE_W };
@@ -236,6 +243,22 @@ int  pipe_create(struct file **r, struct file **w);
 int  node_is_empty_dir(struct node *d);
 int  vfs_rename(const char *from, const char *to);
 int  vfs_symlink(const char *target, const char *abs);
+int  vfs_each_node(int (*fn)(struct node *, void *), void *ctx);   /* stops at the first nonzero result */
+void vfs_mark_base(void);                                          /* current tree is the disk image */
+struct node *vfs_put_node(const char *abs, uint32_t mode, const uint8_t *data, size_t size);
+void kernel_poweroff(void) __attribute__((noreturn));              /* flush persistent state, then power off */
+
+/* persist.c: changes that survive reboot (see the comment at the top of that file) */
+void persist_attach_fs(const struct fs_driver *fs, uint64_t base_lba);
+void persist_touch(struct node *n);
+void persist_node_created(struct node *n);
+void persist_deleted(const char *abs);
+void persist_renamed(const char *from, const char *to);
+void persist_moved(struct node *n);
+void persist_chmod(struct node *n);
+int  persist_flush(struct node *n);
+int  persist_sync_all(void);
+
 void procfs_refresh(void);
 
 void tty_init(void);

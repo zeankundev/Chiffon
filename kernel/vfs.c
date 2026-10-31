@@ -24,15 +24,38 @@ struct node *node_create(const char *abs, uint32_t mode) {
     nodes[slot] = n;
     return n;
 }
+static void node_free(struct node *n) {
+    if (!n->is_static) kfree(n->data);
+    kfree(n->path);
+    kfree(n);
+}
+
+/* Removes n from the tree.  An open file keeps the node alive until it is closed. */
 int node_unlink(struct node *n) {
     for (int i = 0; i < MAXNODES; i++)
         if (nodes[i] == n) {
             nodes[i] = 0;
-            if (!n->is_static) kfree(n->data);
-            kfree(n->path); kfree(n);
+            n->unlinked = 1;
+            if (n->refs == 0) node_free(n);
             return 0;
         }
     return -ENOENT;
+}
+
+int vfs_each_node(int (*fn)(struct node *, void *), void *ctx) {
+    if (!nodes) return 0;
+    for (int i = 0; i < MAXNODES; i++)
+        if (nodes[i]) {
+            int r = fn(nodes[i], ctx);
+            if (r) return r;
+        }
+    return 0;
+}
+
+void vfs_mark_base(void) {
+    if (!nodes) return;
+    for (int i = 0; i < MAXNODES; i++)
+        if (nodes[i]) nodes[i]->base = 1;
 }
 
 static void pop_comp(char *res) {
@@ -160,6 +183,11 @@ static ssize_t pipe_write(struct pipe *p, const void *buf, size_t n) {
 struct file *file_dup(struct file *f) { f->refs++; return f; }
 void file_close(struct file *f) {
     if (--f->refs > 0) return;
+    if (f->type == F_NODE && f->node) {
+        struct node *n = f->node;
+        if (n->unflushed && !n->unlinked) persist_flush(n);
+        if (--n->refs == 0 && n->unlinked) node_free(n);
+    }
     if (f->pipe) {
         if (f->type == F_PIPE_R) f->pipe->readers--; else f->pipe->writers--;
         wakeup(f->pipe);
@@ -173,6 +201,7 @@ int vfs_open(const char *path, int flags, int mode, struct file **out) {
     int r = vfs_resolve(path, 1, abs);
     if (r) return r;
     struct node *n = node_find(abs);
+    int created = 0;
     if (!n) {
         if (!(flags & O_CREAT)) return -ENOENT;
         char par[PATH_MAX];
@@ -181,18 +210,22 @@ int vfs_open(const char *path, int flags, int mode, struct file **out) {
         if (!pn || !S_ISDIR(pn->mode)) return -ENOENT;
         n = node_create(abs, S_IFREG | (mode & ~(cur ? cur->umask : 022) & 0777));
         if (!n) return -ENOMEM;
+        created = 1;
     } else if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
     if (S_ISDIR(n->mode) && (flags & O_ACCMODE)) return -EISDIR;
     if ((flags & O_TRUNC) && (n->mode & S_IFMT) == S_IFREG) {
         if (n->is_static) { n->data = 0; n->cap = 0; n->is_static = 0; }
         n->lazy = 0;
         n->size = 0;
+        persist_touch(n);
     }
     struct file *f = kmalloc(sizeof *f);
     if (!f) return -ENOMEM;
     memset(f, 0, sizeof *f);
     f->type = F_NODE; f->refs = 1; f->flags = flags; f->node = n;
+    n->refs++;
     *out = f;
+    if (created) persist_node_created(n);
     return 0;
 }
 
@@ -226,7 +259,7 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
     }
     if (f->flags & O_APPEND) f->off = nd->size;
     ssize_t r = node_write(nd, f->off, buf, n);
-    if (r > 0) f->off += r;
+    if (r > 0) { f->off += r; persist_touch(nd); }
     return r;
 }
 int file_readable(struct file *f) {
@@ -328,6 +361,27 @@ int node_load(struct node *n) {
     return 0;
 }
 
+struct node *vfs_put_node(const char *abs, uint32_t mode, const uint8_t *data, size_t size) {
+    struct node *n = node_find(abs);
+    if (!n) {
+        mkparents(abs);
+        n = node_create(abs, mode);
+        if (!n) return 0;
+    }
+    uint8_t *d = 0;
+    if (size) {
+        d = kmalloc(size);
+        if (!d) return 0;
+        memcpy(d, data, size);
+    }
+    if (!n->is_static) kfree(n->data);
+    n->data = d; n->cap = size; n->size = size;
+    n->is_static = 0; n->lazy = 0; n->fs = 0; n->fs_ino = 0;
+    n->mode = mode;
+    n->base = 0;
+    return n;
+}
+
 void vfs_load_cpio(const void *cpio, size_t size) {
     const uint8_t *p = cpio, *end = p + size;
     int count = 0;
@@ -358,7 +412,9 @@ void vfs_finish(void) {
     mkdev("/dev/null", DEV_NULL); mkdev("/dev/zero", DEV_ZERO);
     if (fb_primary()) { mkdev("/dev/fb0", DEV_FB); struct node *fn = node_find("/dev/fb0"); if (fn) fn->size = fb_primary()->info.size; }
     if (!node_find("/dev")) node_create("/dev", S_IFDIR | 0755);
-    if (!node_find("/tmp")) node_create("/tmp", S_IFDIR | 01777);
+    struct node *tmp = node_find("/tmp");
+    if (!tmp) node_create("/tmp", S_IFDIR | 01777);
+    else tmp->mode = S_IFDIR | 01777;
 }
 
 /* ---- extra namespace operations ---- */
@@ -377,13 +433,15 @@ int vfs_rename(const char *from, const char *to) {
     if (t) {
         if (S_ISDIR(t->mode) != S_ISDIR(n->mode)) return S_ISDIR(t->mode) ? -EISDIR : -ENOTDIR;
         if (S_ISDIR(t->mode) && !node_is_empty_dir(t)) return -ENOTEMPTY;
-        node_unlink(t);
     }
+    persist_renamed(from, to);
+    if (t) node_unlink(t);
     for (int i = 0; i < MAXNODES; i++) {
         struct node *c = nodes[i];
         if (!c || (c != n && !(S_ISDIR(n->mode) && !strncmp(c->path, from, fl) && c->path[fl] == '/'))) continue;
         char *np = kmalloc(strlen(to) + strlen(c->path) - fl + 1);
         if (!np) return -ENOMEM;
+        persist_moved(c);
         strlcpy(np, to, strlen(to) + 1);
         strlcat(np, c->path + fl, strlen(to) + strlen(c->path) - fl + 1);
         kfree(c->path); c->path = np;
@@ -398,5 +456,6 @@ int vfs_symlink(const char *target, const char *abs) {
     n->data = kmalloc(l + 1); n->cap = l + 1;
     if (!n->data) { node_unlink(n); return -ENOMEM; }
     memcpy(n->data, target, l); n->size = l;
+    persist_node_created(n);
     return 0;
 }
