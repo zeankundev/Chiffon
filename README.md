@@ -1,21 +1,13 @@
 # Chiffon
 A Unix-like **hybrid kernel** (microkernel core with kernel-space essential services and user-space device servers reached through IPC) + operating system for aarch64 and x86_64.
 
-## Hybrid Kernel Architecture
+## How it works
 Chiffon implements a hybrid kernel model:
 - **Core Kernel**: Scheduler, PMM, VMM, IPC message passing, and capability management.
 - **Kernel-space drivers**: Core essentials (block devices, TTY/VT console, base timers).
 - **User-space device drivers**: Peripheral subsystems (such as the framebuffer display server `/bin/fbserver`) run as isolated user processes in ring 3.
 - **Capabilities**: Device servers receive fine-grained hardware capabilities (`CHI_CAP_MMIO` for MMIO mapping, `CHI_CAP_IRQ` for hardware interrupts).
 - **Crash Resilience**: If a user-space driver server crashes or is killed, the kernel does not panic. Blocked and subsequent callers receive `-EPIPE` (-32), allowing the driver loader (`/bin/drvloader`) to recover or restart the driver.
-
-## IPC Benchmark & Performance
-Measured round-trip IPC latency (client `ipc_call` -> server `ipc_recv` -> server `ipc_reply` -> client wakeup):
-- **Average Latency**: **88.5 µs** per round-trip
-- **Minimum Latency**: **83.5 µs**
-- **Maximum Latency**: **371.2 µs**
-- **Throughput**: **~11,300 round-trips/second**
-*(Measured on aarch64 Cortex-A72 in QEMU using ARM generic timer counter `CNTVCT_EL0` at 62.5 MHz)*
 
 ## Building & Running
 ```bash
