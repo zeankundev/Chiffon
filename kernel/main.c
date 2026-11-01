@@ -104,7 +104,7 @@ static void load_config(void) {
 void kmain(uintptr_t bootinfo) {
     board_early_init(bootinfo);
     cmdline_set(board_cmdline());
-    kprintf("Chiffon %s (%s)\n", VERSION, ARCH_NAME);
+    kprintf("Chiffon %s (%s, %s)\n", VERSION, VERNAME, ARCH_NAME);
 
     uintptr_t s, e;
     board_mem_range(&s, &e);

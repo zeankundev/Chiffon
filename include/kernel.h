@@ -10,7 +10,8 @@ typedef long ssize_t;
 typedef long off_t;
 
 #define HZ 100
-#define VERSION "0.1"
+#define VERSION "0.2"
+#define VERNAME "kanadera"
 
 #define EPERM 1
 #define ENOENT 2
