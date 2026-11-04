@@ -10,8 +10,8 @@ typedef long ssize_t;
 typedef long off_t;
 
 #define HZ 100
-#define VERSION "0.2"
-#define VERNAME "kanadera"
+#define VERSION "0.3"
+#define VERNAME "shama"
 
 #define EPERM 1
 #define ENOENT 2
@@ -40,6 +40,7 @@ typedef long off_t;
 #define ENOSYS 38
 #define ENOTEMPTY 39
 #define ENOSPC 28
+#define EROFS 30
 #define ELOOP 40
 
 #define S_IFMT  0170000
@@ -62,7 +63,7 @@ typedef long off_t;
 
 #define NPROC 32
 #define NOFILE 32
-#define NVMA 24
+#define NVMA 64
 #define KSTACK_SIZE 16384
 #define STACK_SIZE (128 * 1024)
 #define USER_STACK_TOP 0x00007FFFFFFFF000UL
@@ -177,7 +178,7 @@ int  mm_copyout(struct mm *mm, uintptr_t va, const void *src, size_t len);
 int  uok(uintptr_t va, size_t len);
 int  ustrcpy(char *dst, uintptr_t usrc, size_t max);
 
-enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB };
+enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT };
 struct node {
     char *path; uint32_t mode; int dev;
     uint8_t *data; size_t size, cap; int is_static;
@@ -186,6 +187,7 @@ struct node {
     int refs;        /* open file descriptions that use this node */
     int unlinked;    /* removed from the tree; freed when the last open file closes */
     int base;        /* 1 = unchanged since the disk was mounted (never written to the log) */
+    int readonly;    /* mounted read-only (FAT volumes): writes, creates and removals fail with EROFS */
     int unflushed;   /* contents changed since they were last written to the persistence log */
 };
 struct fs_driver {
@@ -201,7 +203,8 @@ enum { F_NODE = 1, F_PIPE_R, F_PIPE_W };
 struct pipe;
 struct file { int type, refs, flags; struct node *node; size_t off; struct pipe *pipe; };
 
-void vfs_init(void);                                   /* empty tree with "/" */
+void vfs_init(void);
+int  vfs_ready(void);                                  /* 1 once vfs_init has run */                                   /* empty tree with "/" */
 void vfs_load_cpio(const void *cpio, size_t size);     /* import an initramfs */
 void vfs_finish(void);                                 /* /dev, /tmp */
 struct node *vfs_add(const char *abs, uint32_t mode, uint64_t size, uint32_t fs_ino, const struct fs_driver *fs);
@@ -270,6 +273,8 @@ ssize_t tty_read(void *buf, size_t n, int nonblock);
 ssize_t tty_write(const void *buf, size_t n);
 long tty_ioctl(unsigned long cmd, uintptr_t arg);
 int  tty_readable(void);
+ssize_t input_read(void *buf, size_t n, int nonblock);   /* kbd.c: /dev/input/event0 */
+int  input_readable(void);
 
 void syscall_dispatch(struct trapframe *tf);
 void trap_user_fault(struct trapframe *tf, const char *why, uintptr_t addr, int sig);

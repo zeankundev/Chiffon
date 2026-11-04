@@ -272,9 +272,56 @@ int proc_wait(int pid, uintptr_t ustatus, int options) {
 #define AT_CLKTCK 17
 #define AT_SECURE 23
 #define AT_RANDOM 25
+#define AT_BASE 7
+#define ET_EXEC 2
+#define ET_DYN 3
+#define PT_LOAD 1
+#define PT_INTERP 3
+#define PIE_BASE    0x0000000000400000UL   /* load address of a position-independent (ET_DYN) program */
+#define INTERP_BASE 0x0000555500000000UL   /* load address of the dynamic loader named by PT_INTERP */
 
 struct ehdr { uint8_t ident[16]; uint16_t type, machine; uint32_t version; uint64_t entry, phoff, shoff; uint32_t flags; uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx; };
 struct phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz, memsz, align; };
+
+/* Map every PT_LOAD segment at bias+vaddr.  *hi receives the end of the highest segment and
+ * *phdr_va the address of the program headers when they sit inside a loaded segment (AT_PHDR). */
+static int load_segments(struct mm *nm, const uint8_t *img, size_t sz, const struct ehdr *eh,
+                         uintptr_t bias, uintptr_t *hi, uintptr_t *phdr_va) {
+    for (int i = 0; i < eh->phnum; i++) {
+        const struct phdr *ph = (const void *)(img + eh->phoff + i * sizeof *ph);
+        if (ph->type != PT_LOAD) continue;
+        uintptr_t va = ph->vaddr + bias;
+        if (va < PAGE_SIZE || va + ph->memsz > USER_TOP - STACK_SIZE * 4 || ph->filesz > ph->memsz ||
+            (ph->filesz && ph->offset + ph->filesz > sz)) return -ENOEXEC;
+        int r = mm_map(nm, va, ph->memsz);
+        if (r) return r;
+        if ((r = mm_copyout(nm, va, img + ph->offset, ph->filesz))) return r;
+        if (va + ph->memsz > *hi) *hi = va + ph->memsz;
+        if (eh->phoff >= ph->offset && eh->phoff < ph->offset + ph->filesz) *phdr_va = va + (eh->phoff - ph->offset);
+    }
+    return 0;
+}
+
+/* Load the ELF dynamic loader named by PT_INTERP (for musl: /lib/ld-musl-<arch>.so.1) at INTERP_BASE. */
+static int load_interp(struct mm *nm, const char *path, uintptr_t *entry) {
+    char abs[PATH_MAX];
+    int r = vfs_resolve(path, 1, abs);
+    if (r) return r;
+    struct node *n = node_find(abs);
+    if (!n) return -ENOENT;
+    if ((n->mode & S_IFMT) != S_IFREG) return -EACCES;
+    if ((r = node_load(n))) return r;
+    const uint8_t *img = n->data; size_t sz = n->size;
+    const struct ehdr *eh = (const void *)img;
+    if (sz < sizeof *eh || memcmp(eh->ident, "\177ELF", 4) || eh->ident[4] != 2 || eh->ident[5] != 1 ||
+        eh->type != ET_DYN || eh->machine != ELF_MACHINE || eh->phentsize != sizeof(struct phdr) ||
+        eh->phoff + (uint64_t)eh->phnum * sizeof(struct phdr) > sz)
+        return -ENOEXEC;
+    uintptr_t hi = 0, phdr_va = 0;
+    if ((r = load_segments(nm, img, sz, eh, INTERP_BASE, &hi, &phdr_va))) return r;
+    *entry = INTERP_BASE + eh->entry;
+    return 0;
+}
 
 static uint64_t rnd_state = 0x9E3779B97F4A7C15UL;
 static uint64_t rnd(void) { rnd_state ^= ticks + 0x1234567; rnd_state ^= rnd_state << 13; rnd_state ^= rnd_state >> 7; rnd_state ^= rnd_state << 17; return rnd_state; }
@@ -290,25 +337,26 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     const uint8_t *img = n->data; size_t sz = n->size;
     const struct ehdr *eh = (const void *)img;
     if (sz < sizeof *eh || memcmp(eh->ident, "\177ELF", 4) || eh->ident[4] != 2 || eh->ident[5] != 1 ||
-        eh->type != 2 || eh->machine != ELF_MACHINE || eh->phentsize != sizeof(struct phdr) ||
+        (eh->type != ET_EXEC && eh->type != ET_DYN) || eh->machine != ELF_MACHINE || eh->phentsize != sizeof(struct phdr) ||
         eh->phoff + (uint64_t)eh->phnum * sizeof(struct phdr) > sz)
         return -ENOEXEC;
 
     struct mm nm; memset(&nm, 0, sizeof nm);
     nm.root = arch_aspace_new();
     if (!nm.root) return -ENOMEM;
-    uintptr_t hi = 0, phdr_va = 0;
-    for (int i = 0; i < eh->phnum; i++) {
+    uintptr_t bias = eh->type == ET_DYN ? PIE_BASE : 0;
+    uintptr_t hi = 0, phdr_va = 0, interp_base = 0, entry = eh->entry + bias;
+    for (int i = 0; i < eh->phnum; i++) {                /* PT_INTERP: start in the dynamic loader instead */
         const struct phdr *ph = (const void *)(img + eh->phoff + i * sizeof *ph);
-        if (ph->type == 3) { r = -ENOEXEC; goto fail; }
-        if (ph->type != 1) continue;
-        if (ph->vaddr < PAGE_SIZE || ph->vaddr + ph->memsz > USER_TOP - STACK_SIZE * 4 || ph->filesz > ph->memsz ||
-            (ph->filesz && ph->offset + ph->filesz > sz)) { r = -ENOEXEC; goto fail; }
-        if ((r = mm_map(&nm, ph->vaddr, ph->memsz))) goto fail;
-        if ((r = mm_copyout(&nm, ph->vaddr, img + ph->offset, ph->filesz))) goto fail;
-        if (ph->vaddr + ph->memsz > hi) hi = ph->vaddr + ph->memsz;
-        if (eh->phoff >= ph->offset && eh->phoff < ph->offset + ph->filesz) phdr_va = ph->vaddr + (eh->phoff - ph->offset);
+        if (ph->type != PT_INTERP) continue;
+        if (!ph->filesz || ph->filesz >= PATH_MAX || ph->offset + ph->filesz > sz) { r = -ENOEXEC; goto fail; }
+        char ipath[PATH_MAX];
+        memcpy(ipath, img + ph->offset, ph->filesz);
+        ipath[ph->filesz] = 0;
+        if ((r = load_interp(&nm, ipath, &entry))) goto fail;
+        interp_base = INTERP_BASE;
     }
+    if ((r = load_segments(&nm, img, sz, eh, bias, &hi, &phdr_va))) goto fail;
     if (!hi) { r = -ENOEXEC; goto fail; }
     if ((r = mm_map(&nm, USER_STACK_TOP - STACK_SIZE, STACK_SIZE))) goto fail;
     nm.brk_start = nm.brk_end = PGUP(hi);
@@ -317,7 +365,7 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     int argc = 0, envc = 0; size_t S = 0;
     while (argv && argv[argc]) S += strlen(argv[argc++]) + 1;
     while (envp && envp[envc]) S += strlen(envp[envc++]) + 1;
-    const int naux = 14;
+    const int naux = 15;
     size_t W = 1 + (argc + 1) + (envc + 1) + 2 * naux;
     uintptr_t top = USER_STACK_TOP, strb = top - S, rndp = (strb - 16) & ~15UL;
     uintptr_t sp = (rndp - W * 8) & ~15UL;
@@ -336,8 +384,8 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     memcpy(buf + (rndp - sp), &r0, 8); memcpy(buf + (rndp - sp) + 8, &r1, 8);
     uint64_t aux[][2] = {
         {AT_PHDR, phdr_va}, {AT_PHENT, sizeof(struct phdr)}, {AT_PHNUM, eh->phnum}, {AT_PAGESZ, PAGE_SIZE},
-        {AT_ENTRY, eh->entry}, {AT_UID, 0}, {AT_EUID, 0}, {AT_GID, 0}, {AT_EGID, 0}, {AT_SECURE, 0},
-        {AT_RANDOM, rndp}, {AT_CLKTCK, HZ}, {AT_HWCAP, AUX_HWCAP}, {AT_NULL, 0},
+        {AT_BASE, interp_base}, {AT_ENTRY, eh->entry + bias}, {AT_UID, 0}, {AT_EUID, 0}, {AT_GID, 0}, {AT_EGID, 0},
+        {AT_SECURE, 0}, {AT_RANDOM, rndp}, {AT_CLKTCK, HZ}, {AT_HWCAP, AUX_HWCAP}, {AT_NULL, 0},
     };
     for (int i = 0; i < naux; i++) { w[k++] = aux[i][0]; w[k++] = aux[i][1]; }
     r = mm_copyout(&nm, sp, buf, total);
@@ -359,7 +407,7 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
         if (p->fd[i] && (p->cloexec >> i & 1)) { file_close(p->fd[i]); p->fd[i] = 0; }
     p->cloexec = 0;
     for (int i = 1; i < 65; i++) if (p->sigh[i] != 1) p->sigh[i] = 0;
-    arch_tf_user(tf, eh->entry, sp);
+    arch_tf_user(tf, entry, sp);
     arch_uctx_init(&p->uctx);
     if (p == cur) arch_uctx_restore(&p->uctx);
     const char *base = strrchr(abs, '/');

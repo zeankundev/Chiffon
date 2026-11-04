@@ -120,3 +120,10 @@ struct chi_fb_fix_screeninfo {                        /* 80 bytes on LP64, == st
     chi_u32 mmio_len, accel;
     chi_u16 capabilities, reserved[2];
 };
+
+/* /dev/input/event0: read-only stream of 8-byte input records (keyboards, mice, USB HID).
+ *   CHI_EV_KEY  code = scancode set 1 (0x100 | sc for E0-prefixed keys: arrows, Right Ctrl, ...)  value 1 = press, 0 = release
+ *   CHI_EV_REL  code 0 = X, 1 = Y                                                             value = motion (+ = right / down)
+ *   CHI_EV_BTN  code 0 = left, 1 = right, 2 = middle                                          value 1 = press, 0 = release */
+struct chi_input_event { chi_u16 type, code; chi_s32 value; };
+enum { CHI_EV_KEY = 1, CHI_EV_REL = 2, CHI_EV_BTN = 3 };

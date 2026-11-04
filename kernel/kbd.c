@@ -13,7 +13,34 @@ static int shift, ctrl, alt, caps, numlock = 1;
 
 static void emit(const char *s) { while (*s) tty_input((unsigned char)*s++); }
 
+/* ---- /dev/input/event0: raw events for programs that need key release and pointer motion ---- */
+#define EVQ 256
+static struct chi_input_event evq[EVQ];
+static unsigned evhead, evtail;
+
+static void ev_push(uint16_t type, uint16_t code, int32_t value) {
+    if (evhead - evtail >= EVQ) return;                     /* reader too slow: drop, never block the IRQ path */
+    evq[evhead++ % EVQ] = (struct chi_input_event){ type, code, value };
+    wakeup(evq);
+}
+void input_rel(unsigned code, int value) { if (value) ev_push(CHI_EV_REL, code, value); }
+void input_btn(unsigned code, int pressed) { ev_push(CHI_EV_BTN, code, pressed ? 1 : 0); }
+int input_readable(void) { return evhead != evtail; }
+ssize_t input_read(void *buf, size_t n, int nonblock) {
+    if (n < sizeof(struct chi_input_event)) return -EINVAL;
+    while (evhead == evtail) {
+        if (nonblock) return -EAGAIN;
+        if (cur->killed) return -EINTR;
+        sleep_on(evq);
+    }
+    struct chi_input_event *out = buf;
+    size_t cnt = 0;
+    while (evhead != evtail && (cnt + 1) * sizeof *out <= n) out[cnt++] = evq[evtail++ % EVQ];
+    return cnt * sizeof *out;
+}
+
 void kbd_scancode(uint8_t sc, int release, int e0) {
+    ev_push(CHI_EV_KEY, (uint16_t)(sc | (e0 ? 0x100 : 0)), release ? 0 : 1);
     switch (sc) {                                           /* modifiers */
     case 0x2A: case 0x36: if (!e0) { shift = !release; return; } break;
     case 0x1D: ctrl = !release; return;

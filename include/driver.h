@@ -35,3 +35,6 @@ void irq_dispatch(unsigned irq);
 
 /* keyboard drivers report keys here (kernel/kbd.c): scancode-set-1 numbering, release flag, E0 flag */
 void kbd_scancode(unsigned char sc, int release, int e0);
+/* pointer devices (PS/2 mouse, USB mice): CHI_EV_REL / CHI_EV_BTN records for /dev/input/event0 */
+void input_rel(unsigned code, int value);
+void input_btn(unsigned code, int pressed);

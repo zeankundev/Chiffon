@@ -5,6 +5,7 @@
 #endif
 static struct node **nodes;
 static uint32_t next_ino = 1;
+int vfs_ready(void) { return nodes != 0; }
 
 struct node *node_find(const char *abs) {
     for (int i = 0; i < MAXNODES; i++)
@@ -208,11 +209,13 @@ int vfs_open(const char *path, int flags, int mode, struct file **out) {
         strlcpy(par, abs, sizeof par); pop_comp(par);
         struct node *pn = node_find(par);
         if (!pn || !S_ISDIR(pn->mode)) return -ENOENT;
+        if (pn->readonly) return -EROFS;
         n = node_create(abs, S_IFREG | (mode & ~(cur ? cur->umask : 022) & 0777));
         if (!n) return -ENOMEM;
         created = 1;
     } else if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
     if (S_ISDIR(n->mode) && (flags & O_ACCMODE)) return -EISDIR;
+    if (n->readonly && ((flags & O_ACCMODE) || (flags & O_TRUNC))) return -EROFS;
     if ((flags & O_TRUNC) && (n->mode & S_IFMT) == S_IFREG) {
         if (n->is_static) { n->data = 0; n->cap = 0; n->is_static = 0; }
         n->lazy = 0;
@@ -239,6 +242,7 @@ ssize_t file_read(struct file *f, void *buf, size_t n) {
     case DEV_ZERO: memset(buf, 0, n); return n;
     case DEV_TTY: return tty_read(buf, n, f->flags & O_NONBLOCK);
     case DEV_FB: { ssize_t r = fb_read(f->off, buf, n); if (r > 0) f->off += r; return r; }
+    case DEV_INPUT: return input_read(buf, n, f->flags & O_NONBLOCK);
     }
     if (nd->lazy && node_load(nd)) return -EIO;
     if (f->off >= nd->size) return 0;
@@ -252,10 +256,12 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
     if (f->type != F_NODE) return -EBADF;
     struct node *nd = f->node;
     if (S_ISDIR(nd->mode)) return -EISDIR;
+    if (nd->readonly) return -EROFS;
     switch (nd->dev) {
     case DEV_NULL: case DEV_ZERO: return n;
     case DEV_TTY: return tty_write(buf, n);
     case DEV_FB: { ssize_t r = fb_write(f->off, buf, n); if (r > 0) f->off += r; return r; }
+    case DEV_INPUT: return -EINVAL;
     }
     if (f->flags & O_APPEND) f->off = nd->size;
     ssize_t r = node_write(nd, f->off, buf, n);
@@ -265,6 +271,7 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
 int file_readable(struct file *f) {
     if (f->type == F_PIPE_R) return f->pipe->rd != f->pipe->wr || !f->pipe->writers;
     if (f->type == F_NODE && f->node->dev == DEV_TTY) return tty_readable();
+    if (f->type == F_NODE && f->node->dev == DEV_INPUT) return input_readable();
     return 1;
 }
 
@@ -412,6 +419,8 @@ void vfs_finish(void) {
     mkdev("/dev/null", DEV_NULL); mkdev("/dev/zero", DEV_ZERO);
     if (fb_primary()) { mkdev("/dev/fb0", DEV_FB); struct node *fn = node_find("/dev/fb0"); if (fn) fn->size = fb_primary()->info.size; }
     if (!node_find("/dev")) node_create("/dev", S_IFDIR | 0755);
+    if (!node_find("/dev/input")) node_create("/dev/input", S_IFDIR | 0755);
+    mkdev("/dev/input/event0", DEV_INPUT);
     struct node *tmp = node_find("/tmp");
     if (!tmp) node_create("/tmp", S_IFDIR | 01777);
     else tmp->mode = S_IFDIR | 01777;

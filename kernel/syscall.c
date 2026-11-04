@@ -161,6 +161,17 @@ static long sys_ioctl(long fd, unsigned long cmd, uintptr_t arg) {
     return -ENOTTY;
 }
 
+/* read-only trees (FAT volumes): namespace changes under a read-only directory fail with EROFS */
+static int ro_parent(const char *abs) {
+    char par[PATH_MAX];
+    strlcpy(par, abs, sizeof par);
+    char *s = strrchr(par, '/');
+    if (!s) return 0;
+    if (s == par) par[1] = 0; else *s = 0;
+    struct node *p = node_find(par);
+    return p && p->readonly;
+}
+
 /* ---- namespace ---- */
 static long sys_getcwd(uintptr_t buf, size_t size) {
     size_t l = strlen(cur->cwd) + 1;
@@ -210,6 +221,7 @@ static long sys_mkdir(uintptr_t up, int mode) {
     char *s = strrchr(par, '/'); if (s == par) par[1] = 0; else *s = 0;
     struct node *pn = node_find(par);
     if (!pn || !S_ISDIR(pn->mode)) return -ENOENT;
+    if (ro_parent(abs)) return -EROFS;
     struct node *n = node_create(abs, S_IFDIR | (mode & ~cur->umask & 0777));
     if (!n) return -ENOMEM;
     persist_node_created(n);
@@ -222,6 +234,7 @@ static long sys_unlink(uintptr_t up, int rmdir) {
     if ((r = vfs_resolve(p, 0, abs))) return r;
     struct node *n = node_find(abs);
     if (!n || !strcmp(abs, "/")) return n ? -EPERM : -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
     if (S_ISDIR(n->mode)) {
         if (!rmdir) return -EISDIR;
         if (!node_is_empty_dir(n)) return -ENOTEMPTY;
@@ -235,6 +248,8 @@ static long sys_rename(uintptr_t a, uintptr_t b) {
     int r;
     if ((r = upath(a, p)) || (r = upath(b, q))) return r;
     if ((r = vfs_resolve(p, 0, x)) || (r = vfs_resolve(q, 0, y))) return r;
+    struct node *src = node_find(x);
+    if ((src && src->readonly) || ro_parent(x) || ro_parent(y)) return -EROFS;
     return vfs_rename(x, y);
 }
 static long sys_symlink(uintptr_t target, uintptr_t linkp) {
@@ -242,6 +257,7 @@ static long sys_symlink(uintptr_t target, uintptr_t linkp) {
     int r;
     if ((r = upath(target, t)) || (r = upath(linkp, p))) return r;
     if ((r = vfs_resolve(p, 0, abs))) return r;
+    if (ro_parent(abs)) return -EROFS;
     return vfs_symlink(t, abs);
 }
 static long sys_chmod(uintptr_t up, int mode) {
@@ -251,6 +267,7 @@ static long sys_chmod(uintptr_t up, int mode) {
     if ((r = vfs_resolve(p, 1, abs))) return r;
     struct node *n = node_find(abs);
     if (!n) return -ENOENT;
+    if (n->readonly) return -EROFS;
     n->mode = (n->mode & S_IFMT) | (mode & 07777);
     persist_chmod(n);
     return 0;

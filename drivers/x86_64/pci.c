@@ -23,6 +23,11 @@ int pci_find(uint16_t vendor, uint16_t device, struct pci_dev *out) {
         if (devs[i].vendor == vendor && devs[i].device == device) { *out = devs[i]; return 0; }
     return -1;
 }
+int pci_find_class(uint32_t cls, struct pci_dev *out) {         /* cls = class:subclass:prog-if, e.g. 0x0C0330 for xHCI */
+    for (int i = 0; i < ndev; i++)
+        if ((devs[i].class_rev >> 8) == cls) { *out = devs[i]; return 0; }
+    return -1;
+}
 uint32_t pci_bar(const struct pci_dev *d, int n) {
     uint32_t v = pci_read32(d->bus, d->dev, d->fn, 0x10 + 4 * n);
     return (v & 1) ? (v & ~3u) : (v & ~0xFu);
