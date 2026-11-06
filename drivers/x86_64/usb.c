@@ -178,25 +178,25 @@ void usb_attach(int p, int speed) {
     if (ctrl(p, 0x80, 6, 0x0200, 0, cfg, total) != total) { kfree(cfg); return; }
 
     struct usb_ep eps[8]; int n = 0;
-    int cur = 0, have_kbd = 0, have_mouse = 0, have_msc = 0;
+    int curif = 0, have_kbd = 0, have_mouse = 0, have_msc = 0;
     for (uint32_t o = 0; o + 2 <= total;) {
         uint8_t l = cfg[o], t = cfg[o + 1];
         if (l < 2 || o + l > total) break;
         if (t == 4 && l >= 9) {                           /* interface: alternate setting 0 only */
-            cur = 0;
+            curif = 0;
             uint8_t cls = cfg[o + 5], sub = cfg[o + 6], pr = cfg[o + 7];
             if (cfg[o + 3] == 0) {
-                if (cls == 3 && sub == 1 && pr == 1 && !have_kbd) { cur = 1; have_kbd = 1; d->kbd_if = cfg[o + 2]; }
-                else if (cls == 3 && sub == 1 && pr == 2 && !have_mouse) { cur = 2; have_mouse = 1; d->mouse_if = cfg[o + 2]; }
-                else if (cls == 8 && sub == 6 && pr == 0x50 && !have_msc) { cur = 3; have_msc = 1; }
+                if (cls == 3 && sub == 1 && pr == 1 && !have_kbd) { curif = 1; have_kbd = 1; d->kbd_if = cfg[o + 2]; }
+                else if (cls == 3 && sub == 1 && pr == 2 && !have_mouse) { curif = 2; have_mouse = 1; d->mouse_if = cfg[o + 2]; }
+                else if (cls == 8 && sub == 6 && pr == 0x50 && !have_msc) { curif = 3; have_msc = 1; }
             }
         } else if (t == 5 && l >= 7) {                    /* endpoint of the interface chosen above */
             uint8_t addr = cfg[o + 2], attr = cfg[o + 3] & 3;
             uint16_t mps = le16(cfg + o + 4);
             int use = 0;
-            if (cur == 1 && attr == 3 && (addr & 0x80)) { d->kbd_ep = addr; use = 1; }
-            else if (cur == 2 && attr == 3 && (addr & 0x80)) { d->mouse_ep = addr; use = 1; }
-            else if (cur == 3 && attr == 2) { if (addr & 0x80) d->msc_in = addr; else d->msc_out = addr; use = 1; }
+            if (curif == 1 && attr == 3 && (addr & 0x80)) { d->kbd_ep = addr; use = 1; }
+            else if (curif == 2 && attr == 3 && (addr & 0x80)) { d->mouse_ep = addr; use = 1; }
+            else if (curif == 3 && attr == 2) { if (addr & 0x80) d->msc_in = addr; else d->msc_out = addr; use = 1; }
             if (use && n < 8) eps[n++] = (struct usb_ep){ addr, (uint8_t)attr, mps, cfg[o + 6] };
         }
         o += l;

@@ -12,6 +12,11 @@ void console_putc(int c) {
     for (struct console *cn = consoles; cn; cn = cn->next) cn->write(c);
 }
 
+void console_serial_putc(int c) {
+    board_console_putc(c);
+    for (struct console *cn = consoles; cn; cn = cn->next) if (!cn->screen) cn->write(c);
+}
+
 void console_register(struct console *c) {
     c->next = 0;
     struct console **pp = &consoles;

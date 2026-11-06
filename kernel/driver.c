@@ -110,11 +110,11 @@ long dev_mmap_phys(uintptr_t phys, size_t len) {
     uintptr_t p_aligned = phys & ~(PAGE_SIZE - 1);
     size_t l_aligned = ((phys + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)) - p_aligned;
     if (arch_map_device(p_aligned, l_aligned)) return -EIO;
-    if (cur->mm.mmap_next < MMAP_BASE) cur->mm.mmap_next = MMAP_BASE;
-    uintptr_t va = cur->mm.mmap_next;
+    if (cur->mm->mmap_next < MMAP_BASE) cur->mm->mmap_next = MMAP_BASE;
+    uintptr_t va = cur->mm->mmap_next;
     if (va + l_aligned > USER_STACK_TOP - STACK_SIZE * 8) return -ENOMEM;
-    cur->mm.mmap_next += l_aligned;
-    int r = mm_map_dev(&cur->mm, va, l_aligned, p_aligned);
+    cur->mm->mmap_next += l_aligned;
+    int r = mm_map_dev(cur->mm, va, l_aligned, p_aligned);
     if (r) return r;
     return (long)(va + (phys & (PAGE_SIZE - 1)));
 }

@@ -24,7 +24,8 @@ static void draw(int x, int y, uint16_t cell) {
 }
 static void redraw_all(void) { fb_fill(fb, 0, 0, fb->info.width, fb->info.height, 0); }
 static struct vt_display display = { "fbcon", 0, 0, draw, redraw_all };
-static struct console fbcon = { "fbcon", vt_putc, vt_flush, 0 };
+static void fbcon_write(int c) { vt_write(0, c); }     /* kernel messages land on /dev/tty1 */
+static struct console fbcon = { "fbcon", fbcon_write, vt_flush, 0, 1 };
 
 void fbcon_attach(struct fb_device *d) {
     const char *opt = cmdline_get("fbcon");

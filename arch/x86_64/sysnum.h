@@ -27,6 +27,8 @@
 #define SYS_nanosleep 35
 #define SYS_getpid 39
 #define SYS_clone 56
+#define SYS_futex 202
+#define SYS_getcpu 309
 #define SYS_fork 57
 #define SYS_vfork 58
 #define SYS_execve 59
@@ -91,3 +93,4 @@
 #define STAT_SIZE 144
 #define SIGACT_SIZE 32
 #define CLONE_CTID_ARG(a3, a4) (a3)
+#define CLONE_TLS_ARG(a3, a4) (a4)

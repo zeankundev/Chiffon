@@ -10,7 +10,8 @@
 
 static void draw(int x, int y, uint16_t cell) { VGA_MEM[y * COLS + x] = cell; }
 static struct vt_display display = { "vga-text", COLS, ROWS, draw, 0 };
-static struct console con = { "vga-text", vt_putc, vt_flush, 0 };
+static void con_write(int c) { vt_write(0, c); }       /* kernel messages land on /dev/tty1 */
+static struct console con = { "vga-text", con_write, vt_flush, 0, 1 };
 
 static int probe(void) {
     if (fb_primary()) return -1;                          /* a graphics display already owns the screen */

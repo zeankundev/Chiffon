@@ -1,6 +1,8 @@
 #include "kernel.h"
 #include "sysnum.h"
 
+static void group_quiesce(void);
+
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
 #define AT_REMOVEDIR 0x200
@@ -8,10 +10,10 @@
 #define O_CLOEXEC 0x80000
 #define BOOT_EPOCH 1700000000UL
 
-static struct file *getfd(long fd) { return (fd < 0 || fd >= NOFILE) ? 0 : cur->fd[fd]; }
+static struct file *getfd(long fd) { return (fd < 0 || fd >= NOFILE) ? 0 : cur->ft->f[fd]; }
 static int fd_install(struct file *f, int minfd, int cloexec) {
     for (int i = minfd; i < NOFILE; i++)
-        if (!cur->fd[i]) { cur->fd[i] = f; cur->cloexec = (cur->cloexec & ~(1u << i)) | (cloexec ? 1u << i : 0); return i; }
+        if (!cur->ft->f[i]) { cur->ft->f[i] = f; cur->cloexec = (cur->cloexec & ~(1u << i)) | (cloexec ? 1u << i : 0); return i; }
     return -EMFILE;
 }
 static int upath(uintptr_t u, char *buf) { return ustrcpy(buf, u, PATH_MAX); }
@@ -110,7 +112,7 @@ static long sys_openat(long dirfd, uintptr_t upathp, int flags, int mode) {
 static long sys_close(long fd) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    file_close(f); cur->fd[fd] = 0; cur->cloexec &= ~(1u << fd);
+    file_close(f); cur->ft->f[fd] = 0; cur->cloexec &= ~(1u << fd);
     return 0;
 }
 static long sys_dup2(long o, long n, int cloexec) {
@@ -118,8 +120,8 @@ static long sys_dup2(long o, long n, int cloexec) {
     if (!f) return -EBADF;
     if (n < 0 || n >= NOFILE) return -EBADF;
     if (o == n) return n;
-    if (cur->fd[n]) file_close(cur->fd[n]);
-    cur->fd[n] = file_dup(f);
+    if (cur->ft->f[n]) file_close(cur->ft->f[n]);
+    cur->ft->f[n] = file_dup(f);
     cur->cloexec = (cur->cloexec & ~(1u << n)) | (cloexec ? 1u << n : 0);
     return n;
 }
@@ -146,7 +148,7 @@ static long sys_pipe2(uintptr_t ufds, int flags) {
     if (e) return e;
     int a = fd_install(r, 0, flags & O_CLOEXEC), b = a < 0 ? -1 : fd_install(w, 0, flags & O_CLOEXEC);
     if (a < 0 || b < 0) {
-        if (a >= 0) cur->fd[a] = 0;
+        if (a >= 0) cur->ft->f[a] = 0;
         file_close(r); file_close(w);
         return -EMFILE;
     }
@@ -156,7 +158,10 @@ static long sys_pipe2(uintptr_t ufds, int flags) {
 static long sys_ioctl(long fd, unsigned long cmd, uintptr_t arg) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (f->type == F_NODE && f->node->dev == DEV_TTY) return tty_ioctl(cmd, arg);
+    if (f->type == F_NODE && f->node->dev == DEV_TTY) {
+        int m = tty_resolve(f->node->minor);
+        return m < 0 ? m : tty_ioctl(m, cmd, arg);
+    }
     if (f->type == F_NODE && f->node->dev == DEV_FB) return fb_ioctl(cmd, arg);
     return -ENOTTY;
 }
@@ -282,7 +287,7 @@ static long sys_fsync(long fd) {
 
 /* ---- memory ---- */
 static long sys_brk(uintptr_t addr) {
-    struct mm *m = &cur->mm;
+    struct mm *m = cur->mm;
     if (!addr || addr < m->brk_start || addr >= MMAP_BASE) return m->brk_end;
     uintptr_t oe = (m->brk_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1), ne = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (ne > oe) { if (mm_map(m, oe, ne - oe)) return m->brk_end; }
@@ -291,7 +296,7 @@ static long sys_brk(uintptr_t addr) {
     return addr;
 }
 static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, long off) {
-    struct mm *m = &cur->mm;
+    struct mm *m = cur->mm;
     if (!len) return -EINVAL;
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     struct file *f = 0;
@@ -350,19 +355,78 @@ static long sys_execve(struct trapframe *tf, uintptr_t upathp, uintptr_t uargv, 
     if (r) return r;
     if ((r = copy_strv(uargv, &argv)) < 0) return r;
     if ((r = copy_strv(uenvp, &envp)) < 0) { free_strv(argv); return r; }
+    group_quiesce();
     r = proc_exec(cur, p, argv, envp, tf);
     free_strv(argv); free_strv(envp);
     return r;
 }
-static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t ptid, uintptr_t ctid) {
-    if (flags & (0x100 | 0x10000)) return -ENOSYS;     /* CLONE_VM / CLONE_THREAD: no threads yet */
+static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t ptid, uintptr_t tls, uintptr_t ctid) {
+    if (flags & 0x100) {                              /* CLONE_VM: a thread (CLONE_THREAD) or vfork-style sharing */
+        if (!(flags & 0x10000)) return -ENOSYS;
+#if ARCH_AARCH64
+        int tid = proc_thread(tf, flags, stack, tls, ctid);
+        if (tid < 0) return tid;
+        if ((flags & 0x100000) && uok(ptid, 4)) *(int *)ptid = tid;       /* CLONE_PARENT_SETTID */
+        return tid;
+#else
+        return -ENOSYS;                               /* x86_64 threads need fs_base TLS support first */
+#endif
+    }
     int pid = proc_fork(tf);
     if (pid < 0) return pid;
     struct proc *c = find_proc(pid);
     if (stack) TF_SP(c->tf) = stack;
     if ((flags & 0x100000) && uok(ptid, 4)) *(int *)ptid = pid;
-    if (flags & 0x1000000) mm_copyout(&c->mm, ctid, &pid, 4);
+    if (flags & 0x1000000) mm_copyout(c->mm, ctid, &pid, 4);
     return pid;
+}
+
+/* execve replaces the address space, so the other threads of the group must be gone first.  They are
+ * killed and this thread yields until they have exited (they leave at their next kernel boundary). */
+static void group_quiesce(void) {
+    for (;;) {
+        int others = 0;
+        for (int i = 0; i < NPROC; i++) {
+            struct proc *q = &ptable[i];
+            if (q == cur || q->tgid != cur->tgid || q->state == P_UNUSED || q->state == P_ZOMBIE || q->state == P_EMBRYO) continue;
+            others = 1;
+            if (!q->killed) proc_signal(q, 9);
+        }
+        if (!others) break;
+        yield();
+    }
+    if (cur->is_thread) {                             /* the exec'ing thread becomes the group leader */
+        cur->is_thread = 0;
+        cur->tgid = cur->pid;
+    }
+}
+
+/* futex(uaddr, op, val, timeout): FUTEX_WAIT sleeps while *uaddr == val; FUTEX_WAKE wakes waiters. */
+static long sys_futex(uintptr_t uaddr, int op, uint32_t val, uintptr_t timeout) {
+    op &= ~128;                                       /* FUTEX_PRIVATE_FLAG: same behaviour here */
+    if (!uok(uaddr, 4)) return -EFAULT;
+    if (op == 0 || op == 9) {                         /* FUTEX_WAIT, FUTEX_WAIT_BITSET */
+        uint64_t deadline = 0;
+        if (timeout) {
+            if (!uok(timeout, 16)) return -EFAULT;
+            uint64_t ms = ((uint64_t *)timeout)[0] * 1000 + ((uint64_t *)timeout)[1] / 1000000;
+            deadline = ticks + ms * HZ / 1000 + 1;
+        }
+        void *key = futex_key(cur->mm, uaddr);
+        cur->futex_woken = 0;
+        for (;;) {
+            if (*(volatile uint32_t *)uaddr != val) return -EAGAIN;
+            if (cur->killed) return -EINTR;
+            if (timeout && ticks >= deadline) return -ETIMEDOUT;
+            cur->futex_deadline = timeout ? deadline : 0;
+            sleep_on(key);
+            cur->futex_deadline = 0;
+            if (cur->futex_woken) { cur->futex_woken = 0; return 0; }
+        }
+    }
+    if (op == 1 || op == 10)                          /* FUTEX_WAKE, FUTEX_WAKE_BITSET */
+        return futex_wake_key(futex_key(cur->mm, uaddr), (int)val > 0 ? (int)val : 0);
+    return -ENOSYS;
 }
 static long sys_sigaction(int sig, uintptr_t act, uintptr_t oact) {
     if (sig <= 0 || sig > 64 || sig == 9 || sig == 19) return -EINVAL;
@@ -482,29 +546,37 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
 
     case SYS_brk: return sys_brk(a0);
     case SYS_mmap: return sys_mmap(a0, a1, a2, a3, a4, a5);
-    case SYS_munmap: return mm_unmap(&cur->mm, a0, a1);
+    case SYS_munmap: return mm_unmap(cur->mm, a0, a1);
     case SYS_mprotect: case SYS_madvise: return 0;
     case SYS_mremap: return -ENOMEM;
 
-    case SYS_clone: return sys_clone(tf, a0, a1, a2, CLONE_CTID_ARG(a3, a4));
+    case SYS_clone: return sys_clone(tf, a0, a1, a2, CLONE_TLS_ARG(a3, a4), CLONE_CTID_ARG(a3, a4));
+    case SYS_futex: return sys_futex(a0, a1, a2, a3);
+    case SYS_getcpu: {
+        uint32_t id = this_cpu()->id;
+        if (a0 && uok(a0, 4)) *(uint32_t *)a0 = id;
+        if (a1 && uok(a1, 4)) *(uint32_t *)a1 = 0;
+        return 0; }
     case SYS_execve: return sys_execve(tf, a0, a1, a2);
-    case SYS_exit: case SYS_exit_group: proc_exit((a0 & 0xff) << 8);
+    case SYS_exit: proc_exit((a0 & 0xff) << 8);                 /* this thread only */
+    case SYS_exit_group: proc_exit_group((a0 & 0xff) << 8);     /* the whole thread group */
     case SYS_wait4: return proc_wait(a0, a1, a2);
     case SYS_kill: return proc_kill(a0, a1);
-    case SYS_tgkill: return proc_kill(a1, a2);
+    case SYS_tgkill: return proc_kill_tid(a1, a2);
     case SYS_rt_sigaction: return sys_sigaction(a0, a1, a2);
     case SYS_rt_sigprocmask:
         if (a2 && uok(a2, 8)) *(uint64_t *)a2 = 0;
         return 0;
     case SYS_sigaltstack: return 0;
-    case SYS_getpid: case SYS_gettid: return cur->pid;
+    case SYS_getpid: return cur->tgid;
+    case SYS_gettid: return cur->pid;
     case SYS_getppid: return cur->ppid;
     case SYS_getuid: case SYS_geteuid: case SYS_getgid: case SYS_getegid: return 0;
     case SYS_setpgid: { struct proc *p = a0 ? find_proc(a0) : cur; if (!p) return -ESRCH; p->pgid = a1 ? a1 : p->pid; return 0; }
     case SYS_getpgid: { struct proc *p = a0 ? find_proc(a0) : cur; return p ? p->pgid : -ESRCH; }
-    case SYS_setsid: cur->pgid = cur->pid; return cur->pid;
+    case SYS_setsid: cur->pgid = cur->pid; cur->ctty = 0; return cur->pid;
     case SYS_sched_yield: yield(); return 0;
-    case SYS_set_tid_address: return cur->pid;
+    case SYS_set_tid_address: cur->clear_child_tid = a0; return cur->pid;
     case SYS_set_robust_list: return 0;
     case SYS_uname: return sys_uname(a0);
     case SYS_clock_gettime: return sys_clock_gettime(a1);

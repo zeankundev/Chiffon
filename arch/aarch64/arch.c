@@ -56,12 +56,12 @@ void arch_halt(void) { __asm__ volatile("msr daifset,#2"); for (;;) __asm__ vola
 #define PTE_TABLE 3UL
 #define PTE_USER_PAGE (3UL | (1UL << 2) | (1UL << 6) | (3UL << 8) | (1UL << 10) | (1UL << 11) | (1UL << 53))
 static uint8_t empty_l0[4096] __attribute__((aligned(4096)));
-static uintptr_t cur_root = ~0UL;
 
 uintptr_t arch_kernel_root(void) { return V2P(empty_l0); }
 void arch_aspace_switch(uintptr_t root) {
-    if (root == cur_root) return;
-    cur_root = root;
+    struct cpu *c = this_cpu();          /* TTBR0 is per CPU: each CPU caches what it has loaded */
+    if (root == c->aspace) return;
+    c->aspace = root;
     __asm__ volatile("msr ttbr0_el1,%0; isb; tlbi vmalle1; dsb ish; isb" :: "r"(root) : "memory");
 }
 uintptr_t arch_aspace_new(void) { return pmm_alloc(); }
@@ -79,7 +79,8 @@ void arch_aspace_free(uintptr_t root) {
         pmm_free(l0[i] & PA_MASK);
     }
     pmm_free(root);
-    if (cur_root == root) cur_root = ~0UL;
+    struct cpu *c = this_cpu();
+    if (c->aspace == root) c->aspace = ~0UL;
 }
 int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
     uint64_t *t = P2V(root);
@@ -140,4 +141,5 @@ void arch_tf_user(struct trapframe *tf, uintptr_t entry, uintptr_t sp) {
     tf->pc = entry; tf->sp = sp; tf->pstate = 0;        /* EL0t, interrupts enabled */
 }
 void arch_uctx_init(struct arch_uctx *u) { memset(u, 0, sizeof *u); }
+void arch_uctx_set_tls(struct arch_uctx *u, uintptr_t tls) { u->tpidr = tls; }
 

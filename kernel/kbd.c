@@ -49,6 +49,7 @@ void kbd_scancode(uint8_t sc, int release, int e0) {
     case 0x45: if (!release && !e0) numlock = !numlock; return;
     }
     if (release) return;
+    if (alt && !e0 && sc >= 0x3B && sc <= 0x3E) { vt_switch(sc - 0x3B); return; }   /* Alt+F1..F4: show that screen */
 
     const char *seq = 0;
     if (e0 || (sc >= 0x47 && sc <= 0x53 && !numlock)) {     /* navigation block (or keypad with NumLock off) */

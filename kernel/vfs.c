@@ -240,7 +240,10 @@ ssize_t file_read(struct file *f, void *buf, size_t n) {
     switch (nd->dev) {
     case DEV_NULL: return 0;
     case DEV_ZERO: memset(buf, 0, n); return n;
-    case DEV_TTY: return tty_read(buf, n, f->flags & O_NONBLOCK);
+    case DEV_TTY: {
+        int m = tty_resolve(nd->minor);
+        return m < 0 ? m : tty_read(m, buf, n, f->flags & O_NONBLOCK);
+    }
     case DEV_FB: { ssize_t r = fb_read(f->off, buf, n); if (r > 0) f->off += r; return r; }
     case DEV_INPUT: return input_read(buf, n, f->flags & O_NONBLOCK);
     }
@@ -259,7 +262,10 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
     if (nd->readonly) return -EROFS;
     switch (nd->dev) {
     case DEV_NULL: case DEV_ZERO: return n;
-    case DEV_TTY: return tty_write(buf, n);
+    case DEV_TTY: {
+        int m = tty_resolve(nd->minor);
+        return m < 0 ? m : tty_write(m, buf, n);
+    }
     case DEV_FB: { ssize_t r = fb_write(f->off, buf, n); if (r > 0) f->off += r; return r; }
     case DEV_INPUT: return -EINVAL;
     }
@@ -270,7 +276,10 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
 }
 int file_readable(struct file *f) {
     if (f->type == F_PIPE_R) return f->pipe->rd != f->pipe->wr || !f->pipe->writers;
-    if (f->type == F_NODE && f->node->dev == DEV_TTY) return tty_readable();
+    if (f->type == F_NODE && f->node->dev == DEV_TTY) {
+        int m = tty_resolve(f->node->minor);
+        return m < 0 ? 1 : tty_readable(m);
+    }
     if (f->type == F_NODE && f->node->dev == DEV_INPUT) return input_readable();
     return 1;
 }
@@ -338,10 +347,10 @@ static void mkparents(const char *abs) {
             *s = '/';
         }
 }
-static void mkdev(const char *path, int dev) {
+static void mkdev(const char *path, int dev, int minor) {
     struct node *n = node_find(path);
     if (!n) n = node_create(path, S_IFCHR | 0666);
-    if (n) { n->dev = dev; n->mode = S_IFCHR | 0666; }
+    if (n) { n->dev = dev; n->minor = minor; n->mode = S_IFCHR | 0666; }
 }
 
 void vfs_init(void) {
@@ -415,12 +424,18 @@ void vfs_load_cpio(const void *cpio, size_t size) {
 }
 
 void vfs_finish(void) {
-    mkdev("/dev/console", DEV_TTY); mkdev("/dev/tty", DEV_TTY); mkdev("/dev/ttyS0", DEV_TTY);
-    mkdev("/dev/null", DEV_NULL); mkdev("/dev/zero", DEV_ZERO);
-    if (fb_primary()) { mkdev("/dev/fb0", DEV_FB); struct node *fn = node_find("/dev/fb0"); if (fn) fn->size = fb_primary()->info.size; }
+    mkdev("/dev/console", DEV_TTY, TTY_SERIAL_MINOR); mkdev("/dev/ttyS0", DEV_TTY, TTY_SERIAL_MINOR);
+    mkdev("/dev/tty", DEV_TTY, TTY_CTTY_MINOR); mkdev("/dev/tty0", DEV_TTY, TTY_ACTIVE_MINOR);
+    for (int m = 1; m <= VT_SCREENS; m++) {
+        char name[16];
+        ksnprintf(name, sizeof name, "/dev/tty%d", m);
+        mkdev(name, DEV_TTY, m);
+    }
+    mkdev("/dev/null", DEV_NULL, 0); mkdev("/dev/zero", DEV_ZERO, 0);
+    if (fb_primary()) { mkdev("/dev/fb0", DEV_FB, 0); struct node *fn = node_find("/dev/fb0"); if (fn) fn->size = fb_primary()->info.size; }
     if (!node_find("/dev")) node_create("/dev", S_IFDIR | 0755);
     if (!node_find("/dev/input")) node_create("/dev/input", S_IFDIR | 0755);
-    mkdev("/dev/input/event0", DEV_INPUT);
+    mkdev("/dev/input/event0", DEV_INPUT, 0);
     struct node *tmp = node_find("/tmp");
     if (!tmp) node_create("/tmp", S_IFDIR | 01777);
     else tmp->mode = S_IFDIR | 01777;

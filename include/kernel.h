@@ -4,6 +4,7 @@
 #include <stdarg.h>
 #include "arch.h"
 #include "board.h"
+#include "smp.h"
 #include "ipc.h"
 
 typedef long ssize_t;
@@ -33,6 +34,7 @@ typedef long off_t;
 #define EINVAL 22
 #define EMFILE 24
 #define ENOTTY 25
+#define ENXIO 6
 #define ESPIPE 29
 #define EPIPE 32
 #define ERANGE 34
@@ -61,7 +63,7 @@ typedef long off_t;
 
 #define PATH_MAX 256
 
-#define NPROC 32
+#define NPROC 64
 #define NOFILE 32
 #define NVMA 64
 #define KSTACK_SIZE 16384
@@ -111,22 +113,30 @@ enum { P_UNUSED, P_EMBRYO, P_RUNNABLE, P_RUNNING, P_SLEEPING, P_ZOMBIE };
 
 struct vma { uintptr_t start, end; int dev; };   /* dev: maps device memory (never freed to the pmm) */
 struct mm {
+    int refs;
     uintptr_t root;
     struct vma vma[NVMA];
     int nvma;
     uintptr_t brk_start, brk_end, mmap_next;
 };
 struct file;
+struct filetab { int refs; struct file *f[NOFILE]; };
 
 struct proc {
     int pid, ppid, pgid, state, killed, exit_status, umask;
+    int tgid;                /* thread group: the pid of the group leader (getpid) */
+    int is_thread;           /* a clone(CLONE_THREAD) thread: not a child for wait4 */
+    uintptr_t clear_child_tid;   /* CLONE_CHILD_CLEARTID / set_tid_address: zeroed and woken on exit */
+    uint64_t futex_deadline; /* timed FUTEX_WAIT: wake at this tick */
+    int futex_woken;         /* set by FUTEX_WAKE */
+    int ctty;                /* controlling terminal: minor + 1, 0 = none */
     uint32_t cloexec;
     void *chan;
-    struct mm mm;
+    struct mm *mm;           /* shared by the threads of a group */
     uint8_t *kstack;
     uintptr_t ksp;
     struct trapframe *tf;
-    struct file *fd[NOFILE];
+    struct filetab *ft;      /* open files, shared by the threads of a group */
     char cwd[PATH_MAX];
     uint64_t sigh[65];
     struct arch_uctx uctx;
@@ -139,7 +149,6 @@ struct proc {
     int ncaps;
     struct proc_cap caps[MAX_PROC_CAPS];
 };
-extern struct proc *cur;
 extern struct proc ptable[NPROC];
 extern volatile uint64_t ticks;
 
@@ -169,6 +178,15 @@ extern int init_pid;
 int  proc_spawn_init(const char *path, char **argv, char **envp, const char *console);
 void init_exited(int wstatus);
 void check_killed(void);
+int  proc_thread(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t tls, uintptr_t ctid);
+void proc_exit_group(int wstatus) __attribute__((noreturn));
+int  proc_kill_tid(int tid, int sig);
+void mm_put(struct mm *m);
+void *futex_key(struct mm *m, uintptr_t uaddr);
+int  futex_wake_key(void *key, int n);
+#ifndef ETIMEDOUT
+#define ETIMEDOUT 110
+#endif
 
 int  mm_map(struct mm *mm, uintptr_t va, size_t len);
 int  mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa);   /* map device memory (e.g. /dev/fb0) */
@@ -181,6 +199,7 @@ int  ustrcpy(char *dst, uintptr_t usrc, size_t max);
 enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT };
 struct node {
     char *path; uint32_t mode; int dev;
+    int minor;       /* DEV_TTY: which terminal (serial, screen N, or a TTY_*_MINOR alias) */
     uint8_t *data; size_t size, cap; int is_static;
     uint32_t ino, mtime;
     const struct fs_driver *fs; uint32_t fs_ino; int lazy;
@@ -265,14 +284,21 @@ int  persist_sync_all(void);
 
 void procfs_refresh(void);
 
+/* tty.c: one terminal per device minor (0 = serial /dev/ttyS0, 1..VT_SCREENS = /dev/tty1..N) */
+#define TTY_SERIAL_MINOR 0
+#define TTY_ACTIVE_MINOR 253                 /* /dev/tty0: the screen currently shown */
+#define TTY_CTTY_MINOR   254                 /* /dev/tty: the caller's controlling terminal */
 void tty_init(void);
 void console_services_init(void);
-void tty_input(int c);
+void tty_input(int c);                       /* keyboard byte -> the active screen's tty */
+void tty_rx(int minor, int c);               /* input byte for a specific tty (serial) */
 void console_poll(void);
-ssize_t tty_read(void *buf, size_t n, int nonblock);
-ssize_t tty_write(const void *buf, size_t n);
-long tty_ioctl(unsigned long cmd, uintptr_t arg);
-int  tty_readable(void);
+int  tty_resolve(int minor);                 /* alias -> real minor, or -errno (-ENXIO without a controlling tty) */
+void tty_set_session(int minor, int pid);    /* make pid the session leader of a tty */
+ssize_t tty_read(int minor, void *buf, size_t n, int nonblock);
+ssize_t tty_write(int minor, const void *buf, size_t n);
+long tty_ioctl(int minor, unsigned long cmd, uintptr_t arg);
+int  tty_readable(int minor);
 ssize_t input_read(void *buf, size_t n, int nonblock);   /* kbd.c: /dev/input/event0 */
 int  input_readable(void);
 

@@ -39,7 +39,7 @@ void procfs_refresh(void) {
         alive[i] = p->pid;
         char st = p->state == P_RUNNING || p->state == P_RUNNABLE ? 'R' : p->state == P_ZOMBIE ? 'Z' : 'S';
         unsigned long vsz = 0;
-        for (int v = 0; v < p->mm.nvma; v++) vsz += p->mm.vma[v].end - p->mm.vma[v].start;
+        if (p->mm) for (int v = 0; v < p->mm->nvma; v++) vsz += p->mm->vma[v].end - p->mm->vma[v].start;
         ksnprintf(path, sizeof path, "/proc/%d", p->pid);
         if (!node_find(path)) node_create(path, S_IFDIR | 0555);
         ksnprintf(buf, sizeof buf, "%d (%s) %c %d %d %d 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 %lu %lu 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",

@@ -6,3 +6,4 @@ env/busybox/busybox-git
 env/testenv
 env/milkos
 env/doomlocal
+env/wldemo

@@ -166,6 +166,7 @@ void arch_uctx_init(struct arch_uctx *u) {
     *(uint32_t *)(u->fx + 24) = 0x1F80;              /* MXCSR */
 }
 void arch_uctx_save(struct arch_uctx *u) { __asm__ volatile("fxsave (%0)" :: "r"(u->fx) : "memory"); }
+void arch_uctx_set_tls(struct arch_uctx *u, uintptr_t tls) { u->fs_base = tls; }
 void arch_uctx_restore(struct arch_uctx *u) {
     __asm__ volatile("fxrstor (%0)" :: "r"(u->fx) : "memory");
     wrmsr(0xC0000100, u->fs_base);

@@ -29,3 +29,4 @@ void arch_tf_user(struct trapframe *tf, uintptr_t entry, uintptr_t sp);
 void arch_uctx_init(struct arch_uctx *u);
 void arch_uctx_save(struct arch_uctx *u);
 void arch_uctx_restore(struct arch_uctx *u);
+void arch_uctx_set_tls(struct arch_uctx *u, uintptr_t tls);

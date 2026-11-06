@@ -69,10 +69,10 @@ static int read_chain(struct fat_vol *v, uint32_t c, int nofat, uint64_t size, u
 /* whole directory contents; size 0 means "walk the FAT chain" (FAT32 directories record no size) */
 static uint8_t *read_dir(struct fat_vol *v, uint32_t c, int nofat, uint64_t size, uint64_t *len) {
     if (!size && !nofat) {
-        uint32_t cur = c; uint64_t n = 0;
-        while (cur >= 2 && cur - 2 < v->nclusters && !is_eoc(v, cur) && n < (1u << 20)) {
+        uint32_t clus = c; uint64_t n = 0;
+        while (clus >= 2 && clus - 2 < v->nclusters && !is_eoc(v, clus) && n < (1u << 20)) {
             n += v->clus_bytes;
-            cur = fat_next(v, cur);
+            clus = fat_next(v, clus);
         }
         size = n;
     }

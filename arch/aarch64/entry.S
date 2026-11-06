@@ -30,6 +30,7 @@
     .text
     .globl trap_return
 trap_return:
+    bl   klock_leave                  /* the kernel is done: give the lock back before returning */
     ldr  x21, [sp, #248]
     ldp  x22, x23, [sp, #256]
     msr  sp_el0, x21
@@ -56,11 +57,16 @@ trap_return:
 
 sync_entry:
     SAVE
-    mov  x0, sp
+    mrs  x0, spsr_el1
+    tst  x0, #0xF
+    b.ne 1f
+    bl   klock_enter                 /* from user space: take the kernel lock (kernel-mode faults panic) */
+1:  mov  x0, sp
     bl   sync_c
     b    trap_return
 irq_entry:
     SAVE
+    bl   klock_enter                 /* interrupts from user or from an idle CPU */
     mov  x0, sp
     bl   irq_c
     b    trap_return

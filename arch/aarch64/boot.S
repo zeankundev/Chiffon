@@ -122,3 +122,58 @@ boot_l1:    .space 4096
     .balign 16
 boot_stack: .space 16384
 boot_stack_top:
+
+/* Secondary CPUs (PSCI CPU_ON): enter with the MMU off at a physical address, x0 = CPU index.  They
+ * reuse the boot CPU's translation tables (kept in .bss) and its MAIR/TCR values, then jump to the
+ * kernel's upper-half address space and run secondary_main() on their own stack. */
+    .section .text.boot, "ax"
+    .globl secondary_start
+secondary_start:
+    mov  x19, x0
+    mov  x1, #(3 << 20)
+    msr  cpacr_el1, x1
+    isb
+    adrp x2, boot_l0_lo
+    add  x2, x2, :lo12:boot_l0_lo         /* TTBR0: identity map */
+    adrp x3, boot_l0_hi
+    add  x3, x3, :lo12:boot_l0_hi         /* TTBR1: kernel map   */
+    mov  x0, #0xFF00
+    msr  mair_el1, x0
+    mov  x0, #0x3510
+    movk x0, #0xB510, lsl #16
+    movk x0, #0x2, lsl #32
+    msr  tcr_el1, x0
+    msr  ttbr0_el1, x2
+    msr  ttbr1_el1, x3
+    isb
+    dsb  sy
+    tlbi vmalle1
+    dsb  sy
+    isb
+    mrs  x0, sctlr_el1
+    orr  x0, x0, #1
+    orr  x0, x0, #(1 << 2)
+    orr  x0, x0, #(1 << 12)
+    orr  x0, x0, #(1 << 23)
+    bic  x0, x0, #(1 << 19)
+    bic  x0, x0, #(1 << 1)
+    msr  sctlr_el1, x0
+    isb
+    ldr  x1, =secondary_high
+    br   x1
+
+secondary_high:
+    ldr  x0, =secondary_stacks
+    add  x0, x0, x19, lsl #14
+    add  x0, x0, #16384                   /* top of this CPU's 16 KiB boot stack */
+    mov  sp, x0
+    mov  x29, xzr
+    mov  x0, x19
+    bl   secondary_main
+1:  wfi
+    b    1b
+
+    .bss
+    .balign 16
+secondary_stacks: .space 262144           /* 16 CPUs x 16 KiB */
+

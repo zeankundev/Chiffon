@@ -60,6 +60,8 @@
 #define SYS_munmap 215
 #define SYS_mremap 216
 #define SYS_clone 220
+#define SYS_futex 98
+#define SYS_getcpu 168
 #define SYS_execve 221
 #define SYS_mmap 222
 #define SYS_mprotect 226
@@ -71,3 +73,4 @@
 #define STAT_SIZE 128
 #define SIGACT_SIZE 24
 #define CLONE_CTID_ARG(a3, a4) (a4)
+#define CLONE_TLS_ARG(a3, a4) (a3)

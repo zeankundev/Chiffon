@@ -1,9 +1,7 @@
 #include "kernel.h"
 
 struct proc ptable[NPROC];
-struct proc *cur;
 volatile uint64_t ticks;
-static uintptr_t sched_ctx;
 static int next_pid = 1;
 int init_pid = 1;
 static uint8_t kstacks[NPROC][KSTACK_SIZE] __attribute__((aligned(16)));
@@ -89,7 +87,7 @@ int uok(uintptr_t va, size_t len) {
     if (!len) return 1;
     if (va + len < va || va + len > USER_TOP) return 0;
     for (uintptr_t a = PGDN(va); a < va + len; a += PAGE_SIZE)
-        if (!arch_translate(cur->mm.root, a)) return 0;
+        if (!arch_translate(cur->mm->root, a)) return 0;
     return 1;
 }
 int ustrcpy(char *dst, uintptr_t usrc, size_t max) {
@@ -101,6 +99,51 @@ int ustrcpy(char *dst, uintptr_t usrc, size_t max) {
     return -ENAMETOOLONG;
 }
 
+/* ---- per-process resources: the address space and the open-file table are shared by a thread group ---- */
+static struct filetab *fdtab_new(void) {
+    struct filetab *t = kmalloc(sizeof *t);
+    if (t) { memset(t, 0, sizeof *t); t->refs = 1; }
+    return t;
+}
+static void fdtab_put(struct filetab *t) {
+    if (!t || --t->refs > 0) return;
+    for (int i = 0; i < NOFILE; i++) if (t->f[i]) { file_close(t->f[i]); t->f[i] = 0; }
+    kfree(t);
+}
+void mm_put(struct mm *m) {
+    if (!m || --m->refs > 0) return;
+    mm_free(m);
+    kfree(m);
+}
+
+/* ---- futexes: a waiter sleeps on the kernel alias of the futex word's physical address, so threads
+ * (and processes sharing memory) meet on the same key.  Wakeups happen under the kernel lock, so the
+ * check-then-sleep in FUTEX_WAIT cannot lose a wakeup. ---- */
+void *futex_key(struct mm *m, uintptr_t uaddr) {
+    uintptr_t pa = arch_translate(m->root, uaddr & ~(PAGE_SIZE - 1));
+    return pa ? P2V(pa + (uaddr & (PAGE_SIZE - 1))) : 0;
+}
+int futex_wake_key(void *key, int n) {
+    int woke = 0;
+    if (!key) return 0;
+    for (int i = 0; i < NPROC && woke < n; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == P_SLEEPING && p->chan == key) { p->futex_woken = 1; p->state = P_RUNNABLE; woke++; }
+    }
+    if (woke) sched_kick();
+    return woke;
+}
+static void futex_timeouts(void) {
+    int woke = 0;
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state == P_SLEEPING && p->futex_deadline && ticks >= p->futex_deadline) {
+            p->futex_deadline = 0; p->state = P_RUNNABLE; woke = 1;
+        }
+    }
+    if (woke) sched_kick();
+}
+
 struct proc *proc_alloc(void) {
     for (int i = 0; i < NPROC; i++) {
         struct proc *p = &ptable[i];
@@ -108,6 +151,7 @@ struct proc *proc_alloc(void) {
         memset(p, 0, sizeof *p);
         p->state = P_EMBRYO;
         p->pid = next_pid++;
+        p->tgid = p->pid;
         p->kstack = kstacks[i];
         p->umask = 022;
         strlcpy(p->cwd, "/", sizeof p->cwd);
@@ -116,43 +160,59 @@ struct proc *proc_alloc(void) {
     }
     return 0;
 }
+
+/* The scheduler loop of one CPU.  It is entered holding the kernel lock and keeps it while it
+ * switches to a process (the process resumes holding it); it releases it only while the CPU idles. */
 void scheduler(void) {
-    int last = 0;
+    struct cpu *c = this_cpu();
+    int last = c->id * 4;
     for (;;) {
-        struct proc *n = 0;
         for (int i = 0; i < NPROC; i++) if (ptable[i].state == P_ZOMBIE && ptable[i].ppid == 0) ptable[i].state = P_UNUSED;
+        struct proc *n = 0;
         for (int i = 1; i <= NPROC; i++) {
             struct proc *p = &ptable[(last + i) % NPROC];
             if (p->state == P_RUNNABLE) { n = p; last = p - ptable; break; }
         }
-        if (!n) { arch_idle(); continue; }
-        cur = n; n->state = P_RUNNING;
-        arch_aspace_switch(n->mm.root);
+        if (!n) {
+            c->idle = 1;
+            klock_leave();
+            arch_idle();
+            klock_enter();
+            c->idle = 0;
+            continue;
+        }
+        c->proc = n; n->state = P_RUNNING;
+        arch_aspace_switch(n->mm->root);
         arch_set_kstack((uintptr_t)n->kstack + KSTACK_SIZE);
         arch_uctx_restore(&n->uctx);
-        arch_switch(&sched_ctx, n->ksp);
+        arch_switch(&c->sched_ctx, n->ksp);
         arch_uctx_save(&n->uctx);
         arch_aspace_switch(arch_kernel_root());
-        cur = 0;
+        c->proc = 0;
     }
 }
-static void sched(void) { arch_switch(&cur->ksp, sched_ctx); }
+static void sched(void) { arch_switch(&cur->ksp, this_cpu()->sched_ctx); }
 void yield(void) { cur->state = P_RUNNABLE; sched(); }
 void sleep_on(void *chan) { cur->chan = chan; cur->state = P_SLEEPING; sched(); cur->chan = 0; }
 void wakeup(void *chan) {
+    int woke = 0;
     for (int i = 0; i < NPROC; i++)
-        if (ptable[i].state == P_SLEEPING && ptable[i].chan == chan) ptable[i].state = P_RUNNABLE;
+        if (ptable[i].state == P_SLEEPING && ptable[i].chan == chan) { ptable[i].state = P_RUNNABLE; woke = 1; }
+    if (woke) sched_kick();
 }
 void timer_tick(int from_user) {
-    ticks++;
+    if (this_cpu()->id == 0) {                /* one clock: only the boot CPU counts ticks */
+        ticks++;
+        wakeup((void *)&ticks);
+        futex_timeouts();
+    }
     console_poll();
-    wakeup((void *)&ticks);
     if (from_user && cur && cur->state == P_RUNNING) yield();
 }
 
 void proc_signal(struct proc *p, int sig) {
     if (sig <= 0 || sig > 64) return;
-    if (p->pid == init_pid && (sig == 10 || sig == 12 || sig == 15)) {
+    if (!p->is_thread && p->pid == init_pid && (sig == 10 || sig == 12 || sig == 15)) {
         kprintf("[chiffon] powering off\n");
         kernel_poweroff();
     }
@@ -161,27 +221,43 @@ void proc_signal(struct proc *p, int sig) {
     case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 28: return;
     }
     p->killed = sig;
-    if (p->state == P_SLEEPING) p->state = P_RUNNABLE;
+    if (p->state == P_SLEEPING) { p->state = P_RUNNABLE; sched_kick(); }
 }
+/* kill(pid): every thread of the process group leader pid (pid > 0), or a process group. */
 int proc_kill(int pid, int sig) {
     int found = 0;
     for (int i = 0; i < NPROC; i++) {
         struct proc *p = &ptable[i];
         if (p->state == P_UNUSED || p->state == P_EMBRYO || p->state == P_ZOMBIE) continue;
-        if (pid > 0 ? p->pid == pid : pid == 0 ? p->pgid == cur->pgid : pid == -1 ? p->pid != init_pid : p->pgid == -pid) {
+        if (pid > 0 ? p->tgid == pid : pid == 0 ? p->pgid == cur->pgid : pid == -1 ? p->pid != init_pid : p->pgid == -pid) {
             found = 1; proc_signal(p, sig);
         }
     }
     return found ? 0 : -ESRCH;
+}
+/* tgkill(tgid, tid, sig): one thread. */
+int proc_kill_tid(int tid, int sig) {
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *p = &ptable[i];
+        if (p->state != P_UNUSED && p->state != P_EMBRYO && p->state != P_ZOMBIE && p->pid == tid) {
+            proc_signal(p, sig);
+            return 0;
+        }
+    }
+    return -ESRCH;
 }
 void check_killed(void) { if (cur->killed) proc_exit(cur->killed); }
 
 int proc_fork(struct trapframe *tf) {
     struct proc *c = proc_alloc();
     if (!c) return -EAGAIN;
-    struct mm *pm = &cur->mm, *cm = &c->mm;
+    c->ft = fdtab_new();
+    if (!c->ft) { c->state = P_UNUSED; return -ENOMEM; }
+    struct mm *pm = cur->mm, *cm = kmalloc(sizeof *cm);
+    if (!cm) { fdtab_put(c->ft); c->ft = 0; c->state = P_UNUSED; return -ENOMEM; }
+    memset(cm, 0, sizeof *cm); cm->refs = 1; c->mm = cm;
     cm->root = arch_aspace_new();
-    if (!cm->root) { c->state = P_UNUSED; return -ENOMEM; }
+    if (!cm->root) { kfree(cm); c->mm = 0; fdtab_put(c->ft); c->ft = 0; c->state = P_UNUSED; return -ENOMEM; }
     cm->nvma = pm->nvma; memcpy(cm->vma, pm->vma, sizeof pm->vma);
     cm->brk_start = pm->brk_start; cm->brk_end = pm->brk_end; cm->mmap_next = pm->mmap_next;
     for (int i = 0; i < pm->nvma; i++)
@@ -189,21 +265,22 @@ int proc_fork(struct trapframe *tf) {
             uintptr_t src = arch_translate(pm->root, a);
             if (!src || arch_translate(cm->root, a)) continue;
             if (pm->vma[i].dev) {
-                if (arch_map(cm->root, a, src)) { mm_free(cm); c->state = P_UNUSED; return -ENOMEM; }
+                if (arch_map(cm->root, a, src)) { mm_put(cm); c->mm = 0; c->state = P_UNUSED; return -ENOMEM; }
                 continue;
             }
             uintptr_t dst = pmm_alloc();
-            if (!dst) { mm_free(cm); c->state = P_UNUSED; return -ENOMEM; }
+            if (!dst) { mm_put(cm); c->mm = 0; c->state = P_UNUSED; return -ENOMEM; }
             memcpy(P2V(dst), P2V(src), PAGE_SIZE);
             arch_sync_icache(P2V(dst), PAGE_SIZE);
             arch_map(cm->root, a, dst);
         }
-    for (int i = 0; i < NOFILE; i++) if (cur->fd[i]) c->fd[i] = file_dup(cur->fd[i]);
+    for (int i = 0; i < NOFILE; i++) if (cur->ft->f[i]) c->ft->f[i] = file_dup(cur->ft->f[i]);
     c->cloexec = cur->cloexec;
     strlcpy(c->cwd, cur->cwd, sizeof c->cwd);
     memcpy(c->sigh, cur->sigh, sizeof c->sigh);
     memcpy(c->name, cur->name, sizeof c->name);
     c->umask = cur->umask; c->pgid = cur->pgid; c->ppid = cur->pid;
+    c->ctty = cur->ctty;
     c->is_driver_loader = cur->is_driver_loader;
     c->ncaps = cur->ncaps;
     memcpy(c->caps, cur->caps, sizeof cur->caps);
@@ -212,28 +289,50 @@ int proc_fork(struct trapframe *tf) {
     c->tf = arch_kstack_setup((uintptr_t)c->kstack + KSTACK_SIZE, &c->ksp, tf);
     TF_RET(c->tf) = 0;
     c->state = P_RUNNABLE;
+    sched_kick();
     return c->pid;
 }
 
+/* Terminate the calling thread.  The group leader's exit reparents its children; a thread just goes
+ * away (reaped by the scheduler, nobody waits for it).  The address space and the open-file table are
+ * released when the last thread of the group drops them. */
 void proc_exit(int wstatus) {
     struct proc *p = cur;
-    int was_init = (p->pid == init_pid);
+    int was_init = !p->is_thread && p->pid == init_pid;
     if (was_init) init_exited(wstatus);
+    if (p->clear_child_tid) {                  /* pthread_join waits for this word to become 0 */
+        uint32_t zero = 0;
+        if (uok(p->clear_child_tid, 4)) mm_copyout(p->mm, p->clear_child_tid, &zero, 4);
+        futex_wake_key(futex_key(p->mm, p->clear_child_tid), NPROC);
+        p->clear_child_tid = 0;
+    }
     ipc_proc_exit(p);
     dev_driver_cleanup(p);
-    for (int i = 0; i < NOFILE; i++) if (p->fd[i]) { file_close(p->fd[i]); p->fd[i] = 0; }
     arch_aspace_switch(arch_kernel_root());
-    mm_free(&p->mm);
-    for (int i = 0; i < NPROC; i++) {
-        struct proc *q = &ptable[i];
-        if (q->state != P_UNUSED && q->ppid == p->pid) { q->ppid = init_pid; if (q->state == P_ZOMBIE) for (int j = 0; j < NPROC; j++) if (ptable[j].pid == init_pid) wakeup(&ptable[j]); }
+    fdtab_put(p->ft); p->ft = 0;
+    mm_put(p->mm); p->mm = 0;
+    if (!p->is_thread) {
+        for (int i = 0; i < NPROC; i++) {
+            struct proc *q = &ptable[i];
+            if (q->state != P_UNUSED && q->ppid == p->tgid) { q->ppid = init_pid; if (q->state == P_ZOMBIE) for (int j = 0; j < NPROC; j++) if (ptable[j].pid == init_pid) wakeup(&ptable[j]); }
+        }
     }
     p->exit_status = wstatus;
-    if (was_init) p->ppid = 0;
+    if (was_init || p->is_thread) p->ppid = 0;
     p->state = P_ZOMBIE;
     for (int i = 0; i < NPROC; i++) if (ptable[i].pid == p->ppid && ptable[i].state != P_UNUSED) wakeup(&ptable[i]);
     sched();
     panic("zombie scheduled");
+}
+
+/* exit_group: every other thread of the group is killed, then the caller exits. */
+void proc_exit_group(int wstatus) {
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *q = &ptable[i];
+        if (q != cur && q->tgid == cur->tgid && q->state != P_UNUSED && q->state != P_EMBRYO && q->state != P_ZOMBIE)
+            proc_signal(q, 9);
+    }
+    proc_exit(wstatus);
 }
 
 int proc_wait(int pid, uintptr_t ustatus, int options) {
@@ -241,7 +340,7 @@ int proc_wait(int pid, uintptr_t ustatus, int options) {
         int have = 0;
         for (int i = 0; i < NPROC; i++) {
             struct proc *q = &ptable[i];
-            if (q->state == P_UNUSED || q->state == P_EMBRYO || q->ppid != cur->pid) continue;
+            if (q->state == P_UNUSED || q->state == P_EMBRYO || q->is_thread || q->ppid != cur->tgid) continue;
             if (pid > 0 && q->pid != pid) continue;
             have = 1;
             if (q->state == P_ZOMBIE) {
@@ -256,6 +355,31 @@ int proc_wait(int pid, uintptr_t ustatus, int options) {
         if (cur->killed) return -EINTR;
         sleep_on(cur);
     }
+}
+
+/* clone(CLONE_VM | CLONE_THREAD ...): a thread is a process that shares its group's address space,
+ * open files and thread group id.  The per-process state (registers, signals, cwd) is copied by
+ * proc_fork and then the shared parts are pointed at the group's objects. */
+int proc_thread(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t tls, uintptr_t ctid) {
+    int pid = proc_fork(tf);
+    if (pid < 0) return pid;
+    struct proc *c = 0;
+    for (int i = 0; i < NPROC; i++) if (ptable[i].pid == pid) c = &ptable[i];
+    mm_put(c->mm);
+    c->mm = cur->mm; cur->mm->refs++;
+    if (flags & 0x400) {                        /* CLONE_FILES: share the open-file table */
+        fdtab_put(c->ft);
+        c->ft = cur->ft; cur->ft->refs++;
+    }
+    c->tgid = cur->tgid;
+    c->is_thread = 1;
+    c->ppid = cur->ppid;
+    TF_RET(c->tf) = 0;
+    if (stack) TF_SP(c->tf) = stack;
+    if (flags & 0x80000) arch_uctx_set_tls(&c->uctx, tls);            /* CLONE_SETTLS */
+    if (flags & 0x200000) c->clear_child_tid = ctid;                  /* CLONE_CHILD_CLEARTID */
+    if ((flags & 0x1000000) && uok(ctid, 4)) *(int *)ctid = pid;      /* CLONE_CHILD_SETTID */
+    return pid;
 }
 
 #define AT_NULL 0
@@ -399,12 +523,15 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
             if (pa) arch_sync_icache(P2V(pa), PAGE_SIZE);
         }
 
-    struct mm old = p->mm;
-    p->mm = nm;
-    if (p == cur) arch_aspace_switch(p->mm.root);
-    mm_free(&old);
+    struct mm *heap = kmalloc(sizeof *heap);
+    if (!heap) { r = -ENOMEM; goto fail; }
+    *heap = nm; heap->refs = 1;
+    struct mm *old = p->mm;
+    p->mm = heap;
+    if (p == cur) arch_aspace_switch(heap->root);
+    mm_put(old);
     for (int i = 0; i < NOFILE; i++)
-        if (p->fd[i] && (p->cloexec >> i & 1)) { file_close(p->fd[i]); p->fd[i] = 0; }
+        if (p->ft->f[i] && (p->cloexec >> i & 1)) { file_close(p->ft->f[i]); p->ft->f[i] = 0; }
     p->cloexec = 0;
     for (int i = 1; i < 65; i++) if (p->sigh[i] != 1) p->sigh[i] = 0;
     arch_tf_user(tf, entry, sp);
@@ -421,17 +548,26 @@ fail:
 int proc_spawn_init(const char *path, char **argv, char **envp, const char *console) {
     struct proc *p = proc_alloc();
     if (!p) return -EAGAIN;
-    p->mm.root = arch_aspace_new();
+    p->mm = kmalloc(sizeof *p->mm);
+    if (!p->mm) { fdtab_put(p->ft); p->ft = 0; p->state = P_UNUSED; return -ENOMEM; }
+    memset(p->mm, 0, sizeof *p->mm); p->mm->refs = 1;
+    p->mm->root = arch_aspace_new();
     p->pgid = p->pid;
+    p->ft = fdtab_new();
+    if (!p->ft) { p->state = P_UNUSED; return -ENOMEM; }
     for (int i = 0; i < 3; i++) {
-        int r = vfs_open(console, 2, 0, &p->fd[i]);
-        if (r) { for (int j = 0; j < i; j++) file_close(p->fd[j]); mm_free(&p->mm); p->state = P_UNUSED; return r; }
+        int r = vfs_open(console, 2, 0, &p->ft->f[i]);
+        if (r) { for (int j = 0; j < i; j++) file_close(p->ft->f[j]); mm_put(p->mm); p->mm = 0; p->state = P_UNUSED; return r; }
+    }
+    if (p->ft->f[0]->type == F_NODE && p->ft->f[0]->node->dev == DEV_TTY && p->ft->f[0]->node->minor < TTY_ACTIVE_MINOR) {
+        p->ctty = p->ft->f[0]->node->minor + 1;               /* the init console is its controlling terminal */
+        tty_set_session(p->ft->f[0]->node->minor, p->pid);
     }
     struct trapframe tf; memset(&tf, 0, sizeof tf);
     int r = proc_exec(p, path, argv, envp, &tf);
     if (r) {
-        for (int i = 0; i < 3; i++) file_close(p->fd[i]);
-        mm_free(&p->mm); p->state = P_UNUSED;
+        for (int i = 0; i < 3; i++) file_close(p->ft->f[i]);
+        mm_put(p->mm); p->mm = 0; p->state = P_UNUSED;
         return r;
     }
     p->tf = arch_kstack_setup((uintptr_t)p->kstack + KSTACK_SIZE, &p->ksp, &tf);

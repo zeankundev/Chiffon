@@ -102,6 +102,7 @@ static void load_config(void) {
 }
 
 void kmain(uintptr_t bootinfo) {
+    smp_bsp_init();                                 /* per-CPU pointer + the kernel lock (see smp.h) */
     board_early_init(bootinfo);
     cmdline_set(board_cmdline());
     kprintf("Chiffon %s (%s, %s)\n", VERSION, VERNAME, ARCH_NAME);
@@ -139,5 +140,6 @@ void kmain(uintptr_t bootinfo) {
     if (start_init() <= 0) 
         panic("no init process could be started. Either provide a root disk with /sbin/init, configuring [init] section in chiffon.ini, or use a valid initramfs");
     kprintf("\n");
+    smp_init();                                     /* start the other CPUs; they join the scheduler */
     scheduler();
 }
