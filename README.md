@@ -1,3 +1,5 @@
+<img width="1396" height="404" alt="image" src="https://github.com/user-attachments/assets/3a527007-f556-43cf-86a2-f10c9f621caa" />
+
 # Chiffon
 A Unix-like **hybrid kernel** (microkernel core with kernel-space essential services and user-space device servers reached through IPC) + operating system for aarch64 and x86_64.
 
