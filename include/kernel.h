@@ -178,6 +178,7 @@ extern int init_pid;
 int  proc_spawn_init(const char *path, char **argv, char **envp, const char *console);
 void init_exited(int wstatus);
 void check_killed(void);
+int  proc_spawn_console(const char *path, char **argv, char **envp, const char *console);
 int  proc_thread(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t tls, uintptr_t ctid);
 void proc_exit_group(int wstatus) __attribute__((noreturn));
 int  proc_kill_tid(int tid, int sig);
@@ -291,6 +292,7 @@ void procfs_refresh(void);
 void tty_init(void);
 void console_services_init(void);
 void tty_input(int c);                       /* keyboard byte -> the active screen's tty */
+int  tty_key_event(int minor, uint16_t code, int release);   /* direct mode: key -> that tty's key queue; 0 = line mode */
 void tty_rx(int minor, int c);               /* input byte for a specific tty (serial) */
 void console_poll(void);
 int  tty_resolve(int minor);                 /* alias -> real minor, or -errno (-ENXIO without a controlling tty) */

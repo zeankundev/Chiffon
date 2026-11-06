@@ -127,3 +127,16 @@ struct chi_fb_fix_screeninfo {                        /* 80 bytes on LP64, == st
  *   CHI_EV_BTN  code 0 = left, 1 = right, 2 = middle                                          value 1 = press, 0 = release */
 struct chi_input_event { chi_u16 type, code; chi_s32 value; };
 enum { CHI_EV_KEY = 1, CHI_EV_REL = 2, CHI_EV_BTN = 3 };
+
+/* Keyboard delivery mode of a tty (CHI_KBDSETMODE / CHI_KBDGETMODE on /dev/ttyN, /dev/tty, /dev/tty0).
+ * Chiffon numbers on purpose: they are not Linux KDSKBMODE (0x4B45) and must not be confused with it.
+ *   CHI_KBDMODE_TTY     keys go through the line discipline (default): line buffering, echo, ^C / ^\ signals.
+ *   CHI_KBDMODE_DIRECT  keys bypass the line discipline entirely: no line buffer, no echo, no signals.
+ *                       read() returns struct chi_input_event records (CHI_EV_KEY; code = scancode set 1,
+ *                       | 0x100 for E0 keys; value 1 = press, 0 = release), n must be >= 8.
+ *                       Alt+F1..F4 still switch screens (kernel hotkey). The mode ends, back to TTY,
+ *                       when the process that set it exits, so a crashed program cannot leave the keyboard dead. */
+#define CHI_KBDSETMODE   0x4B80
+#define CHI_KBDGETMODE   0x4B81
+#define CHI_KBDMODE_TTY     0
+#define CHI_KBDMODE_DIRECT  1

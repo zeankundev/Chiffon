@@ -22,6 +22,7 @@ Chiffon is a Unix-like **hybrid kernel** (microkernel core + kernel-space core s
 | **VFS & Storage** | Verified (ext read-only; changes logged) | Ext2/3/4 reader mounts read-only. Mutations (create, write, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `chmod`) are recorded in a write-ahead log in the last 4 MiB of the disk (`kernel/persist.c`) and replayed at boot. Saved on close, `fsync`, `sync` and power-off. Reset by `make` rebuilding the image. Verified on aarch64 (virtio-blk) and x86_64 (ATA PIO): reboot, rename, unlink, compaction and a hard stop. |
 | **Processes** | Verified (Single-CPU) | `fork`, `execve`, `wait4`, `exit`. Fixed limits: `NPROC = 32`, `NOFILE = 32`. Single-CPU execution (SMP locking planned for Phase 3/4). |
 | **Virtual Memory** | Verified | Flat 4 GiB direct map (`MAXFRAMES = 1 << 20`). User space up to `0x00007FFFFFFFF000`. |
+| **Keyboard delivery** | Verified in QEMU (x86_64 PS/2, aarch64 virtio-input); test program not committed | Per-tty `CHI_KBDSETMODE` / `CHI_KBDGETMODE` (`include/uapi/chiffon_abi.h`). `CHI_KBDMODE_DIRECT` sends each key press/release as a `chi_input_event` record straight to the reader: no line buffer, no echo, no ^C/^\ signals. Alt+F1..F4 stay a kernel hotkey. The mode ends when the process that set it exits. Default is `CHI_KBDMODE_TTY` (unchanged line discipline). |
 
 ## 3. Capabilities & Syscall Interface
 
@@ -49,3 +50,4 @@ Run under QEMU (`make run`):
 - `drvloader start fb`: Start the user-space framebuffer server.
 - `ipcdemo`: Demonstrate client-to-server IPC and graphics operations.
 - `fsutil write /tmp/a hello`, then `poweroff` and boot again: `cat /tmp/a` shows the change (persistence check). `fsutil fill 3000` forces a log compaction.
+- Direct keyboard mode: a program opens `/dev/tty0`, calls `chiffon_ioctl(fd, CHI_KBDSETMODE, (void *)CHI_KBDMODE_DIRECT)`, then reads `struct chi_input_event` records. Type into the QEMU window (or `sendkey` on the monitor) and check that Ctrl-C arrives as a key record and no signal is sent.

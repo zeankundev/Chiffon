@@ -545,7 +545,8 @@ fail:
     return r;
 }
 
-int proc_spawn_init(const char *path, char **argv, char **envp, const char *console) {
+/* Start a process on a terminal: init (pid 1, sets init_pid) or an extra console shell (not init). */
+static int spawn_process(const char *path, char **argv, char **envp, const char *console, int as_init) {
     struct proc *p = proc_alloc();
     if (!p) return -EAGAIN;
     p->mm = kmalloc(sizeof *p->mm);
@@ -571,9 +572,20 @@ int proc_spawn_init(const char *path, char **argv, char **envp, const char *cons
         return r;
     }
     p->tf = arch_kstack_setup((uintptr_t)p->kstack + KSTACK_SIZE, &p->ksp, &tf);
-    strlcpy(p->name, "init", sizeof p->name);
+    strlcpy(p->name, as_init ? "init" : "sh", sizeof p->name);
     p->is_driver_loader = 1;
     p->state = P_RUNNABLE;
-    init_pid = p->pid;
+    if (as_init) init_pid = p->pid;
+    sched_kick();
     return p->pid;
+}
+
+int proc_spawn_init(const char *path, char **argv, char **envp, const char *console) {
+    return spawn_process(path, argv, envp, console, 1);
+}
+
+/* A second console shell (e.g. on the framebuffer terminal).  It is not init: its exit does not power the
+ * system off, and it has no parent to wait for it (it is reaped when it exits). */
+int proc_spawn_console(const char *path, char **argv, char **envp, const char *console) {
+    return spawn_process(path, argv, envp, console, 0);
 }

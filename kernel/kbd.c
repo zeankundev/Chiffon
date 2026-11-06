@@ -40,16 +40,22 @@ ssize_t input_read(void *buf, size_t n, int nonblock) {
 }
 
 void kbd_scancode(uint8_t sc, int release, int e0) {
-    ev_push(CHI_EV_KEY, (uint16_t)(sc | (e0 ? 0x100 : 0)), release ? 0 : 1);
-    switch (sc) {                                           /* modifiers */
-    case 0x2A: case 0x36: if (!e0) { shift = !release; return; } break;
-    case 0x1D: ctrl = !release; return;
-    case 0x38: alt = !release; return;
-    case 0x3A: if (!release) caps = !caps; return;
-    case 0x45: if (!release && !e0) numlock = !numlock; return;
+    uint16_t code = (uint16_t)(sc | (e0 ? 0x100 : 0));
+    ev_push(CHI_EV_KEY, code, release ? 0 : 1);
+    int modifier = 0;                                       /* state keys: they never type anything */
+    switch (sc) {
+    case 0x2A: case 0x36: if (!e0) { shift = !release; modifier = 1; } break;
+    case 0x1D: ctrl = !release; modifier = 1; break;
+    case 0x38: alt = !release; modifier = 1; break;
+    case 0x3A: if (!release) caps = !caps; modifier = 1; break;
+    case 0x45: if (!release && !e0) numlock = !numlock; modifier = 1; break;
     }
-    if (release) return;
-    if (alt && !e0 && sc >= 0x3B && sc <= 0x3E) { vt_switch(sc - 0x3B); return; }   /* Alt+F1..F4: show that screen */
+    if (alt && !e0 && sc >= 0x3B && sc <= 0x3E) {           /* Alt+F1..F4: kernel hotkey, also in direct mode */
+        if (!release) vt_switch(sc - 0x3B);
+        return;
+    }
+    if (tty_key_event(vt_active() + 1, code, release)) return;   /* direct mode: the key goes out untranslated */
+    if (modifier || release) return;
 
     const char *seq = 0;
     if (e0 || (sc >= 0x47 && sc <= 0x53 && !numlock)) {     /* navigation block (or keypad with NumLock off) */

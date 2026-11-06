@@ -27,6 +27,7 @@ enum { VINTR, VQUIT, VERASE, VKILL, VEOF, VTIME, VMIN };
 struct ktermios { uint32_t iflag, oflag, cflag, lflag; uint8_t line; uint8_t cc[19]; };
 
 #define INQ 1024
+#define KQ 128                             /* direct keyboard mode: queued key events per tty */
 #define LINEMAX 256
 #define NTTY (1 + VT_SCREENS)
 
@@ -38,6 +39,10 @@ struct tty {
     char line[LINEMAX];
     size_t llen;
     int eof_flag;
+    int kbdmode;                           /* CHI_KBDMODE_TTY or CHI_KBDMODE_DIRECT */
+    int kowner;                            /* pid that asked for direct mode; the mode ends when it exits */
+    struct chi_input_event kq[KQ];         /* direct mode: key events, 8-byte records */
+    size_t khead, ktail;
 };
 static struct tty ttys[NTTY];
 
@@ -93,6 +98,38 @@ static void signal_fg(struct tty *t, int sig) {
     }
 }
 
+/* ---- direct keyboard mode (CHI_KBDMODE_DIRECT) ----------------------------------------------
+ * Keys of the active screen skip the line discipline: no line buffer, no echo, no ^C / ^\ signals.
+ * The reader gets struct chi_input_event records. Ownership: the mode belongs to the pid that set it,
+ * and reverts to line mode as soon as that process is gone (checked when a key or a read comes in). */
+static void kbd_reset(struct tty *t) {
+    t->kbdmode = CHI_KBDMODE_TTY;
+    t->kowner = 0;
+    t->khead = t->ktail = 0;
+}
+
+static int kbd_direct(struct tty *t) {
+    if (t->kbdmode != CHI_KBDMODE_DIRECT) return 0;
+    for (int i = 0; i < NPROC; i++)
+        if (ptable[i].pid == t->kowner && ptable[i].state != P_UNUSED && ptable[i].state != P_ZOMBIE) return 1;
+    kbd_reset(t);                          /* owner exited: give the keyboard back to the line discipline */
+    wakeup(t);
+    return 0;
+}
+
+/* Called by the keyboard layer for every key of the active screen. Returns 1 when the key was taken
+ * by direct mode (the caller must not translate it), 0 when the tty is in line mode. */
+int tty_key_event(int minor, uint16_t code, int release) {
+    if (minor < 0 || minor >= NTTY) return 0;
+    struct tty *t = &ttys[minor];
+    if (!kbd_direct(t)) return 0;
+    if (t->khead - t->ktail < KQ) {        /* reader too slow: drop, never block the IRQ path */
+        t->kq[t->khead++ % KQ] = (struct chi_input_event){ CHI_EV_KEY, code, release ? 0 : 1 };
+        wakeup(t);
+    }
+    return 1;
+}
+
 void tty_rx(int minor, int c) {
     if (minor < 0 || minor >= NTTY) return;
     struct tty *t = &ttys[minor];
@@ -134,6 +171,7 @@ void console_poll(void) {
 int tty_readable(int minor) {
     if (minor < 0 || minor >= NTTY) return 1;
     struct tty *t = &ttys[minor];
+    if (kbd_direct(t)) return t->khead != t->ktail;
     return t->ihead != t->itail || ((t->tio.lflag & ICANON) && t->eof_flag);
 }
 
@@ -144,6 +182,18 @@ ssize_t tty_read(int minor, void *buf, size_t n, int nonblock) {
     if (!n) return 0;
     for (;;) {
         if (cur->killed) return -EINTR;
+        if (kbd_direct(t)) {               /* direct mode: whole key-event records, never line data */
+            if (n < sizeof(struct chi_input_event)) return -EINVAL;
+            if (t->khead != t->ktail) {
+                struct chi_input_event *ev = buf;
+                size_t cnt = 0;
+                while (t->khead != t->ktail && (cnt + 1) * sizeof *ev <= n) ev[cnt++] = t->kq[t->ktail++ % KQ];
+                return cnt * sizeof *ev;
+            }
+            if (nonblock) return -EAGAIN;
+            sleep_on(t);
+            continue;
+        }
         int canon = t->tio.lflag & ICANON;
         if (t->ihead != t->itail) {
             size_t got = 0;
@@ -192,12 +242,26 @@ long tty_ioctl(int minor, unsigned long cmd, uintptr_t arg) {
     case 0x5414: return 0;                         /* TIOCSWINSZ */
     case 0x541B:                                   /* FIONREAD */
         if (!uok(arg, 4)) return -EFAULT;
-        *(int *)arg = (int)(t->ihead - t->itail); return 0;
+        *(int *)arg = kbd_direct(t) ? (int)((t->khead - t->ktail) * sizeof(struct chi_input_event))
+                                    : (int)(t->ihead - t->itail);
+        return 0;
     case TIOCSCTTY:                                /* this tty becomes the caller's controlling terminal */
         cur->ctty = minor + 1; t->leader = cur->pid; return 0;
     case TIOCNOTTY:
         if (cur->ctty == minor + 1) cur->ctty = 0;
         return 0;
+    case CHI_KBDSETMODE:                           /* line discipline, or raw key events for this process */
+        if (arg != CHI_KBDMODE_TTY && arg != CHI_KBDMODE_DIRECT) return -EINVAL;
+        if (arg == CHI_KBDMODE_DIRECT) {           /* pending line input stays; pending key events are dropped */
+            t->kbdmode = CHI_KBDMODE_DIRECT; t->kowner = cur->pid; t->khead = t->ktail = 0;
+        } else {
+            kbd_reset(t);
+        }
+        wakeup(t);
+        return 0;
+    case CHI_KBDGETMODE:
+        if (!uok(arg, 4)) return -EFAULT;
+        *(int *)arg = kbd_direct(t) ? CHI_KBDMODE_DIRECT : CHI_KBDMODE_TTY; return 0;
     case CHI_KDSETMODE:                            /* a graphics program takes over the display */
         if (arg != CHI_KD_TEXT && arg != CHI_KD_GRAPHICS) return -EINVAL;
         vt_set_graphics(arg == CHI_KD_GRAPHICS); return 0;
