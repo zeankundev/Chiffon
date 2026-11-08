@@ -1,8 +1,11 @@
 /* Message passing.  See include/ipc.h for the model. */
 #include "kernel.h"
 
-#define NPORT 32
+#ifdef CHI_TINY
+#define QLEN 4
+#else
 #define QLEN 16
+#endif
 struct port {
     int used, owner;                         /* owner: pid, 0 = kernel */
     ipc_handler svc;                         /* kernel service: run synchronously in the caller */

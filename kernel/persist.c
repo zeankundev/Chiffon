@@ -42,8 +42,13 @@
  */
 #include "kernel.h"
 
+#ifdef CHI_TINY
+#define PST_RESERVE_SECTORS 256u                        /* 128 KiB; tiny profile: mkimage PERSIST_KB=128 */
+#define PST_SLOT_SECTORS    128u                        /* 64 KiB per slot: read in one heap block at attach */
+#else
 #define PST_RESERVE_SECTORS 8192u                       /* 4 MiB; tools/mkimage.sh keeps this much free */
 #define PST_SLOT_SECTORS    4096u                       /* 2 MiB per slot */
+#endif
 #define PST_SLOT_BYTES      ((PST_SLOT_SECTORS - 1) * 512u)
 #define PST_HDR_MAGIC       "CHIFLOG1"
 #define REC_MAGIC           0xC1F0C0DEu

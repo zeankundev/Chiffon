@@ -14,7 +14,6 @@ static int shift, ctrl, alt, caps, numlock = 1;
 static void emit(const char *s) { while (*s) tty_input((unsigned char)*s++); }
 
 /* ---- /dev/input/event0: raw events for programs that need key release and pointer motion ---- */
-#define EVQ 256
 static struct chi_input_event evq[EVQ];
 static unsigned evhead, evtail;
 

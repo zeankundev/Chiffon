@@ -1,7 +1,6 @@
 /* Console fan-out + boot log.  See include/console.h. */
 #include "kernel.h"
 
-#define KLOG_SIZE 16384
 static char klog[KLOG_SIZE];
 static size_t klog_len;                      /* total bytes ever written (ring: last KLOG_SIZE kept) */
 static struct console *consoles;

@@ -9,7 +9,9 @@
 #include "arch.h"
 #include <stdint.h>
 
-#define MAX_CPUS 16
+#ifndef MAX_CPUS
+#define MAX_CPUS 16                       /* the tiny profile builds with 2 (see Makefile) */
+#endif
 #define SGI_RESCHED 1                     /* inter-processor interrupt: "a process became runnable" */
 
 struct proc;

@@ -29,6 +29,25 @@ typedef __UINT64_TYPE__ chi_u64;
 #define CSYS_irq_wait    1013   /* (irq, flags)                         -> 0 | -errno            */
 #define CSYS_dev_info    1014   /* (dev_type, void *info)               -> 0 | -errno            */
 
+/* Networking (kernel/net.c).  IPv4 addresses are passed as 32-bit host-order values, 10.0.2.15 =
+ * 0x0a00020f.  Connections are small integers (0..1).  The first call configures the interface
+ * (DHCP, or the QEMU user-network defaults if nothing answers).  There is no capability check yet:
+ * any process may use the network.  See env/tiny/src/{netinfo,ping,httpget}.c for examples. */
+#define CSYS_net_info    1020   /* (struct chi_netinfo *)               -> 0 | -errno            */
+#define CSYS_net_ping    1021   /* (ip, timeout_ms)                     -> rtt_us | -errno       */
+#define CSYS_net_resolve 1022   /* (const char *name, u32 *ip)          -> 0 | -errno            */
+#define CSYS_net_connect 1023   /* (ip, port)                           -> conn | -errno        */
+#define CSYS_net_send    1024   /* (conn, const void *buf, len)         -> len | -errno         */
+#define CSYS_net_recv    1025   /* (conn, void *buf, len, timeout_ms)   -> n (0 = closed) | -errno */
+#define CSYS_net_close   1026   /* (conn)                               -> 0                    */
+
+struct chi_netinfo {
+    chi_u32 ip, mask, gateway, dns;     /* host-order IPv4 addresses */
+    chi_u8  mac[6];
+    chi_u8  configured;                 /* 1 once DHCP (or the fallback) has run */
+    chi_u8  _pad;
+};
+
 #define CHI_CAP_MMIO     1      /* MMIO physical mapping */
 #define CHI_CAP_IRQ      2      /* Hardware IRQ binding */
 #define CHI_CAP_DRIVER   4      /* Register / supersede driver IPC services */

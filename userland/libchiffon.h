@@ -142,6 +142,25 @@ int memcmp(const void *x, const void *y, size_t n) { const unsigned char *a = x,
 static inline size_t chiffon_strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 static inline int chiffon_strcmp(const char *a, const char *b) { while (*a && *a == *b) a++, b++; return (unsigned char)*a - (unsigned char)*b; }
 static inline void chiffon_puts(const char *s) { chiffon_write(1, s, chiffon_strlen(s)); }
+static inline void chiffon_putu(unsigned long v) {
+    char b[24]; int i = 23; b[i] = 0;
+    if (!v) b[--i] = '0';
+    for (; v; v /= 10) b[--i] = (char)('0' + v % 10);
+    chiffon_puts(b + i);
+}
+static inline void chiffon_putip(unsigned ip) {                  /* host-order IPv4 -> "a.b.c.d" */
+    chiffon_putu(ip >> 24 & 255); chiffon_puts("."); chiffon_putu(ip >> 16 & 255); chiffon_puts(".");
+    chiffon_putu(ip >> 8 & 255); chiffon_puts("."); chiffon_putu(ip & 255);
+}
+
+/* networking (kernel/net.c; see include/uapi/chiffon_abi.h for the semantics) */
+static inline long chiffon_net_info(struct chi_netinfo *i) { return ksys(CSYS_net_info, (long)i, 0, 0, 0, 0, 0); }
+static inline long chiffon_net_ping(unsigned ip, int timeout_ms) { return ksys(CSYS_net_ping, (long)ip, timeout_ms, 0, 0, 0, 0); }
+static inline long chiffon_net_resolve(const char *name, unsigned *ip) { return ksys(CSYS_net_resolve, (long)name, (long)ip, 0, 0, 0, 0); }
+static inline long chiffon_net_connect(unsigned ip, unsigned port) { return ksys(CSYS_net_connect, (long)ip, (long)port, 0, 0, 0, 0); }
+static inline long chiffon_net_send(long c, const void *b, size_t n) { return ksys(CSYS_net_send, c, (long)b, (long)n, 0, 0, 0); }
+static inline long chiffon_net_recv(long c, void *b, size_t n, int timeout_ms) { return ksys(CSYS_net_recv, c, (long)b, (long)n, timeout_ms, 0, 0); }
+static inline long chiffon_net_close(long c) { return ksys(CSYS_net_close, c, 0, 0, 0, 0, 0); }
 
 int main(int argc, char **argv, char **envp);
 __attribute__((noreturn, used)) void chiffon_entry(long argc, char **argv) { chiffon_exit(main((int)argc, argv, argv + argc + 1)); }

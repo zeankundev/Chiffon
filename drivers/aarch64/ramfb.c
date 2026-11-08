@@ -1,3 +1,4 @@
+#ifndef CHI_TINY   /* headless tiny profile: this driver is left out (see include/kernel.h) */
 /* QEMU `ramfb` display for the aarch64 `virt` machine.  The device has no registers of its own: the
  * guest allocates a framebuffer in RAM and tells QEMU where it is by writing a small config struct
  * to the fw_cfg file "etc/ramfb" through fw_cfg's DMA interface.  Resolution: `video=WxH`
@@ -80,3 +81,4 @@ static int init(void) {
 }
 static struct kdriver drv = { "ramfb", "QEMU ramfb framebuffer (fw_cfg)", DRV_DISPLAY, 20, probe, init, 0, 0 };
 KDRIVER(drv);
+#endif

@@ -57,10 +57,29 @@ endif
 OBJCOPY ?= $(CROSS)objcopy
 HOSTCC ?= cc
 
+# Resource profile.  full = desktop-sized tables (default).  tiny = fits a 1 MiB machine
+# (see the budget comments in include/kernel.h).  MAXRAM (MiB) bounds the physical frame bitmap.
+PROFILE := $(strip $(or $(PROFILE),full))
+ifeq ($(filter $(PROFILE),full tiny),)
+  $(error PROFILE must be full or tiny (got '$(PROFILE)'))
+endif
+MAXRAM  := $(strip $(or $(MAXRAM),4096))
+PROFILE_FLAGS := -DCHI_MAXFRAMES=$(shell echo $$(( $(MAXRAM) * 256 )))
+ifeq ($(PROFILE),tiny)
+  PROFILE_FLAGS += -DCHI_TINY=1 -DMAX_CPUS=2
+  PERSIST_KB ?= 128
+endif
+PERSIST_KB ?= 4096                  # write-back log size on disk (must match persist.c)
+# RAMCAP (MiB): the kernel uses at most this much of the RAM the machine reports (0/empty = all)
+RAMCAP := $(strip $(RAMCAP))
+ifneq ($(RAMCAP),)
+  PROFILE_FLAGS += -DCHI_RAM_CAP_MB=$(RAMCAP)
+endif
+CFLAGS += $(PROFILE_FLAGS)
 CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -ffreestanding -fno-builtin \
           -fno-pic -fno-pie -fno-stack-protector \
           $(shell $(CC) -fno-tree-loop-distribute-patterns -E -x c /dev/null -o /dev/null 2>/dev/null && echo -fno-tree-loop-distribute-patterns) \
-          -fno-asynchronous-unwind-tables -mgeneral-regs-only -Iinclude -Iarch/$(ARCH) -I$(BOARD_DIR)
+          -fno-asynchronous-unwind-tables -mgeneral-regs-only -Iinclude -Iarch/$(ARCH) -I$(BOARD_DIR) $(PROFILE_FLAGS)
 ifeq ($(ARCH),x86_64)
   CFLAGS += -mno-red-zone -mcmodel=kernel
   KEXT := bin
@@ -140,7 +159,7 @@ $(B)/initramfs.cpio: $(B)/rootfs.stamp $(B)/config.stamp
 	$(MKCPIO) $(if $(filter initramfs,$(FS)),$(B)/rootfs,$(B)/empty) $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 $(DISKIMG): $(B)/rootfs.stamp $(B)/config.stamp
-	MKCPIO="$(MKCPIO)" sh tools/mkimage.sh -r "$(B)/rootfs" -o "$@" -f "$(FS)" -l "$(ENV)" $(if $(SIZE),-s $(SIZE)) $(if $(MBR),-p)
+	PERSIST_KB=$(PERSIST_KB) MKCPIO="$(MKCPIO)" sh tools/mkimage.sh -r "$(B)/rootfs" -o "$@" -f "$(FS)" -l "$(ENV)" $(if $(SIZE),-s $(SIZE)) $(if $(MBR),-p)
 
 run: all
 	@$(if $(QEMU_CMD),,$(error Board '$(DEVICE)' has no QEMU_CMD in $(BOARD_DIR)/board.mk; run the kernel image on your hardware))
@@ -186,6 +205,7 @@ help:
 	@echo "- make run [ENV=demo] : run the kernel in QEMU on the serial console (if supported by the board)"
 	@echo "- make run-gfx [ENV=demo] : run the kernel in QEMU with a window (framebuffer console + keyboard)"
 	@echo "- make bootdir [ENV=rpi] FIRMWARE=<dir> : stage a Raspberry Pi boot directory for rpiboot"
+	@echo "- make ENV=tiny run : 1 MiB profile (PROFILE=tiny, MEM=1), see env/tiny"
 	@echo "- make clean : remove all build artifacts"
 	@echo ""
 	@echo "Environment configuration: env/<ENV>/chiffon.conf"

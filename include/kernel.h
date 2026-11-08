@@ -11,8 +11,8 @@ typedef long ssize_t;
 typedef long off_t;
 
 #define HZ 100
-#define VERSION "0.3"
-#define VERNAME "shama"
+#define VERSION "0.4"
+#define VERNAME "otohime"
 
 #define EPERM 1
 #define ENOENT 2
@@ -63,11 +63,30 @@ typedef long off_t;
 
 #define PATH_MAX 256
 
+/* Resource budgets.  The default is the full profile (desktop-sized limits).  Build with
+ * PROFILE=tiny (env/tiny) to fit a 1 MiB machine: every static table below shrinks, and the
+ * physical frame bitmap, kernel heap and kernel log are sized from these numbers. */
+#ifdef CHI_TINY
+#define NPROC 8
+#define NOFILE 16
+#define NVMA 24
+#define KSTACK_SIZE 8192
+#define STACK_SIZE (24 * 1024)
+#define KLOG_SIZE 4096
+#define NPORT 12
+#define EVQ 64
+#define CHI_HEAP_MAX (160UL << 10)
+#else
 #define NPROC 64
 #define NOFILE 32
 #define NVMA 64
 #define KSTACK_SIZE 16384
 #define STACK_SIZE (128 * 1024)
+#define KLOG_SIZE 16384
+#define NPORT 32
+#define EVQ 256
+#define CHI_HEAP_MAX (128UL << 20)
+#endif
 #define USER_STACK_TOP 0x00007FFFFFFFF000UL
 #define MMAP_BASE      0x0000002000000000UL
 

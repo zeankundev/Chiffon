@@ -1,3 +1,4 @@
+#ifndef CHI_TINY   /* headless tiny profile: this driver is left out (see include/kernel.h) */
 /* virtio-input keyboard over virtio-mmio (QEMU `-device virtio-keyboard-device`).
  *
  * This is how a keyboard reaches the guest on the aarch64 `virt` machine: there is no PS/2 or USB
@@ -101,3 +102,4 @@ static void poll(void) {
 
 static struct kdriver drv = { "virtio-kbd", "virtio-input keyboard (virtio-mmio, polled)", DRV_INPUT, 10, probe, init, poll, 0 };
 KDRIVER(drv);
+#endif

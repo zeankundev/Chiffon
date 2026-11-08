@@ -128,11 +128,11 @@ void kmain(uintptr_t bootinfo) {
     uintptr_t s, e;
     board_mem_range(&s, &e);
     size_t heap = (e - s) / 3;
-    if (heap > (128UL << 20)) heap = 128UL << 20;
+    if (heap > CHI_HEAP_MAX) heap = CHI_HEAP_MAX;
     heap &= ~(PAGE_SIZE - 1);
     heap_init(P2V(s), heap);
     pmm_init(s + heap, e);
-    kprintf("mem: %lu MiB free for processes, %lu MiB kernel heap\n", (unsigned long)(pmm_free_count() * PAGE_SIZE >> 20), (unsigned long)(heap >> 20));
+    kprintf("mem: %lu KiB free for processes, %lu KiB kernel heap\n", (unsigned long)(pmm_free_count() * PAGE_SIZE >> 10), (unsigned long)(heap >> 10));
 
     arch_init();
     board_init();

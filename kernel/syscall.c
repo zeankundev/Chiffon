@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "net.h"
 #include "sysnum.h"
 
 static void group_quiesce(void);
@@ -621,6 +622,10 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         return dev_irq_wait((unsigned)a0);
     case CSYS_dev_info:
         return dev_info_query((int)a0, (void *)a1);
+
+    case CSYS_net_info: case CSYS_net_ping: case CSYS_net_resolve: case CSYS_net_connect:
+    case CSYS_net_send: case CSYS_net_recv: case CSYS_net_close:
+        return net_syscall(no, a0, a1, a2, a3);
 
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:

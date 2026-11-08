@@ -7,6 +7,7 @@
 #include "drivers/gicv2.h"
 #include "drivers/armtimer.h"
 #include "drivers/virtio_mmio_blk.h"
+#include "net.h"
 #include "drivers/fdt.h"
 
 #define UART_BASE   0x09000000UL
@@ -33,6 +34,11 @@ static void on_node(const struct fdt_node *n, void *ctx) {
 void board_early_init(uintptr_t dtb) {
     struct fdt f;
     if (fdt_open(&f, dtb) == 0) fdt_walk(&f, on_node, 0);       /* RAM size + command line from QEMU's DTB */
+#ifdef CHI_RAM_CAP_MB
+    /* RAMCAP=<MiB> in the environment: use only this much RAM, even if the machine has more.  QEMU
+     * needs a larger -m to place its device tree after the kernel; the kernel must not spend it. */
+    if (ram_size > ((uintptr_t)CHI_RAM_CAP_MB << 20)) ram_size = (uintptr_t)CHI_RAM_CAP_MB << 20;
+#endif
 }
 void board_mem_range(uintptr_t *s, uintptr_t *e) { *s = (arch_kernel_end() + 0xFFFF) & ~0xFFFFUL; *e = ram_base + ram_size; }
 const char *board_cmdline(void) { return cmdline_buf; }
@@ -94,6 +100,12 @@ void board_poweroff(void) {                                    /* PSCI SYSTEM_OF
     x0 = 0x84000008;
     __asm__ volatile("smc #0" :: "r"(x0));
     arch_halt();
+}
+
+int board_net_probe(void) {                             /* the first virtio-net device found */
+    for (int i = 0; i < 32; i++)
+        if (vnet_probe(VIRTIO_BASE + i * VIRTIO_STEP) == 0) return 0;
+    return -1;
 }
 
 int board_blk_init(void) {

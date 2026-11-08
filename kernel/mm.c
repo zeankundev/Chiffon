@@ -1,8 +1,16 @@
 #include "kernel.h"
 
-#define MAXFRAMES (1u << 20)
+/* Physical frame allocator.  One bit per 4 KiB frame of the usable RAM range, indexed from the
+ * first usable frame (not from physical address 0), so a 1 MiB machine at 0x40000000 needs a
+ * 32-byte bitmap instead of a 128 KiB one.  CHI_MAXFRAMES is the largest range supported; the
+ * default (4 GiB) keeps the old behaviour.  PROFILE=tiny sets it to 4 MiB. */
+#ifndef CHI_MAXFRAMES
+#define CHI_MAXFRAMES (1u << 20)
+#endif
+#define MAXFRAMES CHI_MAXFRAMES
 static uint32_t bm[MAXFRAMES / 32];
-static size_t freec, hint, totalc;
+static uintptr_t pbase;
+static size_t nframes, freec, hint, totalc;
 
 static inline void bset(size_t i) { bm[i >> 5] |= 1u << (i & 31); }
 static inline void bclr(size_t i) { bm[i >> 5] &= ~(1u << (i & 31)); }
@@ -12,16 +20,19 @@ void pmm_init(uintptr_t start, uintptr_t end) {
     for (size_t i = 0; i < MAXFRAMES / 32; i++) bm[i] = ~0u;
     start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     end &= ~(PAGE_SIZE - 1);
-    if (end > 0x100000000UL) end = 0x100000000UL;
-    for (uintptr_t pa = start; pa < end; pa += PAGE_SIZE) { bclr(pa >> 12); freec++; totalc++; }
-    hint = start >> 12;
+    if (end <= start) return;
+    if (end - start > (uintptr_t)MAXFRAMES * PAGE_SIZE) end = start + (uintptr_t)MAXFRAMES * PAGE_SIZE;
+    pbase = start;
+    nframes = (end - start) / PAGE_SIZE;
+    for (size_t i = 0; i < nframes; i++) { bclr(i); freec++; totalc++; }
+    hint = 0;
 }
 uintptr_t pmm_alloc(void) {
-    for (size_t n = 0; n < MAXFRAMES; n++) {
-        size_t i = (hint + n) % MAXFRAMES;
+    for (size_t n = 0; n < nframes; n++) {
+        size_t i = (hint + n) % nframes;
         if (!btst(i)) {
             bset(i); freec--; hint = i + 1;
-            uintptr_t pa = (uintptr_t)i << 12;
+            uintptr_t pa = pbase + ((uintptr_t)i << 12);
             memset(P2V(pa), 0, PAGE_SIZE);
             return pa;
         }
@@ -29,8 +40,9 @@ uintptr_t pmm_alloc(void) {
     return 0;
 }
 void pmm_free(uintptr_t pa) {
-    size_t i = pa >> 12;
-    if (i < MAXFRAMES && btst(i)) { bclr(i); freec++; }
+    if (pa < pbase) return;
+    size_t i = (pa - pbase) >> 12;
+    if (i < nframes && btst(i)) { bclr(i); freec++; }
 }
 size_t pmm_free_count(void) { return freec; }
 size_t pmm_total_count(void) { return totalc; }

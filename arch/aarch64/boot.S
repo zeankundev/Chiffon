@@ -1,3 +1,6 @@
+#ifndef MAX_CPUS
+#define MAX_CPUS 16                  /* as include/smp.h; the tiny profile passes -DMAX_CPUS=2 */
+#endif
 /* aarch64 entry (EL1, MMU off, x0 = DTB physical address).
  * Everything here is position independent (adrp) until the MMU is on. */
 /* Bit n of BOOT_DEVICE_GB_MASK set => physical GiB n is mapped as device memory, else as RAM.
@@ -175,5 +178,5 @@ secondary_high:
 
     .bss
     .balign 16
-secondary_stacks: .space 262144           /* 16 CPUs x 16 KiB */
+secondary_stacks: .space 16384 * MAX_CPUS      /* 16 KiB per secondary CPU; MAX_CPUS from the profile */
 
