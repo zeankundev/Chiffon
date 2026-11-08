@@ -24,7 +24,7 @@ You need two tools.
 2. esptool (`pip install esptool`, or a virtual environment if your system Python is locked).
 
 ```sh
-make -C esp32 ESP_TOOLS=/path/to/xtensa/bin ESPTOOL=esptool
+make -C specials/esp32 ESP_TOOLS=/path/to/xtensa/bin ESPTOOL=esptool
 ```
 
 This produces:
@@ -39,7 +39,7 @@ Espressif publishes a QEMU build with an ESP32 machine:
 https://github.com/espressif/qemu/releases (`qemu-xtensa-softmmu-...-x86_64-linux-gnu.tar.xz`).
 
 ```sh
-make -C esp32 run ESP_QEMU=/path/to/qemu-system-xtensa
+make -C specials/esp32 run ESP_QEMU=/path/to/qemu-system-xtensa
 ```
 
 Expected output (abridged):
@@ -59,7 +59,7 @@ hello-init#
 ## Flash a board
 
 ```sh
-make -C esp32 flash PORT=/dev/ttyUSB0 ESPTOOL=esptool
+make -C specials/esp32 flash PORT=/dev/ttyUSB0 ESPTOOL=esptool
 ```
 
 The command writes `chiffon.bin` to flash offset `0x1000`, the slot where the ESP32 ROM looks

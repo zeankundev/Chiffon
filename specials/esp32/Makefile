@@ -15,14 +15,14 @@ ESPTOOL ?= esptool.py
 ESP_QEMU ?= qemu-system-xtensa
 PORT  ?= /dev/ttyUSB0
 
-B := ../build/esp32
-SHARED := ../kernel
+B := ../../build/esp32
+SHARED := ../../kernel
 CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
           -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
           -fno-tree-loop-distribute-patterns -fno-asynchronous-unwind-tables \
           -mabi=call0 -mlongcalls -mtext-section-literals \
           -DCHI_TINY=1 -DMAX_CPUS=1 -DCHI_MAXFRAMES=1024 \
-          -Iinclude -I../include
+          -Iinclude -I../../include
 LDFLAGS := -nostdlib -static -T linker.ld
 
 SRC_C := main.c divdi.c $(SHARED)/lib.c $(SHARED)/mm.c

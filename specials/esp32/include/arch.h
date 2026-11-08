@@ -1,4 +1,4 @@
-/* ESP32 arch interface.  Shadows arch/<name>/arch.h for this build (see esp32/Makefile). */
+/* ESP32 arch interface.  Shadows arch/<name>/arch.h for this build (see specials/esp32/Makefile). */
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
