@@ -9,5 +9,5 @@ MEM ?= 256            # guest RAM in MiB (env chiffon.conf may set MEM=1 for the
 QEMU_NET_ARGS ?= -netdev user,id=n0 -device virtio-net-device,netdev=n0
 QEMU_CMD = qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m $(MEM) -kernel $(KERNEL) -nographic -no-reboot $(QEMU_NET_ARGS) $(DISKARGS)
 # `make run-gfx`: ramfb framebuffer + virtio keyboard (typing in the QEMU window / VNC reaches the guest; serial also works)
-QEMU_GFX_CMD = qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m $(MEM) -kernel $(KERNEL) -device ramfb -device virtio-keyboard-device -serial stdio -no-reboot $(QEMU_NET_ARGS) $(DISKARGS)
+QEMU_GFX_CMD = qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m $(MEM) -kernel $(KERNEL) -device ramfb -device virtio-keyboard-device -serial stdio -no-reboot $(QEMU_NET_ARGS) $(DISKARGS) -smp 4
 DISKARGS_FMT = -drive file=$(DISK),format=raw,if=none,id=hd0 -device virtio-blk-device,drive=hd0
