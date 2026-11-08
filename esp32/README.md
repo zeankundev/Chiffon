@@ -3,7 +3,9 @@
 A minimal boot of Chiffon on the ESP32-D0WD-V3 (Xtensa LX6, 520 KB SRAM, no PSRAM).
 
 What it does: the ROM loads the image, the kernel starts the UART console, reports memory,
-self-tests the heap (the same `kernel/mm.c` allocator the other ports use), and prints a heartbeat.
+self-tests the heap (the same `kernel/mm.c` allocator the other ports use), and drops into the
+interactive `hello-init#` shell matching generic Chiffon's `env/demo` init. On panic, an illegal
+instruction exception (`ill`) is raised to crash the CPU.
 
 What it does not do yet: interrupts, processes, the MMU-based memory model, filesystems, networking.
 Those need an interrupt vector table, the register-window or call0 exception handlers, and a
@@ -43,12 +45,15 @@ make -C esp32 run ESP_QEMU=/path/to/qemu-system-xtensa
 Expected output (abridged):
 
 ```
-Chiffon 0.3 (shama, xtensa-esp32)
+Chiffon 0.4 (otohime, xtensa-esp32)
 board: ESP32-D0WD-V3, 520 KiB SRAM, no PSRAM
 mem: 167 KiB kernel heap above the 8 KiB stack (dram0 0x3FFB0000..0x3FFDC200 holds data, bss, stack, heap)
 heap: self-test passed
 boot complete; stack top 0x3ffb2350, heap 167 KiB
-heartbeat 0 (ccount 13923360)
+init: pid 1 is /sbin/init
+
+Welcome to your simple Chiffon system! Type 'help' for a list of commands.
+hello-init# 
 ```
 
 ## Flash a board
