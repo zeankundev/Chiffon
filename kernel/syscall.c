@@ -446,13 +446,21 @@ static long sys_sigaction(int sig, uintptr_t act, uintptr_t oact) {
 // Stub here: glibc aint starting if kernel is old af
 static long sys_uname(uintptr_t u) {
     if (!uok(u, 390)) return -EFAULT;
+
     char *b = (char *)u;
     memset(b, 0, 390);
+
     strlcpy(b, "Chiffon", 65);
     strlcpy(b + 65, cfg_get("system", "hostname", "chiffon"), 65);
-    strlcpy(b + 130, "6.18.45-chiffon", 65);
-    strlcpy(b + 195, "#1", 65); 
+
+    strlcpy(b + 130, VERSION, 65);
+    strlcpy(b + 130 + strlen(b + 130), "-", 65 - strlen(b + 130));
+    strlcpy(b + 130 + strlen(b + 130), VERNAME,
+            65 - strlen(b + 130));
+
+    strlcpy(b + 195, "#1", 65);
     strlcpy(b + 260, ARCH_NAME, 65);
+
     return 0;
 }
 
