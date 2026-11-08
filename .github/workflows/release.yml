@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'include/kernel.h'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force release even if VERSION has not changed'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      vername: ${{ steps.check.outputs.vername }}
+      old_version: ${{ steps.check.outputs.old_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check VERSION change
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW_VERSION=$(sed -n 's/^#define[[:space:]]\+VERSION[[:space:]]\+"\(.*\)"/\1/p' include/kernel.h)
+          VERNAME=$(sed -n 's/^#define[[:space:]]\+VERNAME[[:space:]]\+"\(.*\)"/\1/p' include/kernel.h)
+
+          echo "Detected VERSION: $NEW_VERSION"
+          echo "Detected VERNAME: $VERNAME"
+
+          if [ -z "$NEW_VERSION" ]; then
+            echo "Error: Could not extract VERSION from include/kernel.h"
+            exit 1
+          fi
+
+          OLD_VERSION=""
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE" 2>/dev/null; then
+              OLD_VERSION=$(git show "${BEFORE}:include/kernel.h" 2>/dev/null | sed -n 's/^#define[[:space:]]\+VERSION[[:space:]]\+"\(.*\)"/\1/p' || true)
+            else
+              OLD_VERSION=$(git show HEAD~1:include/kernel.h 2>/dev/null | sed -n 's/^#define[[:space:]]\+VERSION[[:space:]]\+"\(.*\)"/\1/p' || true)
+            fi
+          fi
+
+          echo "Previous VERSION: $OLD_VERSION"
+
+          SHOULD_RELEASE="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.force_release }}" = "true" ]; then
+              echo "workflow_dispatch with force_release=true"
+              SHOULD_RELEASE="true"
+            elif [ -n "$NEW_VERSION" ] && ! gh release view "$NEW_VERSION" >/dev/null 2>&1; then
+              echo "workflow_dispatch: release $NEW_VERSION does not exist yet"
+              SHOULD_RELEASE="true"
+            fi
+          else
+            if [ -n "$NEW_VERSION" ] && [ "$NEW_VERSION" != "$OLD_VERSION" ]; then
+              echo "VERSION bumped from '$OLD_VERSION' to '$NEW_VERSION'"
+              SHOULD_RELEASE="true"
+            else
+              echo "VERSION did not change (Old: '$OLD_VERSION', New: '$NEW_VERSION')"
+            fi
+          fi
+
+          # Ensure release does not already exist on GitHub unless forced
+          if [ "$SHOULD_RELEASE" = "true" ] && [ "${{ inputs.force_release }}" != "true" ]; then
+            if gh release view "$NEW_VERSION" >/dev/null 2>&1; then
+              echo "Release $NEW_VERSION already exists on GitHub. Skipping release."
+              SHOULD_RELEASE="false"
+            fi
+          fi
+
+          echo "should_release=$SHOULD_RELEASE" >> $GITHUB_OUTPUT
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "vername=$VERNAME" >> $GITHUB_OUTPUT
+          echo "old_version=$OLD_VERSION" >> $GITHUB_OUTPUT
+
+  build-and-release:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            bison \
+            flex \
+            libncurses-dev \
+            e2fsprogs \
+            cpio \
+            git
+
+      - name: Build BusyBox for x86_64 and aarch64
+        run: |
+          git clone --depth 1 https://github.com/mirror/busybox.git busybox-src
+
+          # Build x86_64 BusyBox
+          cd busybox-src
+          make distclean || true
+          sh ../tools/chiffon-busybox-config.sh
+          make -j$(nproc)
+          cp busybox ../busybox-x86_64
+          chmod +x ../busybox-x86_64
+
+          # Build aarch64 BusyBox
+          make distclean || true
+          sh ../tools/chiffon-busybox-config.sh
+          make -j$(nproc) CROSS_COMPILE=aarch64-linux-gnu-
+          cp busybox ../busybox-aarch64
+          chmod +x ../busybox-aarch64
+          cd ..
+
+      - name: Compile test environment images and kernel binaries
+        run: |
+          mkdir -p release_assets
+
+          # ---- 1. Demo environment ----
+          echo "=== Building Demo (x86_64) ==="
+          make clean
+          make ENV=demo ARCH=x86_64
+          cp build/demo/x86_64-qemu/chiffon.bin release_assets/chiffon_x86_64.bin
+          cp build/demo/x86_64-qemu/disk.img release_assets/chiffon-demo-x86_64.img
+
+          echo "=== Building Demo (aarch64) ==="
+          make clean
+          make ENV=demo ARCH=aarch64
+          cp build/demo/aarch64-qemu/chiffon.bin release_assets/chiffon_arm64.bin
+          cp release_assets/chiffon_arm64.bin release_assets/chiffon_aarch64.bin
+          cp build/demo/aarch64-qemu/disk.img release_assets/chiffon-demo-arm64.img
+          cp release_assets/chiffon-demo-arm64.img release_assets/chiffon-demo-aarch64.img
+
+          # ---- 2. Tiny environment (1 MiB profile) ----
+          echo "=== Building Tiny (x86_64) ==="
+          make clean
+          make ENV=tiny ARCH=x86_64
+          cp build/tiny/x86_64-qemu/chiffon.bin release_assets/chiffon_tiny_x86_64.bin
+          cp build/tiny/x86_64-qemu/disk.img release_assets/chiffon-tiny-x86_64.img
+
+          echo "=== Building Tiny (aarch64) ==="
+          make clean
+          make ENV=tiny ARCH=aarch64
+          cp build/tiny/aarch64-qemu/chiffon.bin release_assets/chiffon_tiny_arm64.bin
+          cp release_assets/chiffon_tiny_arm64.bin release_assets/chiffon_tiny_aarch64.bin
+          cp build/tiny/aarch64-qemu/disk.img release_assets/chiffon-tiny-arm64.img
+          cp release_assets/chiffon-tiny-arm64.img release_assets/chiffon-tiny-aarch64.img
+
+          # ---- 3. BusyBox environment ----
+          echo "=== Building BusyBox (x86_64) ==="
+          make clean
+          BUSYBOX="$PWD/busybox-x86_64" make ENV=busybox ARCH=x86_64
+          cp build/busybox/x86_64-qemu/disk.img release_assets/chiffon-busybox-x86_64.img
+
+          echo "=== Building BusyBox (aarch64) ==="
+          make clean
+          BUSYBOX="$PWD/busybox-aarch64" make ENV=busybox ARCH=aarch64
+          cp build/busybox/aarch64-qemu/disk.img release_assets/chiffon-busybox-arm64.img
+          cp release_assets/chiffon-busybox-arm64.img release_assets/chiffon-busybox-aarch64.img
+
+          # Checksums
+          (cd release_assets && sha256sum * > SHA256SUMS)
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+          VERNAME: ${{ needs.check-version.outputs.vername }}
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+
+          cat <<EOF > release_notes.md
+          ## Chiffon ${VERSION} (${VERNAME})
+
+          Automated release for Chiffon version **${VERSION}** (*${VERNAME}*).
+
+          ### What's Changed
+          EOF
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Changes since **${PREV_TAG}**:" >> release_notes.md
+            echo "" >> release_notes.md
+            git log "${PREV_TAG}..HEAD" --pretty=format:"* %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" >> release_notes.md || true
+          else
+            echo "Recent commits:" >> release_notes.md
+            echo "" >> release_notes.md
+            git log -n 15 --pretty=format:"* %s ([%h](https://github.com/${{ github.repository }}/commit/%H))" >> release_notes.md || true
+          fi
+
+          cat <<'EOF' >> release_notes.md
+
+
+          ### Included Artifacts
+
+          #### Kernel Binaries
+          - `chiffon_x86_64.bin`: Raw kernel binary for x86_64
+          - `chiffon_arm64.bin` / `chiffon_aarch64.bin`: Raw kernel binary for aarch64 (ARM64)
+          - `chiffon_tiny_x86_64.bin` & `chiffon_tiny_arm64.bin`: Minimal 1 MiB RAM profile kernels
+
+          #### Test Environment Disk Images
+          - **Demo Environment**:
+            - `chiffon-demo-x86_64.img`: Demo environment disk image for x86_64
+            - `chiffon-demo-arm64.img` / `chiffon-demo-aarch64.img`: Demo environment disk image for ARM64
+          - **BusyBox Environment**:
+            - `chiffon-busybox-x86_64.img`: Static BusyBox environment disk image for x86_64
+            - `chiffon-busybox-arm64.img` / `chiffon-busybox-aarch64.img`: Static BusyBox environment disk image for ARM64
+          - **Tiny Environment**:
+            - `chiffon-tiny-x86_64.img`: 1 MiB RAM profile disk image for x86_64
+            - `chiffon-tiny-arm64.img` / `chiffon-tiny-aarch64.img`: 1 MiB RAM profile disk image for ARM64
+
+          ### Quick Start (QEMU)
+
+          **ARM64 (Demo):**
+          ```bash
+          qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m 512 \
+            -kernel chiffon_arm64.bin \
+            -drive file=chiffon-demo-arm64.img,format=raw,if=none,id=hd0 \
+            -device virtio-blk-device,drive=hd0 -serial stdio
+          ```
+
+          **x86_64 (Demo):**
+          ```bash
+          qemu-system-x86_64 -m 512 \
+            -kernel chiffon_x86_64.bin \
+            -drive file=chiffon-demo-x86_64.img,format=raw,if=none,id=hd0 \
+            -device ide-hd,drive=hd0 -serial stdio
+          ```
+
+          **SHA-256 Checksums:**
+          ```
+          EOF
+
+          cat release_assets/SHA256SUMS >> release_notes.md
+
+          cat <<'EOF' >> release_notes.md
+          ```
+          EOF
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+          VERNAME: ${{ needs.check-version.outputs.vername }}
+        run: |
+          gh release create "${VERSION}" \
+            release_assets/* \
+            --title "${VERSION} - ${VERNAME}" \
+            --notes-file release_notes.md \
+            --target "${{ github.sha }}"
