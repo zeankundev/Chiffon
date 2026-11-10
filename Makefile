@@ -96,6 +96,7 @@ KERNEL := $(B)/chiffon.$(KEXT)
 DISKIMG := $(if $(filter initramfs,$(FS)),,$(B)/disk.img)
 DISK    := $(DISKIMG)
 DISKARGS = $(if $(DISK),$(DISKARGS_FMT))
+ISO := $(B)/chiffon-x86_64.iso
 
 SRC_K := $(wildcard kernel/*.c) $(wildcard arch/$(ARCH)/*.c) $(wildcard drivers/$(ARCH)/*.c)
 SRC_S := $(wildcard arch/$(ARCH)/*.S) kernel/initrd.S
@@ -170,6 +171,15 @@ run-gfx: all
 	@$(if $(QEMU_GFX_CMD),,$(error Board '$(DEVICE)' has no QEMU_GFX_CMD in $(BOARD_DIR)/board.mk))
 	$(QEMU_GFX_CMD) $(if $(CMDLINE),-append "$(CMDLINE)")
 
+# A BIOS El Torito ISO.  It is always built from an initramfs image so it is
+# self-contained rather than depending on the normal ATA/virtio disk image.
+iso:
+	@if [ "$(ARCH)" != "x86_64" ]; then echo "error: ISO boot is currently supported only for ARCH=x86_64" >&2; exit 2; fi
+	@$(MAKE) --no-print-directory ENV=$(ENV) ARCH=x86_64 DEVICE=$(DEVICE) FS=initramfs BUILD=$(BUILD) iso-image
+
+iso-image: $(KERNEL) tools/mkiso.sh
+	sh tools/mkiso.sh "$(B)/chiffon.elf" "$(ISO)"
+
 new-env:
 	@test -n "$(NAME)" || { echo "Usage: make new-env NAME=<name>"; exit 1; }
 	@test ! -e env/$(NAME) || { echo "env/$(NAME) already exists"; exit 1; }
@@ -204,9 +214,10 @@ help:
 	@echo "- make new-device DEVICE=<name> : create a new device for the current environment"
 	@echo "- make run [ENV=demo] : run the kernel in QEMU on the serial console (if supported by the board)"
 	@echo "- make run-gfx [ENV=demo] : run the kernel in QEMU with a window (framebuffer console + keyboard)"
+	@echo "- make iso [ENV=demo] : build a self-contained x86_64 BIOS El Torito ISO (requires WSL GRUB tools)"
 	@echo "- make bootdir [ENV=rpi] FIRMWARE=<dir> : stage a Raspberry Pi boot directory for rpiboot"
 	@echo "- make ENV=tiny run : 1 MiB profile (PROFILE=tiny, MEM=1), see env/tiny"
 	@echo "- make clean : remove all build artifacts"
 	@echo ""
 	@echo "Environment configuration: env/<ENV>/chiffon.conf"
-.PHONY: all run run-gfx new-env new-device bootdir clean help FORCE
+.PHONY: all run run-gfx iso iso-image new-env new-device bootdir clean help FORCE

@@ -12,8 +12,6 @@ static int ndev;
 static inline uint32_t cfg_addr(uint8_t b, uint8_t d, uint8_t f, uint8_t off) {
     return 0x80000000u | (uint32_t)b << 16 | (uint32_t)d << 11 | (uint32_t)f << 8 | (off & 0xFC);
 }
-static inline void outl(uint16_t p, uint32_t v) { __asm__ volatile("outl %0,%1" :: "a"(v), "Nd"(p)); }
-static inline uint32_t inl(uint16_t p) { uint32_t v; __asm__ volatile("inl %1,%0" : "=a"(v) : "Nd"(p)); return v; }
 
 uint32_t pci_read32(uint8_t b, uint8_t d, uint8_t f, uint8_t off) { outl(CFG_ADDR, cfg_addr(b, d, f, off)); return inl(CFG_DATA); }
 void pci_write32(uint8_t b, uint8_t d, uint8_t f, uint8_t off, uint32_t v) { outl(CFG_ADDR, cfg_addr(b, d, f, off)); outl(CFG_DATA, v); }

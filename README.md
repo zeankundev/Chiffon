@@ -24,5 +24,34 @@ make run ENV=<my-env>     # Standard boot: serial console (UART)
 make run-gfx ENV=<my-env>  # Graphical boot: framebuffer window + keyboard
 ```
 
+## Bootable x86_64 ISO on Windows
+
+`make iso` creates `build/<environment>/x86_64-<device>/chiffon-x86_64.iso`.
+It is a BIOS El Torito CD image, loaded by GRUB via Multiboot 1. The target
+embeds the selected environment as an initramfs, so no separate disk image is
+needed to boot it.
+
+The project is being used from Windows, but GRUB's ISO authoring tools are
+Linux tools. Run the following once from an Ubuntu WSL terminal (not PowerShell):
+
+```bash
+sudo apt update
+sudo apt install -y grub-pc-bin grub-common xorriso make gcc binutils cpio
+cd /mnt/c/Users/Zean/Chiffon
+make ENV=demo ARCH=x86_64 iso
+```
+
+Test the resulting ISO from the same WSL terminal (install `qemu-system-x86`
+if necessary):
+
+```bash
+qemu-system-x86_64 -m 256 -cdrom build/demo/x86_64-qemu/chiffon-x86_64.iso -serial stdio -no-reboot
+```
+
+This currently supports **x86_64 (x64)** only. Chiffon has no i386/32-bit x86
+kernel target yet, so `ARCH=x86` cannot produce an ISO. The ISO itself uses a
+standard BIOS El Torito boot image and can boot the 64-bit kernel on a
+BIOS-compatible x64 PC or QEMU.
+
 ## Contributing with AI
 Yes, you are **allowed and encouraged** to deliver AI-generated code changes. Please verify and document implementation details in [AGENTS.md](AGENTS.md) and [PLAN.md](PLAN.md).

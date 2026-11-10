@@ -10,8 +10,43 @@ static inline void wrmsr(uint32_t m, uint64_t v) { __asm__ volatile("wrmsr" :: "
 static inline uint64_t rdmsr(uint32_t m) { uint32_t l, h; __asm__ volatile("rdmsr" : "=a"(l), "=d"(h) : "c"(m)); return (uint64_t)h << 32 | l; }
 
 uintptr_t arch_kernel_end(void) { extern char __kernel_end_phys[]; return (uintptr_t)__kernel_end_phys; }
-/* x86_64: the first 4 GiB is already direct-mapped at boot; devices here use port I/O or low MMIO. */
-int arch_map_device(uintptr_t pa, size_t len) { return pa + len <= 0x100000000UL ? 0 : -1; }
+
+/* x86_64: the first 4 GiB is direct-mapped at boot (PML4[256] via pdpt_lo).
+ * For MMIO above 4 GiB (e.g. UEFI GOP framebuffers on real hardware) we install
+ * additional 1 GiB PDPT entries in the kernel direct map on demand, using 2 MiB
+ * huge pages marked P|RW|PS|PCD|PWT (write-combining would need PAT; PCD+PWT
+ * gives uncached which is safe for MMIO and framebuffers). */
+int arch_map_device(uintptr_t pa, size_t len) {
+    if (!len) return 0;
+    uintptr_t end = pa + len;
+    if (end <= 0x100000000UL) return 0;          /* already covered by boot direct map */
+
+    /* Walk / create PDPT entries for each 1 GiB region in [pa, end).
+     * PML4[256] is the DMAP root; each PDPT entry covers 1 GiB via a 2 MiB-paged PD. */
+    uintptr_t *pml4 = (uintptr_t *)P2V((uintptr_t)boot_pml4);
+    /* PML4[256]: points to pdpt_lo which currently covers only GiB 0-3.
+     * For higher regions we need PML4[256+n] or more PDPT entries in pdpt_lo.
+     * Since pdpt_lo has 512 entries of 1 GiB each, it can cover up to 512 GiB;
+     * we just need to populate the missing entries. */
+    uintptr_t *pdpt = (uintptr_t *)P2V(pml4[256] & ~0xFFFUL);
+
+    uintptr_t gb_start = (pa >> 30) << 30;
+    uintptr_t gb_end   = ((end + ((1UL << 30) - 1)) >> 30) << 30;
+    for (uintptr_t gb = gb_start; gb < gb_end; gb += (1UL << 30)) {
+        unsigned pdpt_idx = gb >> 30;
+        if (pdpt_idx >= 512) return -1;          /* out of range */
+        if (pdpt[pdpt_idx] & 1) continue;        /* already mapped */
+        /* Allocate a new page directory and populate it with 2 MiB entries */
+        uintptr_t pd_pa = pmm_alloc();
+        if (!pd_pa) return -1;
+        uintptr_t *pd = (uintptr_t *)P2V(pd_pa);
+        for (unsigned j = 0; j < 512; j++)
+            pd[j] = (gb + (uintptr_t)j * 0x200000) | 0x83 | 0x18; /* P|RW|PS|PCD|PWT */
+        pdpt[pdpt_idx] = pd_pa | 3;
+        __asm__ volatile("invlpg (%0)" :: "r"(DMAP_BASE + gb) : "memory");
+    }
+    return 0;
+}
 
 /* ---------------- GDT / TSS / IDT ---------------- */
 struct tss { uint32_t r0; uint64_t rsp0, rsp1, rsp2, r1, ist[7], r2; uint16_t r3, iomap; } __attribute__((packed));

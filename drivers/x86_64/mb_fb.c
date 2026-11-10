@@ -1,6 +1,7 @@
 /* Linear framebuffer handed over by a Multiboot loader (GRUB with `set gfxpayload=...`).  The mode
  * is whatever the loader set; this driver only adopts it.  Preferred over bochs-vbe so that real
- * hardware booted through GRUB gets a display without a chipset-specific driver. */
+ * hardware booted through GRUB gets a display without a chipset-specific driver — including
+ * VirtualBox (VMSVGA/VBoxSVGA), VMware, real laptops, and any UEFI GOP system. */
 #include "kernel.h"
 #include "drivers/x86_platform.h"
 
@@ -8,7 +9,7 @@ static struct { int valid; uint64_t addr; uint32_t pitch, width, height; uint8_t
 static struct fb_device fbd;
 
 void mb_fb_boot_info(const uint32_t *m) {
-    if (!(m[0] & (1u << 12))) return;                    /* framebuffer info present */
+    if (!(m[0] & (1u << 12))) return;                    /* framebuffer info present in MBI */
     const uint8_t *b = (const uint8_t *)m;
     boot.addr = *(const uint64_t *)(b + 88);
     boot.pitch = m[24]; boot.width = m[25]; boot.height = m[26];
@@ -18,8 +19,13 @@ void mb_fb_boot_info(const uint32_t *m) {
 }
 
 static int probe(void) {
-    if (!boot.valid || boot.type != 1 || (boot.bpp != 32 && boot.bpp != 16)) return -1;   /* direct RGB only */
-    return boot.addr < 0x100000000ULL ? 0 : -1;
+    if (!boot.valid) return -1;
+    if (boot.type != 1) return -1;                       /* must be direct-colour RGB, not EGA-text */
+    if (boot.bpp != 32 && boot.bpp != 16) return -1;
+    if (!boot.width || !boot.height || !boot.pitch) return -1;
+    /* On BIOS systems (El Torito / VESA) the framebuffer is always below 4 GiB.
+     * On UEFI systems it may be above; arch_map_device enforces the reachability limit. */
+    return 0;
 }
 static int init(void) {
     fbd.name = "multiboot-fb";
