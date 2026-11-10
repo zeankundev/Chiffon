@@ -11,6 +11,14 @@ uint32_t fb_pack(const struct fb_info *i, uint32_t rgb) {
     return ((r >> (8 - i->rlen)) << i->roff) | ((g >> (8 - i->glen)) << i->goff) | ((b >> (8 - i->blen)) << i->boff);
 }
 
+void fb_damage(struct fb_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!d || !d->flush) return;
+    if (x >= d->info.width || y >= d->info.height) return;
+    if (w > d->info.width - x) w = d->info.width - x;
+    if (h > d->info.height - y) h = d->info.height - y;
+    if (w && h) d->flush(d, x, y, w, h);
+}
+
 void fb_fill(struct fb_device *d, int x, int y, int w, int h, uint32_t rgb) {
     struct fb_info *i = &d->info;
     if (x < 0) { w += x; x = 0; }
@@ -24,6 +32,18 @@ void fb_fill(struct fb_device *d, int x, int y, int w, int h, uint32_t rgb) {
         if (i->bpp == 32) for (int k = 0; k < w; k++) ((uint32_t *)line)[k] = px;
         else for (int k = 0; k < w; k++) ((uint16_t *)line)[k] = (uint16_t)px;
     }
+    fb_damage(d, x, y, w, h);
+}
+
+/* Screen size from the command line: video=WIDTHxHEIGHT, or the given defaults. */
+void fb_cmdline_mode(uint32_t *w, uint32_t *h, uint32_t dw, uint32_t dh) {
+    *w = dw; *h = dh;
+    const char *v = cmdline_get("video");
+    if (!v) return;
+    uint32_t a = 0, b = 0;
+    while (*v >= '0' && *v <= '9') a = a * 10 + (*v++ - '0');
+    if (*v == 'x') { v++; while (*v >= '0' && *v <= '9') b = b * 10 + (*v++ - '0'); }
+    if (a >= 320 && a <= 4096 && b >= 200 && b <= 4096) { *w = a; *h = b; }
 }
 
 /* ---- kernel IPC service: "fb" ---- */
@@ -101,7 +121,12 @@ ssize_t fb_write(uint64_t off, const void *buf, size_t n) {
     if (!primary) return -ENODEV;
     if (off >= primary->info.size) return -28;
     if (n > primary->info.size - off) n = primary->info.size - off;
+    if (!n) return 0;
     memcpy(primary->info.virt + off, buf, n);
+    /* the rows this write touched (full width: the device refreshes whole scanlines) */
+    uint32_t p = primary->info.pitch ? primary->info.pitch : 1;
+    uint32_t y0 = (uint32_t)(off / p), y1 = (uint32_t)((off + n - 1) / p);
+    fb_damage(primary, 0, y0, primary->info.width, y1 - y0 + 1);
     return n;
 }
 

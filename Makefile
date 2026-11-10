@@ -88,6 +88,8 @@ else
             -DIMAGE_TEXT_OFFSET=$(shell printf '0x%x' $$(( $(LOAD_ADDR) & 0x1fffff )))
   KEXT := bin
 endif
+# header dependency files: editing a header (or a .c file that #includes another) rebuilds what uses it
+CFLAGS += -MMD -MP
 NOWARN := $(shell $(LD) --help 2>/dev/null | grep -q no-warn-rwx-segments && echo --no-warn-rwx-segments)
 LDFLAGS := -z noexecstack $(NOWARN) -nostdlib -static -no-pie -z max-page-size=4096 \
            $(if $(LOAD_ADDR),--defsym=LOAD_ADDR=$(LOAD_ADDR)) -T arch/$(ARCH)/linker.ld
@@ -220,4 +222,6 @@ help:
 	@echo "- make clean : remove all build artifacts"
 	@echo ""
 	@echo "Environment configuration: env/<ENV>/chiffon.conf"
+-include $(OBJ:.o=.d)
+
 .PHONY: all run run-gfx iso iso-image new-env new-device bootdir clean help FORCE

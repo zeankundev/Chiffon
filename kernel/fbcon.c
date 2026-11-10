@@ -5,11 +5,22 @@
 static struct fb_device *fb;
 static uint32_t pal[16];
 static int xoff, yoff;
+/* pixel rectangle painted since the last flush: the device is told about this, and only this */
+static int dirty, dx0, dy0, dx1, dy1;
+
+static void mark(int x0, int y0, int x1, int y1) {       /* inclusive-exclusive pixel rectangle */
+    if (!dirty) { dx0 = x0; dy0 = y0; dx1 = x1; dy1 = y1; dirty = 1; return; }
+    if (x0 < dx0) dx0 = x0;
+    if (y0 < dy0) dy0 = y0;
+    if (x1 > dx1) dx1 = x1;
+    if (y1 > dy1) dy1 = y1;
+}
 
 static void draw(int x, int y, uint16_t cell) {
     unsigned ch = cell & 0xFF;
     const uint8_t *g = font8x16_data[(ch < FONT_FIRST || ch - FONT_FIRST >= FONT_NGLYPH) ? 0 : ch - FONT_FIRST];
     uint32_t f = pal[(cell >> 8) & 15], b = pal[(cell >> 12) & 15];
+    mark(xoff + x * FONT_W, yoff + y * FONT_H, xoff + (x + 1) * FONT_W, yoff + (y + 1) * FONT_H);
     uint8_t *row = fb->info.virt + (size_t)(yoff + y * FONT_H) * fb->info.pitch + (size_t)(xoff + x * FONT_W) * (fb->info.bpp / 8);
     for (int r = 0; r < FONT_H; r++, row += fb->info.pitch) {
         unsigned bits = g[r];
@@ -25,7 +36,15 @@ static void draw(int x, int y, uint16_t cell) {
 static void redraw_all(void) { fb_fill(fb, 0, 0, fb->info.width, fb->info.height, 0); }
 static struct vt_display display = { "fbcon", 0, 0, draw, redraw_all };
 static void fbcon_write(int c) { vt_write(0, c); }     /* kernel messages land on /dev/tty1 */
-static struct console fbcon = { "fbcon", fbcon_write, vt_flush, 0, 1 };
+
+/* Paint the changed cells, then refresh the pixels that changed (for SVGA-style devices). */
+static void fbcon_flush(void) {
+    vt_flush();
+    if (!dirty) return;
+    dirty = 0;
+    fb_damage(fb, dx0, dy0, dx1 - dx0, dy1 - dy0);
+}
+static struct console fbcon = { "fbcon", fbcon_write, fbcon_flush, 0, 1 };
 
 void fbcon_attach(struct fb_device *d) {
     const char *opt = cmdline_get("fbcon");

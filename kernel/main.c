@@ -46,14 +46,21 @@ static int start_init(void) {
 
     static char args[256];
     strlcpy(args, cfg_get("init", "args", ""), sizeof args);
+    /* An explicit path is tried alone, except /bin/sh: if the image has a BusyBox but the shell link
+     * is missing, the BusyBox multicall binary runs the same shell (`busybox sh`). */
+    static const char *configured[3];
+    configured[0] = path; configured[1] = 0; configured[2] = 0;
+    if (path && !strcmp(path, "/bin/sh")) configured[1] = "/bin/busybox";
+    const char **cands = path ? configured : search;
     int r = -ENOENT;
     for (int i = 0; ; i++) {
-        const char *cand = path ? path : search[i];
+        const char *cand = cands[i];
         if (!cand) break;
-        int shell = !path && (!strcmp(cand, "/bin/sh") || !strcmp(cand, "/bin/busybox"));
+        int fallback = path && i > 0;                    /* the BusyBox stand-in for a missing /bin/sh */
+        int shell = (!path || fallback) && (!strcmp(cand, "/bin/sh") || !strcmp(cand, "/bin/busybox"));
         char *argv[20]; int n = 0;
         argv[n++] = (char *)cfg_get("init", "argv0", shell ? "-sh" : cand);
-        if (!strcmp(cand, "/bin/busybox") && !path) argv[n++] = "sh";
+        if (!strcmp(cand, "/bin/busybox") && (!path || fallback)) argv[n++] = "sh";
         for (char *p = args; *p && n < 18;) {
             while (*p == ' ') p++;
             if (!*p) break;
@@ -84,7 +91,8 @@ static int start_init(void) {
             }
             return r;
         }
-        if (path) { kprintf("init: cannot start %s (error %d)\n", path, -r); break; }
+        if (path && !cands[i + 1]) { kprintf("init: cannot start %s (error %d)\n", path, -r); break; }
+        if (path) kprintf("init: cannot start %s (error %d), trying %s\n", cand, -r, cands[i + 1]);
         strlcpy(args, cfg_get("init", "args", ""), sizeof args);   /* args were split in place */
     }
     return r;

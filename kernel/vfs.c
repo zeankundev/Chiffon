@@ -398,9 +398,22 @@ struct node *vfs_put_node(const char *abs, uint32_t mode, const uint8_t *data, s
     return n;
 }
 
+/* An initramfs with a BusyBox but no shell gets /bin/sh -> busybox, as `busybox --install -s` would
+ * make it.  Without the link the first command, init, cannot start and the kernel panics. */
+static void initramfs_shell_link(void) {
+    struct node *sh = node_find("/bin/sh");
+    struct node *bb = node_find("/bin/busybox");
+    if (sh || !bb || (bb->mode & S_IFMT) != S_IFREG) return;
+    static const char target[] = "busybox";
+    struct node *n = node_create("/bin/sh", S_IFLNK | 0777);
+    if (!n) { kprintf("vfs: initramfs: cannot create /bin/sh\n"); return; }
+    n->data = (uint8_t *)target; n->size = sizeof target - 1; n->is_static = 1;
+    kprintf("vfs: initramfs: /bin/sh was missing, linked to /bin/busybox\n");
+}
+
 void vfs_load_cpio(const void *cpio, size_t size) {
     const uint8_t *p = cpio, *end = p + size;
-    int count = 0;
+    int count = 0, lost = 0;
     while (p + 110 <= end && !memcmp(p, "070701", 6)) {
         uint32_t mode = hex8((const char *)p + 14), fsz = hex8((const char *)p + 54), nsz = hex8((const char *)p + 94);
         const char *name = (const char *)p + 110;
@@ -415,12 +428,14 @@ void vfs_load_cpio(const void *cpio, size_t size) {
         mkparents(abs);
         struct node *n = node_find(abs);
         if (!n) n = node_create(abs, mode);
-        if (!n) continue;
+        if (!n) { if (lost++ < 8) kprintf("vfs: initramfs: no room for %s\n", abs); continue; }
         n->mode = mode;
         if ((mode & S_IFMT) == S_IFREG || S_ISLNK(mode)) { n->data = (uint8_t *)data; n->size = fsz; n->is_static = 1; }
         count++;
     }
+    if (lost) kprintf("vfs: initramfs: %d entries did not fit in the file table\n", lost);
     kprintf("vfs: initramfs: %d entries\n", count);
+    initramfs_shell_link();
 }
 
 void vfs_finish(void) {

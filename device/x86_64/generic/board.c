@@ -14,9 +14,11 @@
 #define COM1 0x3F8
 static uintptr_t ram_end;
 static char cmdline_buf[256];
+static int com1_ok;                              /* a serial port answered at COM1; output is optional */
 
 void board_early_init(uintptr_t mbi) {
-    ns16550_io_init(COM1);
+    com1_ok = ns16550_io_probe(COM1);
+    if (com1_ok) ns16550_io_init(COM1);
     uint32_t *m = P2V(mbi);                          /* multiboot info: flags, mem_lower, mem_upper, ..., cmdline@16 */
     uint64_t upper_kb = (m[0] & 1) ? m[2] : 64 * 1024;
     ram_end = 0x100000 + upper_kb * 1024;
@@ -31,12 +33,12 @@ void board_early_init(uintptr_t mbi) {
 }
 void board_mem_range(uintptr_t *s, uintptr_t *e) { *s = (arch_kernel_end() + 0xFFFF) & ~0xFFFFUL; *e = ram_end; }
 const char *board_cmdline(void) { return cmdline_buf; }
-void board_console_putc(int c) { ns16550_io_putc(COM1, c); }
-int board_console_getc(void) { return ns16550_io_getc(COM1); }
+void board_console_putc(int c) { if (com1_ok) ns16550_io_putc(COM1, c); }
+int board_console_getc(void) { return com1_ok ? ns16550_io_getc(COM1) : -1; }
 
 void board_init(void) {
     pic_pit_init(HZ);
-    driver_note("ns16550", "COM1 serial console 115200 8N1", DRV_CHAR);
+    if (com1_ok) driver_note("ns16550", "COM1 serial console 115200 8N1", DRV_CHAR);
     driver_note("pic-pit", "8259 PIC + 8254 PIT, 100 Hz tick", DRV_MISC);
     driver_note("ata-pio", "legacy ATA PIO disk (primary master)", DRV_BLOCK);
     kprintf("board: x86_64 %s (PIC/PIT/COM1/ATA)\n", BOARD_NAME);

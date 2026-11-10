@@ -11,39 +11,43 @@ static inline uint64_t rdmsr(uint32_t m) { uint32_t l, h; __asm__ volatile("rdms
 
 uintptr_t arch_kernel_end(void) { extern char __kernel_end_phys[]; return (uintptr_t)__kernel_end_phys; }
 
-/* x86_64: the first 4 GiB is direct-mapped at boot (PML4[256] via pdpt_lo).
- * For MMIO above 4 GiB (e.g. UEFI GOP framebuffers on real hardware) we install
- * additional 1 GiB PDPT entries in the kernel direct map on demand, using 2 MiB
- * huge pages marked P|RW|PS|PCD|PWT (write-combining would need PAT; PCD+PWT
- * gives uncached which is safe for MMIO and framebuffers). */
+/* Device memory (MMIO registers, framebuffers, GPU FIFOs) must be mapped uncacheable.  The boot
+ * direct map (boot.S) uses write-back 2 MiB pages, so a framebuffer written through it stays in the
+ * CPU cache, where the display never looks: the screen stays black even though the text was drawn.
+ * Every 2 MiB page a device range touches therefore gets PCD|PWT.  Above 4 GiB the page directories
+ * do not exist yet and are created here, already uncacheable. */
+#define DM_PCD   0x10UL
+#define DM_PWT   0x08UL
+#define DM_LIMIT (1UL << 39)                         /* the direct map covers the first 512 GiB */
+#define DM_ADDR  0x000FFFFFFFFFF000UL
+
+static uint64_t *dmap_pde(uintptr_t pa) {
+    uint64_t *pml4 = P2V(arch_kernel_root());
+    uint64_t *pdpt = P2V(pml4[256] & DM_ADDR);       /* PML4[256] = direct map: pdpt_lo */
+    unsigned g = (unsigned)(pa >> 30);
+    if (!(pdpt[g] & 1)) {
+        uintptr_t pd_pa = pmm_alloc();
+        if (!pd_pa) return 0;
+        uint64_t *pd = P2V(pd_pa);
+        for (unsigned j = 0; j < 512; j++)
+            pd[j] = (((uint64_t)g << 30) + ((uint64_t)j << 21)) | 0x83 | DM_PCD | DM_PWT;
+        pdpt[g] = pd_pa | 3;
+    }
+    uint64_t *pd = P2V(pdpt[g] & DM_ADDR);
+    return &pd[(pa >> 21) & 511];
+}
+
 int arch_map_device(uintptr_t pa, size_t len) {
     if (!len) return 0;
     uintptr_t end = pa + len;
-    if (end <= 0x100000000UL) return 0;          /* already covered by boot direct map */
-
-    /* Walk / create PDPT entries for each 1 GiB region in [pa, end).
-     * PML4[256] is the DMAP root; each PDPT entry covers 1 GiB via a 2 MiB-paged PD. */
-    uintptr_t *pml4 = (uintptr_t *)P2V((uintptr_t)boot_pml4);
-    /* PML4[256]: points to pdpt_lo which currently covers only GiB 0-3.
-     * For higher regions we need PML4[256+n] or more PDPT entries in pdpt_lo.
-     * Since pdpt_lo has 512 entries of 1 GiB each, it can cover up to 512 GiB;
-     * we just need to populate the missing entries. */
-    uintptr_t *pdpt = (uintptr_t *)P2V(pml4[256] & ~0xFFFUL);
-
-    uintptr_t gb_start = (pa >> 30) << 30;
-    uintptr_t gb_end   = ((end + ((1UL << 30) - 1)) >> 30) << 30;
-    for (uintptr_t gb = gb_start; gb < gb_end; gb += (1UL << 30)) {
-        unsigned pdpt_idx = gb >> 30;
-        if (pdpt_idx >= 512) return -1;          /* out of range */
-        if (pdpt[pdpt_idx] & 1) continue;        /* already mapped */
-        /* Allocate a new page directory and populate it with 2 MiB entries */
-        uintptr_t pd_pa = pmm_alloc();
-        if (!pd_pa) return -1;
-        uintptr_t *pd = (uintptr_t *)P2V(pd_pa);
-        for (unsigned j = 0; j < 512; j++)
-            pd[j] = (gb + (uintptr_t)j * 0x200000) | 0x83 | 0x18; /* P|RW|PS|PCD|PWT */
-        pdpt[pdpt_idx] = pd_pa | 3;
-        __asm__ volatile("invlpg (%0)" :: "r"(DMAP_BASE + gb) : "memory");
+    if (end < pa || end > DM_LIMIT) return -1;
+    for (uintptr_t a = pa & ~((1UL << 21) - 1); a < end; a += 1UL << 21) {
+        uint64_t *pde = dmap_pde(a);
+        if (!pde) return -1;
+        if (!(*pde & DM_PCD)) {
+            *pde |= DM_PCD | DM_PWT;
+            __asm__ volatile("invlpg (%0)" :: "r"(P2V(a)) : "memory");
+        }
     }
     return 0;
 }

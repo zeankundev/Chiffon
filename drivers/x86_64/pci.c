@@ -5,7 +5,7 @@
 
 #define CFG_ADDR 0xCF8
 #define CFG_DATA 0xCFC
-#define MAXDEV 32
+#define MAXDEV 64
 static struct pci_dev devs[MAXDEV];
 static int ndev;
 
@@ -20,6 +20,17 @@ int pci_find(uint16_t vendor, uint16_t device, struct pci_dev *out) {
     for (int i = 0; i < ndev; i++)
         if (devs[i].vendor == vendor && devs[i].device == device) { *out = devs[i]; return 0; }
     return -1;
+}
+/* Table-driven lookup, the way Linux matches a driver's id_table: the first entry of `ids` that has a
+ * device present wins, so a table lists the preferred device first. */
+int pci_find_any(const struct pci_id *ids, int n, struct pci_dev *out) {
+    for (int k = 0; k < n; k++)
+        if (!pci_find(ids[k].vendor, ids[k].device, out)) return 0;
+    return -1;
+}
+void pci_enable(const struct pci_dev *d, uint16_t bits) {     /* bits: 1 = I/O, 2 = memory, 4 = bus master */
+    uint32_t cmd = pci_read32(d->bus, d->dev, d->fn, 4);
+    if ((cmd & bits) != bits) pci_write32(d->bus, d->dev, d->fn, 4, cmd | bits);
 }
 int pci_find_class(uint32_t cls, struct pci_dev *out) {         /* cls = class:subclass:prog-if, e.g. 0x0C0330 for xHCI */
     for (int i = 0; i < ndev; i++)

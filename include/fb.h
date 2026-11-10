@@ -20,6 +20,9 @@ struct fb_device {
     const char *name;
     struct fb_info info;
     int (*pan)(struct fb_device *d, uint32_t x, uint32_t y);   /* optional hardware pan/flip */
+    /* optional: the device does not scan video memory by itself (VMware/VirtualBox SVGA, which need a
+     * FIFO command to refresh) and must be told which rectangle changed.  Called by fb_damage(). */
+    void (*flush)(struct fb_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     struct fb_device *next;
 };
 
@@ -32,4 +35,6 @@ ssize_t fb_write(uint64_t off, const void *buf, size_t n);
 long fb_ioctl(unsigned long cmd, uintptr_t arg);
 size_t fb_dump(char *buf, size_t n);
 
+void fb_damage(struct fb_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h);   /* pixels changed: refresh */
+void fb_cmdline_mode(uint32_t *w, uint32_t *h, uint32_t dw, uint32_t dh);   /* video=WxH on the command line */
 void fbcon_attach(struct fb_device *d);                        /* bind the text console to a framebuffer */

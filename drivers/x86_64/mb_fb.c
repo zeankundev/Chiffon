@@ -20,6 +20,7 @@ void mb_fb_boot_info(const uint32_t *m) {
 
 static int probe(void) {
     if (!boot.valid) return -1;
+    if (fb_primary()) return -1;                         /* a device driver already owns the screen */
     if (boot.type != 1) return -1;                       /* must be direct-colour RGB, not EGA-text */
     if (boot.bpp != 32 && boot.bpp != 16) return -1;
     if (!boot.width || !boot.height || !boot.pitch) return -1;
@@ -33,5 +34,6 @@ static int init(void) {
                                  .roff = boot.rpos, .rlen = boot.rsize, .goff = boot.gpos, .glen = boot.gsize, .boff = boot.bpos, .blen = boot.bsize };
     return fb_register(&fbd);
 }
+/* Fallback only: used when no device driver (vmsvga, bochs-vbe) took the screen.  Priority 10. */
 static struct kdriver drv = { "multiboot-fb", "bootloader-provided framebuffer", DRV_DISPLAY, 10, probe, init, 0, 0 };
 KDRIVER(drv);

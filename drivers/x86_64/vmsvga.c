@@ -1,165 +1,170 @@
-/* VMware SVGA2 framebuffer driver.
+/* VMware SVGA II display: VMware Workstation/Player, VirtualBox "VMSVGA" and "VBoxSVGA" (both present
+ * as PCI 15AD:0405) and QEMU's `-vga vmware`.  Matched by PCI ID table, like a Linux pci_driver.
  *
- * Covers VirtualBox "VMSVGA" and "VBoxSVGA" adapters (PCI 15AD:0405) as well
- * as VMware Workstation/Player (same PCI IDs, same register protocol).
+ * The device has three PCI resources, used the way Linux's vmwgfx uses them:
+ *   BAR0  I/O ports.  Index port at +0, value port at +1 (byte offsets; the register number goes in the
+ *         index port and its contents in the value port).
+ *   BAR1  video RAM.  The scanout framebuffer lives here, at SVGA_REG_FB_OFFSET from the base.
+ *   BAR2  the command FIFO, a ring of 32-bit words the guest fills with drawing commands.
  *
- * The SVGA2 device is controlled through a small set of indexed registers
- * reached via two I/O ports whose base address comes from PCI BAR0:
- *
- *   base + SVGA_INDEX_PORT (0)  – write the register index
- *   base + SVGA_VALUE_PORT (1)  – read/write the register value
- *
- * Bring-up sequence:
- *   1. Write SVGA_REG_ID with SVGA_ID_2 to identify the device.
- *   2. Set SVGA_REG_WIDTH / HEIGHT / BITS_PER_PIXEL.
- *   3. Enable by writing 1 to SVGA_REG_ENABLE.
- *   4. Read SVGA_REG_FB_START and SVGA_REG_BYTES_PER_LINE for the linear
- *      framebuffer address and pitch.
- *
- * The framebuffer lies in PCI BAR1 (memory-mapped); we do NOT need to program
- * the BAR ourselves – the firmware/BIOS already did that.  We only need to
- * read back the physical address.
- *
- * References: VMware SVGA Device Developer Kit, open-vm-tools, QEMU vmware_vga. */
+ * Mode setting is plain register writes.  The device does not refresh the screen from video RAM by
+ * itself: after the kernel paints a rectangle, an SVGA_CMD_UPDATE for that rectangle goes into the FIFO
+ * and the device copies it to the display.  That is the flush hook below; without it the screen
+ * stays black although the pixels are in memory. */
 #include "kernel.h"
 #include "drivers/x86io.h"
 #include "drivers/x86_platform.h"
 
-/* PCI IDs */
-#define VMSVGA_VENDOR 0x15AD
-#define VMSVGA_DEVICE 0x0405
+static const struct pci_id ids[] = { { 0x15AD, 0x0405 } };       /* VMware SVGA II / VirtualBox VMSVGA, VBoxSVGA */
 
-/* I/O register layout (offsets from BAR0 base, in 32-bit words / 4-byte steps) */
-#define SVGA_INDEX_PORT 0
-#define SVGA_VALUE_PORT 1
+/* register numbers, written to the index port */
+enum {
+    R_ID = 0, R_ENABLE, R_WIDTH, R_HEIGHT, R_MAX_WIDTH, R_MAX_HEIGHT, R_DEPTH, R_BITS_PER_PIXEL,
+    R_PSEUDOCOLOR, R_RED_MASK, R_GREEN_MASK, R_BLUE_MASK, R_BYTES_PER_LINE, R_FB_START, R_FB_OFFSET,
+    R_VRAM_SIZE, R_FB_SIZE, R_CAPABILITIES, R_MEM_START, R_MEM_SIZE, R_CONFIG_DONE, R_SYNC, R_BUSY,
+};
+#define SVGA_ID_2       0x90000002u
+#define SVGA_CMD_UPDATE 1u
+/* FIFO header, in 32-bit words: MIN, MAX, NEXT_CMD, STOP (byte offsets into the FIFO) */
+#define F_MIN  0
+#define F_MAX  1
+#define F_NEXT 2
+#define F_STOP 3
+#define FIFO_HDR   0x1000u               /* room for the header and any extended FIFO registers */
+#define FIFO_MAXB  (1u << 20)            /* ring size used, however large the device's FIFO is */
+#define SPIN_LIMIT 10000000u             /* device too slow or stuck: stop waiting, never hang the kernel */
 
-/* Register indices */
-#define SVGA_REG_ID            0
-#define SVGA_REG_ENABLE        1
-#define SVGA_REG_WIDTH         2
-#define SVGA_REG_HEIGHT        3
-#define SVGA_REG_MAX_WIDTH     4
-#define SVGA_REG_MAX_HEIGHT    5
-#define SVGA_REG_DEPTH         6
-#define SVGA_REG_BITS_PER_PIXEL 7
-#define SVGA_REG_PSEUDOCOLOR   8
-#define SVGA_REG_RED_MASK      9
-#define SVGA_REG_GREEN_MASK    10
-#define SVGA_REG_BLUE_MASK     11
-#define SVGA_REG_BYTES_PER_LINE 12
-#define SVGA_REG_FB_START      13
-#define SVGA_REG_FB_OFFSET     14
-#define SVGA_REG_VRAM_SIZE     15
-#define SVGA_REG_FB_SIZE       16
-#define SVGA_REG_CAPABILITIES  17
-
-/* Magic ID values */
-#define SVGA_MAGIC   0x900000UL
-#define SVGA_ID_2    (SVGA_MAGIC << 8 | 2)
-#define SVGA_ID_1    (SVGA_MAGIC << 8 | 1)
-#define SVGA_ID_0    (SVGA_MAGIC << 8 | 0)
-#define SVGA_ID_INVALID 0xFFFFFFFFu
-
-/* Default resolution if no kernel command-line override is given */
 #define DEFAULT_W 1024
-#define DEFAULT_H  768
+#define DEFAULT_H 768
 
 static struct pci_dev pdev;
 static uint16_t iobase;
+static volatile uint32_t *fifo;          /* BAR2 (uncacheable), NULL when the device has no FIFO */
+static uint32_t fifo_bytes;
 static struct fb_device fbd;
 
 static void svga_write(uint32_t reg, uint32_t val) {
-    outl(iobase + SVGA_INDEX_PORT * 4, reg);
-    outl(iobase + SVGA_VALUE_PORT * 4, val);
+    outl(iobase + 0, reg);               /* index port */
+    outl(iobase + 1, val);               /* value port */
 }
 static uint32_t svga_read(uint32_t reg) {
-    outl(iobase + SVGA_INDEX_PORT * 4, reg);
-    return inl(iobase + SVGA_VALUE_PORT * 4);
+    outl(iobase + 0, reg);
+    return inl(iobase + 1);
+}
+
+/* Wait until the device has consumed the FIFO.  Bounded: a stuck device must not hang the kernel. */
+static void fifo_drain(void) {
+    for (uint32_t i = 0; i < SPIN_LIMIT && fifo[F_STOP] != fifo[F_NEXT]; i++)
+        __asm__ volatile("pause");
+}
+
+/* Queue one SVGA_CMD_UPDATE and kick the device.  The FIFO is drained before every command, so when
+ * it has to wrap the device is idle and both pointers can restart at FIFO_HDR together. */
+static void svga_update(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    if (!fifo) return;
+    const uint32_t cmd[5] = { SVGA_CMD_UPDATE, x, y, w, h };
+    const uint32_t len = sizeof cmd;
+    fifo_drain();
+    uint32_t next = fifo[F_NEXT];
+    if (next + len > fifo[F_MAX]) {
+        fifo[F_STOP] = FIFO_HDR;
+        next = FIFO_HDR;
+    }
+    for (uint32_t k = 0; k < 5; k++) fifo[(next / 4) + k] = cmd[k];
+    __sync_synchronize();
+    fifo[F_NEXT] = next + len;
+    svga_write(R_SYNC, 1);
+    fifo_drain();
+}
+
+static void svga_flush(struct fb_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    (void)d;
+    svga_update(x, y, w, h);
 }
 
 static int probe(void) {
-    if (pci_find(VMSVGA_VENDOR, VMSVGA_DEVICE, &pdev)) return -1;
-    /* Enable I/O + memory space on the PCI device */
-    uint32_t cmd = pci_read32(pdev.bus, pdev.dev, pdev.fn, 4);
-    pci_write32(pdev.bus, pdev.dev, pdev.fn, 4, cmd | 3);
-    /* BAR0 is the I/O register base */
-    uint32_t bar0 = pci_bar(&pdev, 0);
-    if (!bar0) return -1;
-    iobase = (uint16_t)(bar0 & 0xFFFC);
-    /* Identify the device */
-    svga_write(SVGA_REG_ID, SVGA_ID_2);
-    uint32_t id = svga_read(SVGA_REG_ID);
-    if (id != SVGA_ID_2) {
-        svga_write(SVGA_REG_ID, SVGA_ID_1);
-        id = svga_read(SVGA_REG_ID);
-        if (id != SVGA_ID_1) return -1;
-    }
-    return 0;
+    if (pci_find_any(ids, 1, &pdev)) return -1;
+    pci_enable(&pdev, 1 | 2);                                    /* I/O space and memory space */
+    iobase = (uint16_t)pci_bar(&pdev, 0);
+    if (!iobase) return -1;
+    svga_write(R_ID, SVGA_ID_2);                                 /* identify: the device echoes its ID */
+    return svga_read(R_ID) == SVGA_ID_2 ? 0 : -1;
+}
+
+/* Pixel layout from the device's colour masks (e.g. 0xFF0000 = 8 red bits at bit 16), as Linux does. */
+static void mask_field(uint32_t mask, uint8_t *off, uint8_t *len) {
+    *off = 0; *len = 0;
+    if (!mask) return;
+    while (!(mask & 1)) { mask >>= 1; (*off)++; }
+    while (mask & 1) { mask >>= 1; (*len)++; }
 }
 
 static int init(void) {
-    /* Pick a resolution (kernel command line: video=WIDTHxHEIGHT) */
-    uint32_t w = DEFAULT_W, h = DEFAULT_H;
-    const char *v = cmdline_get("video");
-    if (v) {
-        uint32_t a = 0, b = 0;
-        while (*v >= '0' && *v <= '9') a = a * 10 + (*v++ - '0');
-        if (*v == 'x') { v++; while (*v >= '0' && *v <= '9') b = b * 10 + (*v++ - '0'); }
-        if (a >= 320 && a <= 4096 && b >= 200 && b <= 4096) { w = a; h = b; }
-    }
-    /* Clamp to device maximum */
-    uint32_t mw = svga_read(SVGA_REG_MAX_WIDTH);
-    uint32_t mh = svga_read(SVGA_REG_MAX_HEIGHT);
+    uint32_t w, h;
+    fb_cmdline_mode(&w, &h, DEFAULT_W, DEFAULT_H);
+    uint32_t mw = svga_read(R_MAX_WIDTH), mh = svga_read(R_MAX_HEIGHT);
     if (mw && w > mw) w = mw;
     if (mh && h > mh) h = mh;
 
-    /* Program the mode and enable the device */
-    svga_write(SVGA_REG_ENABLE,        0);         /* disable while changing mode */
-    svga_write(SVGA_REG_WIDTH,         w);
-    svga_write(SVGA_REG_HEIGHT,        h);
-    svga_write(SVGA_REG_BITS_PER_PIXEL, 32);
-    svga_write(SVGA_REG_ENABLE,        1);
+    uint32_t bar1 = pci_bar(&pdev, 1), bar2 = pci_bar(&pdev, 2);
+    if (!bar1) return -1;
 
-    uint32_t pitch  = svga_read(SVGA_REG_BYTES_PER_LINE);
-    uint32_t fb_pa  = svga_read(SVGA_REG_FB_START);
-    uint32_t fb_off = svga_read(SVGA_REG_FB_OFFSET);
+    svga_write(R_ENABLE, 0);                                     /* disable while the mode changes */
+    svga_write(R_WIDTH, w);
+    svga_write(R_HEIGHT, h);
+    svga_write(R_BITS_PER_PIXEL, 32);
+    svga_write(R_ENABLE, 1);
 
-    if (!fb_pa || !pitch) {
-        kprintf("vmsvga: device did not provide a framebuffer address\n");
-        svga_write(SVGA_REG_ENABLE, 0);
+    uint32_t aw = svga_read(R_WIDTH), ah = svga_read(R_HEIGHT), abpp = svga_read(R_BITS_PER_PIXEL);
+    uint32_t pitch = svga_read(R_BYTES_PER_LINE);
+    uint32_t fb_off = svga_read(R_FB_OFFSET);
+    uint32_t vram = svga_read(R_VRAM_SIZE);
+    if (!aw || !ah || !pitch || (abpp != 32 && abpp != 16)) {
+        kprintf("vmsvga: device refused %ux%u (got %ux%u %ubpp)\n", w, h, aw, ah, abpp);
+        svga_write(R_ENABLE, 0);
+        return -1;
+    }
+    if (vram && (uint64_t)fb_off + (uint64_t)pitch * ah > vram) {
+        kprintf("vmsvga: %ux%u does not fit in %u KiB of video memory\n", aw, ah, vram >> 10);
+        svga_write(R_ENABLE, 0);
         return -1;
     }
 
-    uint32_t actual_w = svga_read(SVGA_REG_WIDTH);
-    uint32_t actual_h = svga_read(SVGA_REG_HEIGHT);
-    uint32_t actual_bpp = svga_read(SVGA_REG_BITS_PER_PIXEL);
-    if (actual_bpp != 32 && actual_bpp != 16) {
-        kprintf("vmsvga: unsupported bpp %u\n", (unsigned)actual_bpp);
-        svga_write(SVGA_REG_ENABLE, 0);
-        return -1;
+    /* the FIFO: the device reads commands from [MIN, NEXT) and reports how far it got in STOP */
+    uint32_t fmem = svga_read(R_MEM_SIZE);
+    if (bar2 && fmem > FIFO_HDR) {
+        fifo_bytes = fmem < FIFO_MAXB ? fmem : FIFO_MAXB;
+        arch_map_device(bar2, fifo_bytes);
+        fifo = P2V(bar2);
+        fifo[F_MIN] = FIFO_HDR;
+        fifo[F_MAX] = fifo_bytes;
+        fifo[F_NEXT] = FIFO_HDR;
+        fifo[F_STOP] = FIFO_HDR;
+        svga_write(R_CONFIG_DONE, 1);
     }
 
-    uint64_t phys = (uint64_t)fb_pa + fb_off;
+    uint8_t roff = 16, rlen = 8, goff = 8, glen = 8, boff = 0, blen = 8;
+    uint32_t rm = svga_read(R_RED_MASK), gm = svga_read(R_GREEN_MASK), bm = svga_read(R_BLUE_MASK);
+    if (rm && gm && bm) {
+        mask_field(rm, &roff, &rlen);
+        mask_field(gm, &goff, &glen);
+        mask_field(bm, &boff, &blen);
+    }
+
     fbd.name = "vmsvga";
+    fbd.flush = fifo ? svga_flush : 0;                           /* no FIFO: the framebuffer is still usable */
     fbd.info = (struct fb_info){
-        .phys   = phys,
-        .width  = actual_w,
-        .height = actual_h,
-        .pitch  = pitch,
-        .bpp    = (uint8_t)actual_bpp,
-        /* VMware SVGA2 in 32bpp always delivers xRGB (blue at bit 0) */
-        .roff = 16, .rlen = 8,
-        .goff =  8, .glen = 8,
-        .boff =  0, .blen = 8,
+        .phys = (uintptr_t)bar1 + fb_off, .width = aw, .height = ah, .pitch = pitch, .bpp = abpp,
+        .vheight = ah, .roff = roff, .rlen = rlen, .goff = goff, .glen = glen, .boff = boff, .blen = blen,
     };
+    kprintf("vmsvga: %ux%u %ubpp, video memory %u KiB, FIFO %s\n", aw, ah, abpp, vram >> 10, fifo ? "on" : "off");
     return fb_register(&fbd);
 }
 
-/* Priority 15: after multiboot-fb (10) and bochs-vbe (20) but before vga-text (90).
- * We prefer the GRUB-provided framebuffer if GRUB managed to set gfxpayload, and
- * fall back to programming SVGA ourselves when it did not. */
+/* Priority 5 in the display class: a device that has a driver owns the screen, ahead of the
+ * bootloader's framebuffer (multiboot-fb, prio 10), which is only the fallback. */
 static struct kdriver drv = {
-    "vmsvga", "VMware/VirtualBox SVGA2 framebuffer",
-    DRV_DISPLAY, 15, probe, init, 0, 0
+    "vmsvga", "VMware / VirtualBox SVGA II framebuffer (15AD:0405)",
+    DRV_DISPLAY, 5, probe, init, 0, 0
 };
 KDRIVER(drv);
