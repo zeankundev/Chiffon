@@ -28,7 +28,7 @@ static int has_env(struct envctx *e, const char *k) {
     return 0;
 }
 
-static int screen_started;                           /* the framebuffer console shell is started once */
+static int screen_started[VT_SCREENS];
 
 static int start_init(void) {
     const char* path = cmdline_get("init");
@@ -74,20 +74,30 @@ static int start_init(void) {
             for (int j = 0; j < NPROC; j++)
                 if (ptable[j].pid == r) strlcpy(ptable[j].cwd, cfg_get("init", "cwd", "/"), PATH_MAX);
             kprintf("init: pid %d is %s\n", r, cand);
-            /* A framebuffer is a console too: start the same shell on /dev/tty1 (the window).  Its environment
-             * says which terminal it is on (CHIFFON_CONSOLE), for programs that behave differently there. */
-            if (!screen_started && fb_primary() && strcmp(console, "/dev/tty1") != 0) {
-                screen_started = 1;
+            /* Start an independent interactive shell on every screen tty. VGA text mode has no
+             * fb_primary(), so availability is determined by whether the tty device can be opened. */
+            for (int screen = 1; screen <= VT_SCREENS; screen++) {
+                if (screen_started[screen - 1] ||
+                    (screen == 1 && !strcmp(console, "/dev/tty1"))) continue;
+                char ttyname[16];
+                ksnprintf(ttyname, sizeof ttyname, "/dev/tty%d", screen);
                 char *senv[NENVSLOTS + 1]; int m = 0;
                 for (int k = 0; k < env.n && m < NENVSLOTS - 1; k++) senv[m++] = env.v[k];
-                senv[m++] = "CHIFFON_CONSOLE=/dev/tty1";
+                static char conenv[VT_SCREENS][32];
+                ksnprintf(conenv[screen - 1], sizeof conenv[screen - 1], "CHIFFON_CONSOLE=%s", ttyname);
+                senv[m++] = conenv[screen - 1];
                 senv[m] = 0;
-                int sr = proc_spawn_console(cand, argv, senv, "/dev/tty1");
+                char *screen_argv[20];
+                int ac = 0;
+                for (; ac < n && ac < 19; ac++) screen_argv[ac] = argv[ac];
+                screen_argv[ac] = 0;
+                int sr = proc_spawn_console(cand, screen_argv, senv, ttyname);
                 if (sr > 0) {
+                    screen_started[screen - 1] = 1;
                     for (int j = 0; j < NPROC; j++)
                         if (ptable[j].pid == sr) strlcpy(ptable[j].cwd, cfg_get("init", "cwd", "/"), PATH_MAX);
-                    kprintf("console: pid %d is %s on /dev/tty1\n", sr, cand);
-                } else kprintf("console: no shell on /dev/tty1 (error %d)\n", -sr);
+                    kprintf("console: pid %d is %s on %s\n", sr, cand, ttyname);
+                }
             }
             return r;
         }

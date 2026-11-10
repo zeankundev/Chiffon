@@ -9,7 +9,7 @@
 #pragma once
 #include <stddef.h>
 
-enum drv_class { DRV_BUS, DRV_INPUT, DRV_DISPLAY, DRV_BLOCK, DRV_CHAR, DRV_MISC };
+enum drv_class { DRV_BUS, DRV_INPUT, DRV_DISPLAY, DRV_BLOCK, DRV_CHAR, DRV_NET, DRV_MISC };
 enum drv_state { DRV_IDLE, DRV_ACTIVE, DRV_ABSENT, DRV_FAILED };
 
 struct kdriver {

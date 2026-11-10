@@ -42,6 +42,9 @@ void board_init(void) {
     driver_note("pic-pit", "8259 PIC + 8254 PIT, 100 Hz tick", DRV_MISC);
     driver_note("ata-pio", "legacy ATA PIO disk (primary master)", DRV_BLOCK);
     kprintf("board: x86_64 %s (PIC/PIT/COM1/ATA)\n", BOARD_NAME);
+
+    /* Initialize SMP (LAPIC and CPU discovery) */
+    smp_init();
 }
 void board_irq(struct trapframe *tf) {
     unsigned v = tf->trapno;
@@ -63,3 +66,11 @@ int board_blk_init(void) { return ata_init(); }
 uint64_t board_blk_sectors(void) { return ata_nsect; }
 int board_blk_read(uint64_t lba, void *buf, uint32_t n) { return ata_read(lba, buf, n); }
 int board_blk_write(uint64_t lba, const void *buf, uint32_t n) { return ata_write(lba, buf, n); }
+
+int board_net_probe(void) {
+    /* Network device discovery and initialization happens via drivers/x86_64/virtio_net.c.
+     * The virtio-net-pci driver will auto-probe via the PCI driver during drivers_init().
+     * This function just signals that we've attempted to set up networking; if no device
+     * was found, that's OK -- networking is optional. */
+    return 0;
+}
