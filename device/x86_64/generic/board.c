@@ -42,9 +42,7 @@ void board_init(void) {
     driver_note("pic-pit", "8259 PIC + 8254 PIT, 100 Hz tick", DRV_MISC);
     driver_note("ata-pio", "legacy ATA PIO disk (primary master)", DRV_BLOCK);
     kprintf("board: x86_64 %s (PIC/PIT/COM1/ATA)\n", BOARD_NAME);
-
-    /* Initialize SMP (LAPIC and CPU discovery) */
-    smp_init();
+    /* LAPIC and CPU discovery run from kmain() via smp_init(), once, after init has started. */
 }
 void board_irq(struct trapframe *tf) {
     unsigned v = tf->trapno;

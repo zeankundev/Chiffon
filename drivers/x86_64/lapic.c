@@ -55,6 +55,10 @@ static uintptr_t lapic_base;        /* virtual address of LAPIC MMIO region */
 #define ICR_DEST_ALL_EXCEPT 0xC0000
 #define ICR_DEST_FIELD(cpu) ((uint64_t)(cpu) << 56)
 
+/* LVT delivery modes for LINT0/LINT1 */
+#define LVT_EXTINT 0x700
+#define LVT_NMI    0x400
+
 static inline uint32_t lapic_read(uint32_t offset) {
 	return *(volatile uint32_t *)(lapic_base + offset);
 }
@@ -196,7 +200,16 @@ static int parse_mp_table(void) {
 /* ---- Initialization and IPI ---- */
 
 int board_smp_start(uintptr_t entry_pa) {
+	(void)entry_pa;
 	if (cpu_count <= 1) return 0;  /* no secondary CPUs found */
+	/* Secondary CPUs start in real mode at the SIPI vector. There is no x86 real-mode trampoline yet, so
+	 * starting them now would run whatever bytes sit at that address. Stay on the boot CPU unless the
+	 * kernel is booted with smp=on (for experiments only). */
+	const char *smp = cmdline_get("smp");
+	if (!smp || kstrcasecmp(smp, "on")) {
+		kprintf("smp: %d CPUs found, running on 1 (x86 secondary startup needs a trampoline; boot with smp=on to try)\n", cpu_count);
+		return 0;
+	}
 
 	int secondary_count = 0;
 	int bsp_id = lapic_read(LAPIC_ID) >> 24;
@@ -263,9 +276,11 @@ void lapic_init(void) {
 	lapic_write(LAPIC_SPURIOUS, 0x1FF);             /* spurious vector 0xFF, APIC enabled */
 	lapic_write(LAPIC_TPR, 0);                      /* accept all interrupts */
 
-	/* Mask LINT0 and LINT1 (we use 8259 PIC);  also disable error/thermal/performance */
-	lapic_write(LAPIC_LVT_LINT0, 0x10000);          /* mask LINT0 */
-	lapic_write(LAPIC_LVT_LINT1, 0x10000);          /* mask LINT1 */
+	/* Virtual-wire mode: the 8259 PIC (and so the PIT timer on IRQ0) reaches the CPU through LINT0 as
+	 * ExtINT. Masking LINT0 silently kills the timer, which stops the screen repainting, the keyboard
+	 * being polled and the scheduler preempting anything. LINT1 is NMI; error is masked. */
+	lapic_write(LAPIC_LVT_LINT0, LVT_EXTINT);
+	lapic_write(LAPIC_LVT_LINT1, LVT_NMI);
 	lapic_write(LAPIC_LVT_ERROR, 0x10000);          /* mask error */
 
 	kprintf("lapic: initialized (base=%p, ID=%d)\n", (void *)lapic_base, lapic_read(LAPIC_ID) >> 24);
