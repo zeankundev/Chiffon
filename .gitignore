@@ -7,3 +7,5 @@ env/testenv
 env/milkos
 env/doomlocal
 env/wldemo
+.vs
+.vscode

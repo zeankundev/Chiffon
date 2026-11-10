@@ -1,4 +1,4 @@
-set -e
+
 ENVDIR=$1; ROOT=$2; USERLAND=$3; ARCH=$4; CROSS=$5; REPO=$(pwd)
 rm -rf "$ROOT"; mkdir -p "$ROOT"
 [ -d "$ENVDIR/rootfs" ] && cp -R "$ENVDIR/rootfs/." "$ROOT/"
