@@ -10,6 +10,7 @@ int      pci_find_class(uint32_t cls, struct pci_dev *out);             /* 0 = f
 uint32_t pci_bar(const struct pci_dev *d, int n);                               /* BAR n, flag bits masked off */
 struct pci_id { uint16_t vendor, device; };
 int      pci_find_any(const struct pci_id *ids, int n, struct pci_dev *out);     /* first table entry present, 0 = found */
+void     pci_rescan(void);                                                       /* discover PCI hotplug */
 void     pci_enable(const struct pci_dev *d, uint16_t bits);                    /* set PCI command-register bits */
 
 /* the board hands the Multiboot info block to this before anything else is initialised */

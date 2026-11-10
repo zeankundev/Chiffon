@@ -42,19 +42,28 @@ uint32_t pci_bar(const struct pci_dev *d, int n) {
     return (v & 1) ? (v & ~3u) : (v & ~0xFu);
 }
 
+static void scan_devices(void) {
+    for (int bus = 0; bus < 8; bus++)
+        for (int dev = 0; dev < 32; dev++)
+            for (int fn = 0; fn < 8; fn++) {
+                uint32_t id = pci_read32(bus, dev, fn, 0);
+                if ((id & 0xFFFF) == 0xFFFF) { if (!fn) break; continue; }
+                int known = 0;
+                for (int i = 0; i < ndev; i++)
+                    if (devs[i].bus == bus && devs[i].dev == dev && devs[i].fn == fn) { known = 1; break; }
+                if (!known && ndev < MAXDEV)
+                    devs[ndev++] = (struct pci_dev){ bus, dev, fn, id & 0xFFFF, id >> 16, pci_read32(bus, dev, fn, 8) };
+                if (!fn && !(pci_read32(bus, dev, fn, 0xC) & 0x800000)) break;
+            }
+}
+void pci_rescan(void) { scan_devices(); }
+
 static int probe(void) {
     outl(CFG_ADDR, 0x80000000u);
     return inl(CFG_ADDR) == 0x80000000u ? 0 : -1;       /* does the address register read back? */
 }
 static int init(void) {
-    for (int bus = 0; bus < 8; bus++)                    /* bus 0 plus the first few bridged buses */
-        for (int dev = 0; dev < 32; dev++)
-            for (int fn = 0; fn < 8; fn++) {
-                uint32_t id = pci_read32(bus, dev, fn, 0);
-                if ((id & 0xFFFF) == 0xFFFF) { if (!fn) break; continue; }
-                if (ndev < MAXDEV) devs[ndev++] = (struct pci_dev){ bus, dev, fn, id & 0xFFFF, id >> 16, pci_read32(bus, dev, fn, 8) };
-                if (!fn && !(pci_read32(bus, dev, fn, 0xC) & 0x800000)) break;      /* not multi-function */
-            }
+    scan_devices();
     for (int i = 0; i < ndev; i++)
         kprintf("pci: %02x:%02x.%x %04x:%04x class %04x\n", devs[i].bus, devs[i].dev, devs[i].fn, devs[i].vendor, devs[i].device, devs[i].class_rev >> 16);
     return 0;

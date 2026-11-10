@@ -261,8 +261,12 @@ static int net_configure(void) {
     net_lock();
     if (!configured) {
         if (!dhcp_run()) {
-            my_ip = 0x0a00020f; my_mask = 0xFFFFFF00u; my_gw = 0x0a000202; my_dns = 0x0a000203;
-            kprintf("net: no DHCP answer, using the QEMU user-network addresses\n");
+            /* The QEMU user-network addresses are not valid on VirtualBox NAT,
+             * bridged networks, or physical LANs.  Leave the interface
+             * unconfigured so the caller can retry DHCP on a later request. */
+            kprintf("net: DHCP failed on %s; no IPv4 configuration\n", dev->name);
+            net_unlock();
+            return -EHOSTUNREACH;
         }
         configured = 1;
         kprintf("net: ip "); kprint_ip(my_ip);
@@ -534,20 +538,22 @@ long net_syscall(long nr, long a0, long a1, long a2, long a3) {
     switch (nr) {
     case CSYS_net_info: {
         if (!uok(a0, sizeof(struct chi_netinfo))) return -EFAULT;
-        net_configure();
+        int r = net_configure();
+        if (r) return r;
         struct chi_netinfo *u = (struct chi_netinfo *)a0;
         u->ip = my_ip; u->mask = my_mask; u->gateway = my_gw; u->dns = my_dns;
         memcpy(u->mac, mac, 6); u->configured = (uint8_t)configured; u->_pad = 0;
         return 0;
     }
     case CSYS_net_ping:
-        net_configure();
+        { int r = net_configure(); if (r) return r; }
         return net_ping((uint32_t)a0, (int)a1);      /* round trip in microseconds */
     case CSYS_net_resolve: {
         int cr = ustrcpy(namebuf, a0, sizeof namebuf);     /* 0 on success, -errno otherwise */
         if (cr) return cr;
         if (!uok(a1, 4)) return -EFAULT;
-        net_configure();
+        cr = net_configure();
+        if (cr) return cr;
         uint32_t ip;
         if (dotted_quad(namebuf, &ip)) { *(uint32_t *)a1 = ip; return 0; }
         net_lock();
@@ -558,7 +564,7 @@ long net_syscall(long nr, long a0, long a1, long a2, long a3) {
         return 0;
     }
     case CSYS_net_connect:
-        net_configure();
+        { int r = net_configure(); if (r) return r; }
         net_lock();
         {
             long r = tcp_connect((uint32_t)a0, (uint16_t)a1);
