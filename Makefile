@@ -197,7 +197,7 @@ bootdir: all
 clean:
 	@rm -rf $(BUILD)
 help:
-	@echo "Chiffon - a small Unix-like monolithic kernel with an IPC layer (hybrid goal pending) + OS (c) 2026 zeankun"
+	@echo "Chiffon - a small Unix-like hybrid kernel + OS (c) 2026 zeankun"
 	@echo ""
 	@echo "- make [ENV=demo] : build the kernel and disk image for the given environment (default: demo)"
 	@echo "- make new-env NAME=<name> : create a new environment with the given name"
