@@ -30,6 +30,11 @@ void fb_fill(struct fb_device *d, int x, int y, int w, int h, uint32_t rgb) {
     for (int row = 0; row < h; row++) {
         uint8_t *line = i->virt + (size_t)(i->yoff + y + row) * i->pitch + (size_t)x * (i->bpp / 8);
         if (i->bpp == 32) for (int k = 0; k < w; k++) ((uint32_t *)line)[k] = px;
+        else if (i->bpp == 24) for (int k = 0; k < w; k++) {
+            line[3 * k + 0] = (uint8_t)px;
+            line[3 * k + 1] = (uint8_t)(px >> 8);
+            line[3 * k + 2] = (uint8_t)(px >> 16);
+        }
         else for (int k = 0; k < w; k++) ((uint16_t *)line)[k] = (uint16_t)px;
     }
     fb_damage(d, x, y, w, h);
@@ -94,7 +99,7 @@ static int console_service(const struct chi_ipc_msg *q, struct chi_ipc_msg *r) {
 
 int fb_register(struct fb_device *d) {
     struct fb_info *i = &d->info;
-    if ((i->bpp != 32 && i->bpp != 16) || !i->width || !i->height || !i->pitch) return -EINVAL;
+    if ((i->bpp != 32 && i->bpp != 24 && i->bpp != 16) || !i->width || !i->height || !i->pitch) return -EINVAL;
     if (!i->vheight) i->vheight = i->height;
     if (!i->size) i->size = i->pitch * i->vheight;
     if (arch_map_device(i->phys, i->size)) return -ENODEV;

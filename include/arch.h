@@ -18,6 +18,7 @@ uintptr_t arch_aspace_new(void);
 void arch_aspace_free(uintptr_t aspace);
 void arch_aspace_switch(uintptr_t aspace);
 int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa);
+int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa);
 uintptr_t arch_unmap(uintptr_t root, uintptr_t va);
 uintptr_t arch_translate(uintptr_t root, uintptr_t va);
 void arch_sync_icache(void *va, size_t n);

@@ -162,6 +162,20 @@ int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
     t[(va >> 12) & 511] = pa | 7;                    /* P | RW | US */
     return 0;
 }
+int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa) {
+    uint64_t *t = P2V(root);
+    for (int lvl = 3; lvl > 0; lvl--) {
+        uint64_t *e = &t[(va >> (12 + 9 * lvl)) & 511];
+        if (!(*e & 1)) {
+            uintptr_t np = pmm_alloc();
+            if (!np) return -1;
+            *e = np | 7;
+        }
+        t = P2V(*e & PTE_ADDR);
+    }
+    t[(va >> 12) & 511] = pa | 7 | DM_PCD | DM_PWT; /* user RW, uncached device mapping */
+    return 0;
+}
 static uint64_t *walk(uintptr_t root, uintptr_t va) {
     uint64_t *t = P2V(root);
     for (int lvl = 3; lvl > 0; lvl--) {

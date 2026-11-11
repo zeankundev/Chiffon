@@ -22,7 +22,7 @@ static int probe(void) {
     if (!boot.valid) return -1;
     if (fb_primary()) return -1;                         /* a device driver already owns the screen */
     if (boot.type != 1) return -1;                       /* must be direct-colour RGB, not EGA-text */
-    if (boot.bpp != 32 && boot.bpp != 16) return -1;
+    if (boot.bpp != 32 && boot.bpp != 24 && boot.bpp != 16) return -1;
     if (!boot.width || !boot.height || !boot.pitch) return -1;
     /* On BIOS systems (El Torito / VESA) the framebuffer is always below 4 GiB.
      * On UEFI systems it may be above; arch_map_device enforces the reachability limit. */

@@ -42,6 +42,7 @@ static uint16_t iobase;
 static volatile uint32_t *fifo;          /* BAR2 (uncacheable), NULL when the device has no FIFO */
 static uint32_t fifo_bytes;
 static struct fb_device fbd;
+static uint32_t refresh_ticks;
 
 static void svga_write(uint32_t reg, uint32_t val) {
     outl(iobase + 0, reg);               /* index port */
@@ -80,6 +81,15 @@ static void svga_update(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 static void svga_flush(struct fb_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     (void)d;
     svga_update(x, y, w, h);
+}
+
+/* Userspace can draw by writing directly through /dev/fb0 mmap, which has no syscall to announce
+ * damage. VMware only copies VRAM to the display after UPDATE; periodically refresh the whole mode
+ * so those writes appear. VirtualBox's SVGA implementation also accepts this command. */
+static void svga_poll(void) {
+    if (!fifo || !fbd.info.width || ++refresh_ticks < 10) return;
+    refresh_ticks = 0;
+    svga_update(0, 0, fbd.info.width, fbd.info.height);
 }
 
 static int probe(void) {
@@ -165,6 +175,6 @@ static int init(void) {
  * bootloader's framebuffer (multiboot-fb, prio 10), which is only the fallback. */
 static struct kdriver drv = {
     "vmsvga", "VMware / VirtualBox SVGA II framebuffer (15AD:0405)",
-    DRV_DISPLAY, 5, probe, init, 0, 0
+    DRV_DISPLAY, 5, probe, init, svga_poll, 0
 };
 KDRIVER(drv);

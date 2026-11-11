@@ -96,6 +96,21 @@ int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
     t[(va >> 12) & 511] = pa | PTE_USER_PAGE;
     return 0;
 }
+int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa) {
+    uint64_t *t = P2V(root);
+    for (int lvl = 3; lvl > 0; lvl--) {
+        uint64_t *e = &t[(va >> (12 + 9 * lvl)) & 511];
+        if (!(*e & 1)) {
+            uintptr_t np = pmm_alloc();
+            if (!np) return -1;
+            *e = np | PTE_TABLE;
+        }
+        t = P2V(*e & PA_MASK);
+    }
+    /* AttrIdx 0 is the nGnRnE device-memory attribute used by the direct map. */
+    t[(va >> 12) & 511] = pa | (PTE_USER_PAGE & ~(7UL << 2));
+    return 0;
+}
 static uint64_t *walk(uintptr_t root, uintptr_t va) {
     uint64_t *t = P2V(root);
     for (int lvl = 3; lvl > 0; lvl--) {

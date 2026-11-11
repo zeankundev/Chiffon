@@ -37,7 +37,7 @@ int mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa) {
     if (e > USER_TOP || e < s || (pa & (PAGE_SIZE - 1))) return -EINVAL;
     if (mm->nvma >= NVMA) return -ENOMEM;
     for (uintptr_t a = s; a < e; a += PAGE_SIZE)
-        if (arch_translate(mm->root, a) || arch_map(mm->root, a, pa + (a - s))) {
+        if (arch_translate(mm->root, a) || arch_map_device_user(mm->root, a, pa + (a - s))) {
             for (uintptr_t u = s; u < a; u += PAGE_SIZE) arch_unmap(mm->root, u);
             return -ENOMEM;
         }

@@ -27,6 +27,13 @@ static void draw(int x, int y, uint16_t cell) {
         if (fb->info.bpp == 32) {
             uint32_t *p = (uint32_t *)row;
             for (int k = 0; k < FONT_W; k++) p[k] = (bits & (0x80 >> k)) ? f : b;
+        } else if (fb->info.bpp == 24) {
+            for (int k = 0; k < FONT_W; k++) {
+                uint32_t px = (bits & (0x80 >> k)) ? f : b;
+                row[3 * k + 0] = (uint8_t)px;
+                row[3 * k + 1] = (uint8_t)(px >> 8);
+                row[3 * k + 2] = (uint8_t)(px >> 16);
+            }
         } else {
             uint16_t *p = (uint16_t *)row;
             for (int k = 0; k < FONT_W; k++) p[k] = (bits & (0x80 >> k)) ? (uint16_t)f : (uint16_t)b;
@@ -49,7 +56,7 @@ static struct console fbcon = { "fbcon", fbcon_write, fbcon_flush, 0, 1 };
 void fbcon_attach(struct fb_device *d) {
     const char *opt = cmdline_get("fbcon");
     if (opt && (opt[0] == '0' || !kstrcasecmp(opt, "off"))) return;
-    if (d->info.bpp != 32 && d->info.bpp != 16) return;
+    if (d->info.bpp != 32 && d->info.bpp != 24 && d->info.bpp != 16) return;
     fb = d;
     for (int i = 0; i < 16; i++) pal[i] = fb_pack(&d->info, vt_palette[i]);
     display.cols = d->info.width / FONT_W; display.rows = d->info.height / FONT_H;

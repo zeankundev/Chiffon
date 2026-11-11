@@ -10,7 +10,7 @@ struct fb_info {
     uint8_t  *virt;                 /* kernel mapping (filled in by fb_register if 0) */
     uint32_t width, height;         /* visible resolution */
     uint32_t pitch;                 /* bytes per scanline */
-    uint32_t bpp;                   /* 32 or 16 */
+    uint32_t bpp;                   /* 32, 24, or 16 */
     uint32_t vheight;               /* virtual height in lines (>= height; extra lines allow page flips) */
     uint32_t xoff, yoff;            /* current pan offset */
     uint32_t size;                  /* bytes of pixel memory (vheight * pitch) */
