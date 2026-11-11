@@ -5,14 +5,24 @@
 #include <stddef.h>
 #include "uapi/chiffon_abi.h"
 
+#ifndef ENETDOWN
+#define ENETDOWN 100
+#endif
+#define NETDEV_MAX 4                                 /* NICs the stack can hold at once */
+
 struct netdev {
     const char *name;
     uint8_t mac[6];
     int (*send)(const uint8_t *frame, size_t len);   /* transmit one Ethernet frame: 0 or -errno */
     int (*poll)(void);                               /* deliver pending frames via net_input(): count */
+    int (*link)(void);                               /* optional: 1 = carrier, 0 = none; NULL = always up.
+                                                      * Must be cheap and must not print or sleep. */
 };
 
-int  net_attach(const struct netdev *dev);           /* a driver found a NIC: 0 on success */
+int  net_attach(const struct netdev *dev);           /* a driver found a NIC: 0 on success.  `dev` must stay valid;
+                                                      * up to NETDEV_MAX NICs may attach, the stack picks the
+                                                      * first one that has carrier and answers DHCP. */
+size_t net_dump(char *buf, size_t n);                /* /proc/net: interfaces, link state, IPv4 configuration */
 void net_input(const uint8_t *frame, size_t len);    /* one Ethernet frame from the driver */
 int  vnet_probe(uintptr_t mmio_pa);                 /* drivers/aarch64/virtio_net.c */
 int  board_net_probe(void);                          /* board: attach the NIC(s); weak default: none */

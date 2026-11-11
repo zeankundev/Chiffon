@@ -5,7 +5,7 @@
 
 #include "kernel.h"
 #include "net.h"
-#include "drivers/x86_platform.h"
+#include "drivers/x86_nic.h"
 
 #define VNQ     4
 #define VN_BUF  1536
@@ -100,13 +100,8 @@ static void mfence(void) {
 	__asm__ volatile("mfence" ::: "memory");
 }
 
-/* Kernel globals live in the higher-half image, not at the direct-map alias. */
-static uintptr_t dma_addr(uintptr_t va) {
-	/* The linker maps the image at KOFF while loading it at KOFF's physical offset. */
-	const uintptr_t kernel_vma = 0xFFFFFFFF80000000UL;
-	if (va >= kernel_vma) return va - kernel_vma;
-	return V2P(va); /* direct-map allocations */
-}
+/* Kernel globals live in the higher-half image, not at the direct-map alias (shared helper). */
+static uintptr_t dma_addr(uintptr_t va) { return nic_dma_addr((const void *)va); }
 
 static uint8_t pci_cfg8(uint8_t off) {
 	uint32_t v = pci_read32(pdev.bus, pdev.dev, pdev.fn, off & ~3u);
@@ -260,31 +255,9 @@ static int vn_poll(void) {
 /* Hotplug detection: poll for virtio-net device if not yet attached.
  * This allows ethernet to be automatically connected when hotplugged or added after boot. */
 static void vn_detect_hotplug(void) {
-	/* If device already attached, nothing to do */
-	if (device_attached) return;
 	static uint64_t next_scan;
-	if (ticks < next_scan) return;
-	next_scan = ticks + HZ;
-	pci_rescan();
-
-	/* Don't repeatedly re-probe; only check if we haven't successfully attached */
-	/* Try probe on every poll to catch devices added after boot */
-	static const struct pci_id ids[] = {
-		{ VIRTIO_PCI_ID_VENDOR, VIRTIO_PCI_ID_NET_MODERN },
-		{ VIRTIO_PCI_ID_VENDOR, VIRTIO_PCI_ID_NET_LEGACY }
-	};
-
-	/* Check if device now exists */
-	if (pci_find_any(ids, 2, &pdev) != 0) {
-		/* Device still not found */
-		return;
-	}
-
-	/* Device found! Initialize it */
-	if (init() == 0) {
-		/* Initialization succeeded, device is now attached */
-		device_attached = 1;
-	}
+	if (device_attached || !nic_hotplug_due(&next_scan)) return;
+	init();          /* finds the device if one has appeared; attaches it and sets device_attached */
 }
 
 static int probe(void) {
@@ -299,7 +272,7 @@ static int init(void) {
 		{ VIRTIO_PCI_ID_VENDOR, VIRTIO_PCI_ID_NET_LEGACY }
 	};
 	if (pci_find_any(ids, 2, &pdev)) return 0; /* deferred hotplug probe */
-	pci_enable(&pdev, 6);  /* memory decode and bus mastering */
+	nic_pci_prepare(&pdev);  /* memory decode, bus mastering, INTx off */
 
 	if (find_virtio_regions()) {
 		kprintf("vnet: missing/invalid virtio PCI capabilities\n");

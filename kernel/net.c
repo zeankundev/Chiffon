@@ -1,7 +1,9 @@
 /* Minimal IPv4 stack: Ethernet, ARP, IPv4, ICMP echo, UDP, DHCP, DNS (A records) and a
  * stop-and-wait TCP client.  Polled, not interrupt driven.  One protocol operation runs at a time
  * (net_lock); blocked callers yield so the rest of the system keeps running.  The interface is
- * configured on first use (DHCP, falling back to the QEMU user-network addresses).
+ * configured on first use: up to NETDEV_MAX NICs may be attached; each in turn is given time to
+ * bring its link up and to answer DHCP, and the first that does becomes the interface.  There is
+ * no fallback address: a made-up one would be wrong on any real network.
  *
  * Deliberately missing: server sockets, IP fragmentation and reassembly, TCP retransmission of
  * FIN, congestion control, TIME_WAIT, IPv6, and any capability check on the syscalls. */
@@ -27,7 +29,9 @@
 #define TCP_RXBUF 2048
 #define TCP_CONNS 2
 
-static const struct netdev *dev;
+static const struct netdev *devs[NETDEV_MAX];     /* every attached NIC */
+static int ndevs, dev_idx;
+static const struct netdev *dev;                  /* the active interface (devs[dev_idx]) */
 static uint8_t mac[6];
 static uint32_t my_ip, my_mask, my_gw, my_dns;
 static int configured, busy;
@@ -49,17 +53,35 @@ static uint16_t csum_fold(uint32_t acc) { while (acc >> 16) acc = (acc & 0xFFFF)
 static uint16_t csum(const void *p, size_t n) { return csum_fold(csum_acc(p, n, 0)); }
 static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 
-/* ---- pacing: never yield before the first process exists (boot) ---- */
-static void net_pause(void) { if (cur) yield(); }
+/* ---- pacing: never yield before the first process exists (boot) ----
+ * Timeouts count timer ticks, and a tick only happens while the CPU idles (interrupts are off
+ * inside the kernel).  If this process were the only runnable one and merely yielded, the clock
+ * would stand still and a wait for a reply that never comes (no DHCP server, unplugged cable, a
+ * link that is still negotiating) would hang forever instead of timing out.  So every so often the
+ * wait sleeps until the next tick; in between it spins, which keeps a fast LAN reply fast. */
+static void net_pause(void) {
+    static unsigned spins;
+    if (!cur) return;
+    if ((++spins & 255) == 0) sleep_on((void *)&ticks);
+    else yield();
+}
 static void net_poll(void) { if (dev) dev->poll(); }
 static void net_lock(void) { while (busy) net_pause(); busy = 1; }
 static void net_unlock(void) { busy = 0; }
 
+static void net_select(int idx);
+static int link_state(const struct netdev *d) { return d->link ? d->link() : 1; }
+
 int net_attach(const struct netdev *d) {
-    if (dev) return -EBUSY;
-    dev = d;
-    memcpy(mac, d->mac, 6);
-    kprintf("net: %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", d->name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    if (!d || !d->send || !d->poll) return -EINVAL;
+    for (int i = 0; i < ndevs; i++) if (devs[i] == d) return -EBUSY;
+    if (ndevs >= NETDEV_MAX) return -EBUSY;
+    int idx = ndevs;
+    devs[idx] = d;
+    ndevs = idx + 1;
+    kprintf("net: eth%d: %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", idx, d->name,
+            d->mac[0], d->mac[1], d->mac[2], d->mac[3], d->mac[4], d->mac[5]);
+    if (!dev) net_select(idx);                        /* the first NIC is the default until DHCP says otherwise */
     return 0;
 }
 __attribute__((weak)) int board_net_probe(void) { return -ENODEV; }
@@ -76,6 +98,12 @@ struct arp_ent { uint32_t ip; uint8_t mac[6]; uint8_t valid; };
 static struct arp_ent arp[8];
 static int arp_next;
 
+static void net_select(int idx) {
+    dev_idx = idx;
+    dev = devs[idx];
+    memcpy(mac, dev->mac, 6);
+    memset(arp, 0, sizeof arp);                       /* neighbours seen on another NIC mean nothing here */
+}
 static int arp_find(uint32_t ip, uint8_t *m) {
     for (int i = 0; i < 8; i++) if (arp[i].valid && arp[i].ip == ip) { memcpy(m, arp[i].mac, 6); return 1; }
     return 0;
@@ -194,11 +222,13 @@ static size_t dhcp_msg(uint8_t *b, uint8_t type, uint32_t xid, uint32_t want_ip,
     wr32(b + 236, 0x63825363);
     size_t o = 240;
     b[o++] = 53; b[o++] = 1; b[o++] = type;
+    b[o++] = 61; b[o++] = 7; b[o++] = 1; memcpy(b + o, mac, 6); o += 6;          /* client id: type 1 + MAC */
+    b[o++] = 12; b[o++] = 7; memcpy(b + o, "chiffon", 7); o += 7;                /* host name */
     if (want_ip) { b[o++] = 50; b[o++] = 4; wr32(b + o, want_ip); o += 4; }
     if (server) { b[o++] = 54; b[o++] = 4; wr32(b + o, server); o += 4; }
     b[o++] = 55; b[o++] = 4; b[o++] = 1; b[o++] = 3; b[o++] = 6; b[o++] = 51;
     b[o++] = 255;
-    return o;
+    return 300;                                                                  /* BOOTP minimum size */
 }
 struct dhcp_opts { uint8_t type; uint32_t mask, router, dns, server; };
 static void dhcp_parse(const uint8_t *b, size_t n, struct dhcp_opts *d) {
@@ -219,33 +249,49 @@ static void dhcp_parse(const uint8_t *b, size_t n, struct dhcp_opts *d) {
         o += 2 + l;
     }
 }
+/* Wait up to timeout_ms for a DHCP reply to transaction xid.  Replies to other clients or
+ * transactions are skipped without cutting the wait short.  1 = got one (rep, o, yiaddr). */
+static int dhcp_wait(uint8_t *rep, size_t cap, uint32_t xid, int timeout_ms, struct dhcp_opts *o, uint32_t *yiaddr) {
+    uint64_t until = ticks + MS(timeout_ms);
+    while (ticks < until) {
+        int left = (int)((until - ticks) * 10);
+        if (left < 10) left = 10;
+        long r = udp_wait(68, rep, cap, left, 0);
+        if (r < 0) return 0;
+        if (r < 240 || rep[0] != 2 || rd32(rep + 4) != xid || memcmp(rep + 28, mac, 6)) continue;
+        *o = (struct dhcp_opts){ 0, 0, 0, 0, 0 };
+        dhcp_parse(rep, (size_t)r, o);
+        if (!o->type) continue;
+        *yiaddr = rd32(rep + 16);
+        return 1;
+    }
+    return 0;
+}
+/* DISCOVER/OFFER/REQUEST/ACK with the back-off a real network needs: switches and routers can take
+ * several seconds to start forwarding after the link comes up, and DHCP servers answer slowly. */
 static int dhcp_run(void) {
-    static uint8_t msg[300], rep[300];
+    static uint8_t msg[300], rep[576];
+    static const int discover_wait_ms[] = { 2000, 3000, 4000, 5000 };
     uint32_t xid = (uint32_t)ticks * 2654435761u ^ rd32(mac + 2);
     struct dhcp_opts o = { 0, 0, 0, 0, 0 };
-    uint32_t offered = 0;
-    for (int t = 0; t < 3 && !offered; t++) {                       /* DISCOVER -> OFFER */
+    uint32_t offered = 0, yi = 0;
+    for (int t = 0; t < 4 && !offered; t++) {                       /* DISCOVER -> OFFER */
         size_t n = dhcp_msg(msg, 1, xid, 0, 0);
         udp_send(BCAST, 68, 67, msg, n);
-        long r = udp_wait(68, rep, sizeof rep, 1000, 0);
-        if (r < 240 || rd32(rep + 4) != xid || rep[0] != 2) continue;
-        o = (struct dhcp_opts){ 0, 0, 0, 0, 0 };
-        dhcp_parse(rep, r, &o);
-        if (o.type == 2) offered = rd32(rep + 16);
+        if (dhcp_wait(rep, sizeof rep, xid, discover_wait_ms[t], &o, &yi) && o.type == 2 && yi) offered = yi;
     }
     if (!offered) return 0;
     for (int t = 0; t < 3; t++) {                                   /* REQUEST -> ACK */
         size_t n = dhcp_msg(msg, 3, xid, offered, o.server);
         udp_send(BCAST, 68, 67, msg, n);
-        long r = udp_wait(68, rep, sizeof rep, 1000, 0);
-        if (r < 240 || rd32(rep + 4) != xid || rep[0] != 2) continue;
         struct dhcp_opts a = { 0, 0, 0, 0, 0 };
-        dhcp_parse(rep, r, &a);
+        if (!dhcp_wait(rep, sizeof rep, xid, 3000, &a, &yi)) continue;
+        if (a.type == 6) return 0;                                  /* NAK: the caller starts over */
         if (a.type != 5) continue;
-        my_ip = offered;
+        my_ip = yi ? yi : offered;
         my_mask = a.mask ? a.mask : 0xFFFFFF00u;
         my_gw = a.router;
-        my_dns = a.dns;
+        my_dns = a.dns ? a.dns : a.router;                          /* home routers usually proxy DNS */
         return 1;
     }
     return 0;
@@ -254,22 +300,51 @@ static int dhcp_run(void) {
 static void kprint_ip(uint32_t ip) {
     kprintf("%u.%u.%u.%u", (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
 }
-/* Bring the interface up.  Runs in the first process that uses the network. */
+/* Time a NIC gets to show carrier.  Copper links take 2-5 s to negotiate after a reset, so the first
+ * attempt is generous; later attempts (the next command after a failure) are quick so that an
+ * unplugged cable does not make every command hang. */
+#define LINK_FIRST_MS   8000
+#define LINK_RETRY_MS   1500
+
+static int wait_link(const struct netdev *d, int timeout_ms) {
+    uint64_t until = ticks + MS(timeout_ms);
+    for (;;) {
+        if (link_state(d)) return 1;
+        if (ticks >= until) return 0;
+        net_pause();
+    }
+}
+
+/* Bring an interface up.  Runs in the first process that uses the network.  Every attached NIC is
+ * tried in turn, starting with the one that was active: wait for carrier, then DHCP. */
 static int net_configure(void) {
+    static int attempts;
     if (configured) return 0;
-    if (!dev) return -ENODEV;
+    if (!ndevs) return -ENODEV;
     net_lock();
     if (!configured) {
-        if (!dhcp_run()) {
-            /* The QEMU user-network addresses are not valid on VirtualBox NAT,
-             * bridged networks, or physical LANs.  Leave the interface
-             * unconfigured so the caller can retry DHCP on a later request. */
-            kprintf("net: DHCP failed on %s; no IPv4 configuration\n", dev->name);
+        int start = dev_idx, ok = 0;
+        for (int k = 0; k < ndevs && !ok; k++) {
+            int i = (start + k) % ndevs;
+            net_select(i);
+            if (!wait_link(dev, attempts ? LINK_RETRY_MS : LINK_FIRST_MS)) {
+                kprintf("net: eth%d (%s): no carrier\n", i, dev->name);
+                continue;
+            }
+            kprintf("net: eth%d (%s): link up, asking for an address\n", i, dev->name);
+            if (dhcp_run()) ok = 1;
+            else kprintf("net: eth%d (%s): no DHCP answer\n", i, dev->name);
+        }
+        attempts++;
+        if (!ok) {
+            /* No made-up address: the QEMU user-network one is wrong on VirtualBox and on every
+             * real LAN.  Stay unconfigured so the next request retries. */
+            net_select(start);
             net_unlock();
             return -EHOSTUNREACH;
         }
         configured = 1;
-        kprintf("net: ip "); kprint_ip(my_ip);
+        kprintf("net: eth%d ip ", dev_idx); kprint_ip(my_ip);
         kprintf(" mask "); kprint_ip(my_mask);
         kprintf(" gw "); kprint_ip(my_gw);
         kprintf(" dns "); kprint_ip(my_dns); kprintf("\n");
@@ -473,7 +548,8 @@ static void ip_input(const uint8_t *p, size_t n, const uint8_t *smac) {
     size_t tot = rd16(p + 2);
     if (ihl < 20 || tot < ihl || tot > n) return;
     uint32_t src = rd32(p + 12), dst = rd32(p + 16);
-    int mine = dst == BCAST || (my_ip && (dst == my_ip || (my_mask && dst == (my_ip | ~my_mask))));
+    int mine = dst == BCAST || (my_ip && (dst == my_ip || (my_mask && dst == (my_ip | ~my_mask))))
+               || (!my_ip && p[9] == IP_UDP);               /* a DHCP server may unicast the offer */
     if (!mine || (rd16(p + 6) & 0x3FFF)) return;                   /* not ours, or a fragment */
     const uint8_t *pl = p + ihl;
     size_t pn = tot - ihl;
@@ -595,4 +671,19 @@ long net_syscall(long nr, long a0, long a1, long a2, long a3) {
         return 0;
     }
     return -ENOSYS;
+}
+
+/* ---- /proc/net ---- */
+size_t net_dump(char *buf, size_t n) {
+    size_t o = 0;
+    o += ksnprintf(buf + o, n - o, "%-5s %-17s %-7s %s\n", "IFACE", "MAC", "LINK", "DEVICE");
+    for (int i = 0; i < ndevs && o < n; i++) {
+        const struct netdev *d = devs[i];
+        const char *ls = !d->link ? "up?" : d->link() ? "up" : "down";
+        o += ksnprintf(buf + o, n - o, "eth%d%s %02x:%02x:%02x:%02x:%02x:%02x %-7s %s\n", i, (dev == d) ? "*" : " ",
+                       d->mac[0], d->mac[1], d->mac[2], d->mac[3], d->mac[4], d->mac[5], ls, d->name);
+    }
+    if (o < n)
+        o += ksnprintf(buf + o, n - o, "%s\n", !ndevs ? "no network interface" : configured ? "configured (* = active)" : "not configured (DHCP not done or failed)");
+    return o < n ? o : n - 1;
 }

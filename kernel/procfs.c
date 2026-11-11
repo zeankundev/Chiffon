@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "net.h"
 
 static int listed[NPROC];
 
@@ -30,6 +31,7 @@ void procfs_refresh(void) {
         drivers_dump(big, sizeof big); put("/proc/drivers", big);
         ipc_dump(big, sizeof big); put("/proc/ipc", big);
         fb_dump(big, sizeof big); put("/proc/fb", big);
+        net_dump(big, sizeof big); put("/proc/net", big);
     }
 
     int alive[NPROC] = {0};
