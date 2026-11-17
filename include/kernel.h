@@ -119,11 +119,13 @@ void cmdline_set(const char *s);
 const char *cmdline_get(const char *key);
 
 void pmm_init(uintptr_t start, uintptr_t end);
+size_t pmm_add_range(uintptr_t start, uintptr_t end);   /* more usable RAM, e.g. PSRAM: frames added */
 uintptr_t pmm_alloc(void);
 void pmm_free(uintptr_t pa);
 size_t pmm_free_count(void);
 size_t pmm_total_count(void);
 void heap_init(void *base, size_t size);
+void heap_add_region(void *base, size_t size);          /* a second kernel-heap region */
 void *kmalloc(size_t n);
 void kfree(void *p);
 void *krealloc(void *p, size_t n);

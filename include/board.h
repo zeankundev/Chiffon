@@ -5,7 +5,10 @@
 
 void board_early_init(uintptr_t bootinfo);
 
-void board_mem_range(uintptr_t *start, uintptr_t *end);
+void board_mem_range(uintptr_t *start, uintptr_t *end);       /* primary RAM: holds the kernel */
+/* Further RAM the board knows about (external RAM, a second memory node).  Returns 0 and the range
+ * for index i, or -1 when there is no range i.  A board without extra RAM need not define it. */
+int board_mem_extra(int i, uintptr_t *start, uintptr_t *end);
 
 const char *board_cmdline(void);
 

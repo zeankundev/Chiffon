@@ -44,7 +44,11 @@ static void run(char **argv) {
     if (!path) path = "/bin:/sbin:/usr/bin";
     int pid = chiffon_fork();
     if (pid == 0) {
-        if (argv[0][0] == '/' || argv[0][0] == '.') chiffon_execve(argv[0], argv, g_envp);
+        if (argv[0][0] == '/' || argv[0][0] == '.') {
+            long e = chiffon_execve(argv[0], argv, g_envp);
+            chiffon_puts("exec "); chiffon_puts(argv[0]); chiffon_puts(" failed, errno "); chiffon_putu((unsigned long)(-e)); chiffon_puts("\n");
+            chiffon_exit(1);
+        }
         else for (const char *p = path; *p;) {
             char full[160]; size_t i = 0;
             while (*p && *p != ':' && i < 100) full[i++] = *p++;

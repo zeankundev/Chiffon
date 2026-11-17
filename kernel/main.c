@@ -76,7 +76,10 @@ static int start_init(void) {
             kprintf("init: pid %d is %s\n", r, cand);
             /* Start an independent interactive shell on every screen tty. VGA text mode has no
              * fb_primary(), so availability is determined by whether the tty device can be opened. */
-            for (int screen = 1; screen <= VT_SCREENS; screen++) {
+            /* [console] extra = off in chiffon.ini: no extra shells.  Each one is a whole process, so a
+             * small machine (the tiny profile) keeps its memory for the programs the user runs. */
+            int extra = strcmp(cfg_get("console", "extra", "on"), "off") != 0;
+            for (int screen = 1; extra && screen <= VT_SCREENS; screen++) {
                 if (screen_started[screen - 1] ||
                     (screen == 1 && !strcmp(console, "/dev/tty1"))) continue;
                 char ttyname[16];
@@ -137,6 +140,9 @@ static void load_config(void) {
     kprintf("[config] chiffon.ini not found\n");
 }
 
+/* Boards without extra RAM need not define board_mem_extra(). */
+__attribute__((weak)) int board_mem_extra(int i, uintptr_t *start, uintptr_t *end) { (void)i; (void)start; (void)end; return -1; }
+
 void kmain(uintptr_t bootinfo) {
     smp_bsp_init();                                 /* per-CPU pointer + the kernel lock (see smp.h) */
     board_early_init(bootinfo);
@@ -150,6 +156,13 @@ void kmain(uintptr_t bootinfo) {
     heap &= ~(PAGE_SIZE - 1);
     heap_init(P2V(s), heap);
     pmm_init(s + heap, e);
+    for (int i = 0;; i++) {                        /* extra RAM: usable exactly like the primary range */
+        uintptr_t es, ee;
+        if (board_mem_extra(i, &es, &ee)) break;
+        size_t frames = pmm_add_range(es, ee);
+        kprintf("mem: extra RAM %lu MiB @ %lx added to the frame allocator\n", (unsigned long)((ee - es) >> 20), (unsigned long)es);
+        (void)frames;
+    }
     kprintf("mem: %lu KiB free for processes, %lu KiB kernel heap\n", (unsigned long)(pmm_free_count() * PAGE_SIZE >> 10), (unsigned long)(heap >> 10));
 
     arch_init();

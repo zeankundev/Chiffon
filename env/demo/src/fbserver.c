@@ -5,6 +5,13 @@
  */
 #include "libchiffon.h"
 
+static void put_hex(unsigned long v) {
+    char b[20]; int i = 19; b[i] = 0;
+    if (!v) b[--i] = '0';
+    for (; v; v >>= 4) b[--i] = "0123456789abcdef"[v & 15];
+    chiffon_puts(b + i);
+}
+
 static void put_num(long v) {
     char b[24]; int i = 23; b[i] = 0;
     if (v < 0) { chiffon_puts("-"); v = -v; }
@@ -21,7 +28,7 @@ int main(int argc, char **argv, char **envp) {
     }
 
     chiffon_puts("[fbserver] device info: phys=0x");
-    put_num((long)info.phys);
+    put_hex((unsigned long)info.phys);
     chiffon_puts(" size=");
     put_num((long)info.size);
     chiffon_puts(" (");
@@ -44,7 +51,7 @@ int main(int argc, char **argv, char **envp) {
     }
     unsigned char *fbp = (unsigned char *)m;
     chiffon_puts("[fbserver] MMIO mapped at user VA 0x");
-    put_num(m);
+    put_hex((unsigned long)m);
     chiffon_puts("\n");
 
     /* Create IPC port "fb" */

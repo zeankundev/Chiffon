@@ -6,6 +6,13 @@
  */
 #include "libchiffon.h"
 
+static void put_hex(unsigned long v) {
+    char b[20]; int i = 19; b[i] = 0;
+    if (!v) b[--i] = '0';
+    for (; v; v >>= 4) b[--i] = "0123456789abcdef"[v & 15];
+    chiffon_puts(b + i);
+}
+
 static void put_num(long v) {
     char b[24]; int i = 23; b[i] = 0;
     if (v < 0) { chiffon_puts("-"); v = -v; }
@@ -71,13 +78,13 @@ static void cmd_status(void) {
         chiffon_puts("  Hardware FB Device:      ");
         put_num(fb_info.width); chiffon_puts("x"); put_num(fb_info.height);
         chiffon_puts(" "); put_num(fb_info.bpp); chiffon_puts("bpp @ phys 0x");
-        put_num((long)fb_info.phys); chiffon_puts("\n");
+        put_hex((unsigned long)fb_info.phys); chiffon_puts("\n");
     }
 
     struct chi_dev_uart_info uart_info;
     if (chiffon_dev_info(DEV_TYPE_UART, &uart_info) == 0 && uart_info.size > 0) {
         chiffon_puts("  Hardware UART Device:    phys 0x");
-        put_num((long)uart_info.phys); chiffon_puts(" IRQ ");
+        put_hex((unsigned long)uart_info.phys); chiffon_puts(" IRQ ");
         put_num(uart_info.irq); chiffon_puts("\n");
     }
 }

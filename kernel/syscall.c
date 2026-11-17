@@ -328,6 +328,14 @@ static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, l
 }
 
 /* ---- processes ---- */
+/* Length of a user string (without the NUL), up to max-1 bytes. */
+static int ustr_len(uintptr_t usrc, size_t max, size_t *out) {
+    for (size_t i = 0; i < max; i++) {
+        if ((i == 0 || ((usrc + i) & (PAGE_SIZE - 1)) == 0) && !uok(usrc + i, 1)) return -EFAULT;
+        if (!*(char *)(usrc + i)) { *out = i; return 0; }
+    }
+    return -ENAMETOOLONG;
+}
 static long copy_strv(uintptr_t uv, char ***out) {
     char **v = kmalloc(257 * sizeof(char *));
     int n = 0;
@@ -338,9 +346,14 @@ static long copy_strv(uintptr_t uv, char ***out) {
         uintptr_t s = ((uintptr_t *)uv)[0];
         if (!s) break;
         if (n >= 256) { n = -ENAMETOOLONG; break; }
-        char *tmp = kmalloc(4096);
+        /* Allocate each string at its own size: a fixed 4 KiB per argument or variable exhausts the
+         * heap on small machines (the tiny profile has 160 KiB of heap). */
+        size_t len;
+        int r = ustr_len(s, 4096, &len);
+        if (r) { n = r; break; }
+        char *tmp = kmalloc(len + 1);
         if (!tmp) { n = -ENOMEM; break; }
-        int r = ustrcpy(tmp, s, 4096);
+        r = ustrcpy(tmp, s, len + 1);
         if (r) { kfree(tmp); n = r; break; }
         v[n++] = tmp;
         uv += 8;

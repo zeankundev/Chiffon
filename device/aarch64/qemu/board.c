@@ -18,13 +18,17 @@
 #define TIMER_INTID 30                                  /* EL1 physical timer, PPI 14 */
 
 static uintptr_t ram_base = 0x40000000UL, ram_size = 256UL << 20;
+#define MAXMEM 8
+static struct { uintptr_t base, size; } mem_nodes[MAXMEM];   /* every /memory node in the DTB */
+static int nmem_nodes;
 static char cmdline_buf[256];
 static uint64_t cpu_mpidr[MAX_CPUS];                    /* from the DTB /cpus nodes (reg = MPIDR Aff0) */
 static int cpu_nodes;
 static int psci_smc;                                    /* DTB "method": hvc or smc */
 
 static void on_node(const struct fdt_node *n, void *ctx) {
-    if (n->devtype && !strcmp(n->devtype, "memory") && n->reg_len >= 16) { ram_base = fdt_be64(n->reg); ram_size = fdt_be64(n->reg + 8); }
+    if (n->devtype && !strcmp(n->devtype, "memory") && n->reg_len >= 16 && nmem_nodes < MAXMEM)
+        { mem_nodes[nmem_nodes].base = fdt_be64(n->reg); mem_nodes[nmem_nodes].size = fdt_be64(n->reg + 8); nmem_nodes++; }
     if (n->bootargs) strlcpy(cmdline_buf, n->bootargs, sizeof cmdline_buf);
     if (n->devtype && !strcmp(n->devtype, "cpu") && n->reg_len >= 4 && cpu_nodes < MAX_CPUS)
         cpu_mpidr[cpu_nodes++] = fdt_be32(n->reg) & 0xFFFFFF;
@@ -33,7 +37,14 @@ static void on_node(const struct fdt_node *n, void *ctx) {
 }
 void board_early_init(uintptr_t dtb) {
     struct fdt f;
-    if (fdt_open(&f, dtb) == 0) fdt_walk(&f, on_node, 0);       /* RAM size + command line from QEMU's DTB */
+    if (fdt_open(&f, dtb) == 0) fdt_walk(&f, on_node, 0);       /* RAM + command line from QEMU's DTB */
+    for (int i = 1; i < nmem_nodes; i++)                        /* sort by base: the lowest is primary */
+        for (int j = i; j > 0 && mem_nodes[j].base < mem_nodes[j - 1].base; j--) {
+            uintptr_t b = mem_nodes[j].base, z = mem_nodes[j].size;
+            mem_nodes[j].base = mem_nodes[j - 1].base; mem_nodes[j].size = mem_nodes[j - 1].size;
+            mem_nodes[j - 1].base = b; mem_nodes[j - 1].size = z;
+        }
+    if (nmem_nodes) { ram_base = mem_nodes[0].base; ram_size = mem_nodes[0].size; }
 #ifdef CHI_RAM_CAP_MB
     /* RAMCAP=<MiB> in the environment: use only this much RAM, even if the machine has more.  QEMU
      * needs a larger -m to place its device tree after the kernel; the kernel must not spend it. */
@@ -41,6 +52,16 @@ void board_early_init(uintptr_t dtb) {
 #endif
 }
 void board_mem_range(uintptr_t *s, uintptr_t *e) { *s = (arch_kernel_end() + 0xFFFF) & ~0xFFFFUL; *e = ram_base + ram_size; }
+int board_mem_extra(int i, uintptr_t *s, uintptr_t *e) {
+#ifdef CHI_RAM_CAP_MB
+    (void)i; (void)s; (void)e;                                  /* RAMCAP: the kernel uses only the capped primary */
+    return -1;
+#else
+    if (i + 1 >= nmem_nodes) return -1;
+    *s = mem_nodes[i + 1].base; *e = mem_nodes[i + 1].base + mem_nodes[i + 1].size;
+    return 0;
+#endif
+}
 const char *board_cmdline(void) { return cmdline_buf; }
 void board_console_putc(int c) { pl011_putc(UART_BASE, c); }
 int board_console_getc(void) { return pl011_getc(UART_BASE); }
