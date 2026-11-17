@@ -108,6 +108,7 @@ size_t strlcpy(char *, const char *, size_t);
 size_t strlcat(char *, const char *, size_t);
 char *strrchr(const char *, int);
 void kprintf(const char *fmt, ...);
+void kvprintf(const char *fmt, __builtin_va_list ap);
 int ksnprintf(char *buf, size_t n, const char *fmt, ...);
 void panic(const char *fmt, ...) __attribute__((noreturn));
 

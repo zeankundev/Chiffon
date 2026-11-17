@@ -91,6 +91,10 @@ void kprintf(const char *fmt, ...) {
     struct sink s = {0, 0, 0}; va_list ap;
     va_start(ap, fmt); vfmt(&s, fmt, ap); va_end(ap);
 }
+void kvprintf(const char *fmt, va_list ap) {       /* kprintf for callers that already have a va_list */
+    struct sink s = {0, 0, 0};
+    vfmt(&s, fmt, ap);
+}
 int ksnprintf(char *buf, size_t n, const char *fmt, ...) {
     struct sink s = {buf, 0, n}; va_list ap;
     va_start(ap, fmt); vfmt(&s, fmt, ap); va_end(ap);

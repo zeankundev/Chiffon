@@ -2,6 +2,25 @@
  * (kernel/mm.c, shared with the other architectures), and launches the init shell.
  * On panic, an illegal instruction exception is triggered to crash. */
 #include "kernel.h"
+int flash_map(uint32_t off, uint32_t pages);
+int ext_init(uint32_t part);
+int ext_resolve(const char *path, uint32_t *ino);
+int ext_list(const char *path, void (*emit)(const char *name, uint32_t mode, uint32_t size));
+int ext_open(const char *path, uint32_t *ino, uint32_t *size);
+long ext_read_ino(uint32_t ino, uint64_t off, uint8_t *buf, size_t n);
+int ext_stat(const char *path, uint32_t *mode, uint32_t *size, uint32_t *ino);
+int elf_run(const char *path, int argc, char **argv);
+
+#define FS_PART 0x200000u                  /* flash offset of the root filesystem (1 MiB) */
+static char cwd[256] = "/";
+
+/* Absolute path for a shell argument: relative names are taken from the working directory. */
+static void abs_path(const char *arg, char *out, size_t cap) {
+    if (arg[0] == '/') { strlcpy(out, arg, cap); return; }
+    strlcpy(out, cwd, cap);
+    if (out[strlen(out) - 1] != '/') strlcat(out, "/", cap);
+    strlcat(out, arg, cap);
+}
 
 /* ---- memory-mapped hardware (ESP32 technical reference manual) ---- */
 #define UART0_FIFO    ((volatile uint32_t *)0x3FF40000)     /* UART_FIFO_REG: write a byte to send */
@@ -118,6 +137,26 @@ static int readline(char *buf, size_t maxlen) {
     }
 }
 
+static void ls_entry(const char *name, uint32_t mode, uint32_t size) {
+    char t = (mode & 0xF000) == 0x4000 ? 'd' : (mode & 0xF000) == 0xA000 ? 'l' : '-';
+    kprintf("%c %9lu  %s\n", t, (unsigned long)size, name);
+}
+
+static void cat_file(const char *arg) {
+    char p[256];
+    abs_path(arg, p, sizeof p);
+    uint32_t ino, size;
+    int r = ext_open(p, &ino, &size);
+    if (r) { kprintf("cat: %s: %s\n", arg, r == -EISDIR ? "is a directory" : "no such file"); return; }
+    uint8_t chunk[512];
+    for (uint64_t off = 0; off < size;) {
+        long n = ext_read_ino(ino, off, chunk, sizeof chunk);
+        if (n <= 0) { kprintf("\n[cat: %s: read error at %lu]\n", arg, (unsigned long)off); return; }
+        for (long i = 0; i < n; i++) console_putc(chunk[i]);
+        off += (uint64_t)n;
+    }
+}
+
 static void init_shell(void) {
     char line[256];
     kprintf("init: pid 1 is /sbin/init\n\n");
@@ -152,15 +191,20 @@ static void init_shell(void) {
             }
             kprintf("\n");
         } else if (!strcmp(av[0], "pwd")) {
-            kprintf("/\n");
+            kprintf("%s\n", cwd);
         } else if (!strcmp(av[0], "cd")) {
-            if (ac > 1 && strcmp(av[1], "/") != 0)
-                kprintf("cd: failed\n");
+            char p[256]; uint32_t mode, size, ino;
+            abs_path(ac > 1 ? av[1] : "/", p, sizeof p);
+            if (ext_stat(p, &mode, &size, &ino) || (mode & 0xF000) != 0x4000) kprintf("cd: %s: not a directory\n", ac > 1 ? av[1] : "/");
+            else strlcpy(cwd, p, sizeof cwd);
         } else if (!strcmp(av[0], "ls")) {
-            kprintf("ls: cannot open %s\n", ac > 1 ? av[1] : ".");
+            char p[256];
+            abs_path(ac > 1 ? av[1] : ".", p, sizeof p);
+            int r = ext_list(p, ls_entry);
+            if (r) kprintf("ls: %s: %s\n", ac > 1 ? av[1] : ".", r == -ENOTDIR ? "not a directory" : "no such file or directory");
         } else if (!strcmp(av[0], "cat")) {
-            if (ac > 1)
-                kprintf("cat: cannot open %s\n", av[1]);
+            if (ac < 2) kprintf("cat: missing file name\n");
+            else cat_file(av[1]);
         } else if (!strcmp(av[0], "env")) {
             kprintf("PATH=/bin:/sbin:/usr/bin\nHOME=/\nTERM=vt100\n");
         } else if (!strcmp(av[0], "uname")) {
@@ -174,7 +218,13 @@ static void init_shell(void) {
         } else if (!strcmp(av[0], "crash")) {
             panic("manual crash from init");
         } else {
-            kprintf("%s: command not found\n", av[0]);
+            char p[256];
+            abs_path("/bin/", p, sizeof p);                  /* the program lives in /bin */
+            strlcat(p, av[0], sizeof p);
+            int r = elf_run(p, ac, av);
+            if (r == -ENOENT) kprintf("%s: command not found\n", av[0]);
+            else if (r < 0) kprintf("%s: cannot run (error %d)\n", av[0], -r);
+            else if (r) kprintf("[%s exited with status %d]\n", av[0], r);
         }
     }
 
@@ -191,6 +241,9 @@ void kmain(void) {
     kprintf("mem: %lu KiB kernel heap above the 8 KiB stack (dram0 0x3FFB0000..0x3FFDC200 holds data, bss, stack, heap)\n",
             (unsigned long)(heap >> 10));
     heap_init(_heap_start, heap);
+    if (flash_map(FS_PART, 16)) kprintf("fs: cannot map flash at 0x%x\n", (unsigned)FS_PART);
+    else if (ext_init(FS_PART)) kprintf("fs: no ext2/3/4 filesystem at flash 0x%x\n", (unsigned)FS_PART);
+    else kprintf("fs: ext2/3/4 root on flash 0x%x (read-only)\n", (unsigned)FS_PART);
 
     /* heap self-test: allocate, free into the middle, reallocate, check the bytes */
     unsigned char *a = kmalloc(1000), *b = kmalloc(2000), *c;

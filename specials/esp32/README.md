@@ -85,3 +85,38 @@ is a small change in `linker.ld` and `main.c`.
 - Enable the timer interrupt for a real tick, and replace the busy-wait heartbeat.
 - Add a second heap over the unused data bank.
 - Run the same kernel core on real hardware and record the boot log in `docs/`.
+
+## Filesystem
+
+The root filesystem is an ext2/3/4 image at flash offset `0x200000` (1 MiB). It is built from
+`rootfs/` with `mke2fs -d` (e2fsprogs 1.43 or newer), together with the compiled programs in
+`bin/`. The build rebuilds it whenever a file changes. Use `make FS_TYPE=ext2` for ext2.
+
+The reader (`ext2.c`) is read-only. It supports ext2, ext3, and ext4: extent trees and classic
+direct and indirect blocks, any block size up to 4 KiB, and 32- and 64-byte group descriptors.
+It does not replay the journal, check checksums, or handle triple-indirect blocks.
+
+The flash is read through the chip's flash MMU. `flash.c` maps 1 MiB of the flash into the
+`0x3F400000` window with the ROM's own cache routines, which ESP-IDF's `spi_flash` also uses. In
+QEMU the mapping was verified byte for byte. On real hardware, check the boot log for a fault when
+the window is first read.
+
+Shell commands: `ls`, `cat`, `cd`, `pwd`. Relative paths are taken from the working directory, and
+`..` is supported.
+
+## Programs
+
+Any command that is not a builtin is looked up as `/bin/<name>`. The file must be a static
+Xtensa ELF32 executable linked for the fixed addresses in `programs/prog.ld`:
+
+- code in IRAM at `0x40090000`–`0x40098000`
+- data in the top of DRAM at `0x3FFD4000`–`0x3FFDC000` (the kernel heap ends below it)
+
+The loader (`elf.c`) copies the segments, zeroes `.bss`, and calls the entry point with a pointer
+to the kernel interface in `programs/api.h`: `printf`, `putc`, `malloc`, `free`, and the cycle
+counter. Programs are built with the same toolchain and flags (`-mabi=call0`), and link no libc.
+`programs/hello.c` is the example.
+
+Not supported yet: processes and `fork`, syscalls, IPC, and file writes. This means the Chiffon
+userland programs in `env/` (`ipcdemo`, `fbdemo`, and so on) cannot run on the ESP32 as they are.
+Those programs need the process model, which this port does not have.

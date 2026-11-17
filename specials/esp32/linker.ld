@@ -46,7 +46,7 @@ SECTIONS
   } > dram0
 
   _heap_start = ALIGN(16);
-  _heap_end = ORIGIN(dram0) + LENGTH(dram0);
+  _heap_end = 0x3FFD4000;                 /* the top 32 KiB of DRAM is for user programs (programs/prog.ld) */
 
   /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.xtensa.info) }
 }
