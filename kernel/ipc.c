@@ -7,6 +7,7 @@
 #define QLEN 16
 #endif
 struct port {
+    int id;
     int used, owner;                         /* owner: pid, 0 = kernel */
     ipc_handler svc;                         /* kernel service: run synchronously in the caller */
     char name[IPC_NAME_MAX];
@@ -17,31 +18,44 @@ static struct port ports[NPORT];
 
 void ipc_init(void) { memset(ports, 0, sizeof ports); }
 
-static struct port *by_id(long id) { return id >= 1 && id <= NPORT && ports[id - 1].used ? &ports[id - 1] : 0; }
+static struct port *by_id(long id) {
+    if (id <= 0 || id > __INT_MAX__) return 0;
+    struct port *p = &ports[(id - 1) % NPORT];
+    return p->used && p->id == id ? p : 0;
+}
 static int self(void) { return cur ? cur->pid : 0; }
 static int name_ok(const char *n) { size_t l = strlen(n); return l > 0 && l < IPC_NAME_MAX; }
 
 static long port_new(const char *name, int owner, ipc_handler svc) {
     if (!name_ok(name)) return -EINVAL;
+    int framebuffer = !strcmp(name, IPC_SVC_FB);
+    if (!svc) {
+        if (!strcmp(name, IPC_SVC_CONSOLE)) return -EPERM;
+        if (!strcmp(name, IPC_SVC_LOADER) && !cap_check(cur, CHI_CAP_LOADER, 0, 0)) return -EPERM;
+        if (framebuffer && !cap_check(cur, CHI_CAP_DRIVER, DEV_TYPE_FB, 0)) return -EPERM;
+    }
     for (int i = 0; i < NPORT; i++) {
         if (ports[i].used && !strcmp(ports[i].name, name)) {
-            /* If it's a kernel service and caller has CHI_CAP_DRIVER, allow driver takeover */
-            if (ports[i].svc && cap_check(cur, CHI_CAP_DRIVER, 0, 0)) {
+            if (ports[i].svc && !svc && framebuffer) {
+                if (ports[i].id > __INT_MAX__ - NPORT) return -ENOMEM;
+                ports[i].id += NPORT;
                 ports[i].svc = 0;
                 ports[i].owner = owner;
                 ports[i].head = 0;
                 ports[i].count = 0;
-                return i + 1;
+                return ports[i].id;
             }
             return -EEXIST;
         }
     }
     for (int i = 0; i < NPORT; i++) {
-        if (ports[i].used) continue;
+        if (ports[i].used || ports[i].id > __INT_MAX__ - NPORT) continue;
+        int id = ports[i].id ? ports[i].id + NPORT : i + 1;
         memset(&ports[i], 0, sizeof ports[i]);
+        ports[i].id = id;
         ports[i].used = 1; ports[i].owner = owner; ports[i].svc = svc;
         strlcpy(ports[i].name, name, IPC_NAME_MAX);
-        return i + 1;
+        return id;
     }
     return -ENOMEM;
 }
@@ -51,7 +65,7 @@ int ipc_register_service(const char *name, ipc_handler h) { return (int)port_new
 static void fail_waiters(int pi) {
     for (int i = 0; i < NPROC; i++) {
         struct proc *p = &ptable[i];
-        if (p->state == P_UNUSED || !p->ipc_waiting || p->ipc_wait_port != pi + 1) continue;
+        if (p->state == P_UNUSED || !p->ipc_waiting || p->ipc_wait_port != ports[pi].id) continue;
         memset(&p->ipc_rep, 0, sizeof p->ipc_rep);
         p->ipc_rep.tag = -EPIPE;
         p->ipc_have_reply = 1; p->ipc_waiting = 0;
@@ -102,7 +116,6 @@ static long ipc_recv_k(long id, struct chi_ipc_msg *out, int flags) {
         if (cur->killed) return -EINTR;
         sleep_on(pt);
         if (!by_id(id)) return -EPIPE;       /* closed while we slept */
-        pt = &ports[id - 1];
     }
 }
 
@@ -154,13 +167,13 @@ long ipc_syscall(long nr, long a0, long a1, long a2) {
         return port_new(name, cur->pid, 0);
     case CSYS_ipc_lookup:
         if ((r = ustrcpy(name, a0, sizeof name))) return r;
-        for (int i = 0; i < NPORT; i++) if (ports[i].used && !strcmp(ports[i].name, name)) return i + 1;
+        for (int i = 0; i < NPORT; i++) if (ports[i].used && !strcmp(ports[i].name, name)) return ports[i].id;
         return -ENOENT;
     case CSYS_ipc_close: {
         struct port *pt = by_id(a0);
         if (!pt) return -ENOENT;
         if (pt->svc || pt->owner != cur->pid) return -EPERM;
-        port_drop(a0 - 1);
+        port_drop(pt - ports);
         return 0; }
     case CSYS_ipc_send:
         if (!uok(a1, sizeof m)) return -EFAULT;
@@ -193,8 +206,8 @@ size_t ipc_dump(char *buf, size_t n) {
     o += ksnprintf(buf + o, n - o, "%-3s %-24s %-8s %s\n", "ID", "NAME", "OWNER", "QUEUED");
     for (int i = 0; i < NPORT && o < n; i++) {
         if (!ports[i].used) continue;
-        if (ports[i].svc) o += ksnprintf(buf + o, n - o, "%-3d %-24s %-8s %s\n", i + 1, ports[i].name, "kernel", "-");
-        else o += ksnprintf(buf + o, n - o, "%-3d %-24s %-8d %d\n", i + 1, ports[i].name, ports[i].owner, ports[i].count);
+        if (ports[i].svc) o += ksnprintf(buf + o, n - o, "%-3d %-24s %-8s %s\n", ports[i].id, ports[i].name, "kernel", "-");
+        else o += ksnprintf(buf + o, n - o, "%-3d %-24s %-8d %d\n", ports[i].id, ports[i].name, ports[i].owner, ports[i].count);
     }
     return o < n ? o : n - 1;
 }

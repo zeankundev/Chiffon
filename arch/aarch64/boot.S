@@ -111,6 +111,7 @@ high_entry:
     ldr  x0, =boot_stack_top
     mov  sp, x0
     mov  x29, xzr
+    bl   stack_guard_init
     mov  x0, x19
     bl   kmain
 1:  wfi

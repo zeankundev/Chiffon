@@ -21,10 +21,12 @@ void fb_damage(struct fb_device *d, uint32_t x, uint32_t y, uint32_t w, uint32_t
 
 void fb_fill(struct fb_device *d, int x, int y, int w, int h, uint32_t rgb) {
     struct fb_info *i = &d->info;
+    if (w <= 0 || h <= 0) return;
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
-    if (x + w > (int)i->width) w = i->width - x;
-    if (y + h > (int)i->height) h = i->height - y;
+    if ((unsigned)x >= i->width || (unsigned)y >= i->height) return;
+    if (w > (int)i->width - x) w = i->width - x;
+    if (h > (int)i->height - y) h = i->height - y;
     if (w <= 0 || h <= 0) return;
     uint32_t px = fb_pack(i, rgb);
     for (int row = 0; row < h; row++) {
@@ -69,7 +71,7 @@ static int fb_service(const struct chi_ipc_msg *q, struct chi_ipc_msg *r) {
         return 0;
     case FB_OP_PAN:
         if (q->len < 8) return -EINVAL;
-        if (!d->pan || in[1] + i->height > i->vheight || in[0] + i->width > i->width) return -EINVAL;
+        if (!d->pan || in[1] > i->vheight - i->height || in[0]) return -EINVAL;
         if (d->pan(d, in[0], in[1])) return -EIO;
         i->xoff = in[0]; i->yoff = in[1];
         return 0;
@@ -101,7 +103,12 @@ int fb_register(struct fb_device *d) {
     struct fb_info *i = &d->info;
     if ((i->bpp != 32 && i->bpp != 24 && i->bpp != 16) || !i->width || !i->height || !i->pitch) return -EINVAL;
     if (!i->vheight) i->vheight = i->height;
-    if (!i->size) i->size = i->pitch * i->vheight;
+    uint64_t bytes = (uint64_t)i->pitch * i->vheight;
+    if (i->width > __INT_MAX__ || i->height > __INT_MAX__ || i->vheight < i->height ||
+        i->yoff > i->vheight - i->height || (uint64_t)i->width * (i->bpp / 8) > i->pitch ||
+        bytes > UINT32_MAX || (i->size && bytes > i->size)) return -EINVAL;
+    if (!i->size) i->size = (uint32_t)bytes;
+    if (i->phys > UINTPTR_MAX - i->size) return -EINVAL;
     if (arch_map_device(i->phys, i->size)) return -ENODEV;
     if (!i->virt) i->virt = P2V(i->phys);
     d->next = fbs; fbs = d;

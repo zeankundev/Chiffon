@@ -56,10 +56,11 @@ static int init(void) {
         if (a >= 320 && a <= 2048 && b >= 200 && b <= 2048) { w = a; h = b; }
     }
     size_t bytes = (size_t)w * h * 4;
-    uint8_t *mem = kmalloc(bytes + PAGE_SIZE);
+    size_t mapping = (bytes + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint8_t *mem = kmalloc(mapping + PAGE_SIZE - 1);
     if (!mem) return -1;
     mem = (uint8_t *)(((uintptr_t)mem + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
-    memset(mem, 0, bytes);
+    memset(mem, 0, mapping);
 
     cfg.addr = bs64(V2P((uintptr_t)mem));
     cfg.fourcc = bs32(0x34325258);                                /* 'XR24' = XRGB8888 */
@@ -76,7 +77,7 @@ static int init(void) {
 
     fbd.name = "ramfb";
     fbd.info = (struct fb_info){ .phys = V2P((uintptr_t)mem), .virt = mem, .width = w, .height = h, .pitch = w * 4, .bpp = 32,
-                                 .roff = 16, .rlen = 8, .goff = 8, .glen = 8, .boff = 0, .blen = 8 };
+                                 .size = mapping, .roff = 16, .rlen = 8, .goff = 8, .glen = 8, .boff = 0, .blen = 8 };
     return fb_register(&fbd);
 }
 static struct kdriver drv = { "ramfb", "QEMU ramfb framebuffer (fw_cfg)", DRV_DISPLAY, 20, probe, init, 0, 0 };

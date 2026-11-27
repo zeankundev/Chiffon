@@ -113,7 +113,8 @@ long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2) {
         uintptr_t first;
         size_t span;
         if (val1 != phys || val2 != bytes) return -EPERM;
-        if (device_pages(phys, bytes, &first, &span) || first != phys)
+        /* A page grant can only expose storage owned by this device. */
+        if (device_pages(phys, bytes, &first, &span) || first != phys || span != bytes)
             return -EINVAL;
         val1 = first;
         val2 = span;

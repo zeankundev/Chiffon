@@ -22,6 +22,8 @@ static uint16_t vavail_idx, vlast_used;
 static int vio_ready;
 static int vio_failed;
 static int vio_writable;
+/* One shared queue and bounce buffer: reject concurrent callers rather than reuse them. */
+static int vblk_busy;
 #define DSB() __asm__ volatile("dsb sy" ::: "memory")
 static inline uint32_t vr(uint32_t off) { return vio[off / 4]; }
 static inline void vw(uint32_t off, uint32_t v) { vio[off / 4] = v; }
@@ -89,8 +91,14 @@ static int vblk_request(uint32_t type, uint64_t lba, uint32_t nsect) {
         DSB();
         if (spin > 200000000L) { vio_ready = 0; vio_failed = 1; return -1; }
     }
-    vlast_used++;
     DSB();
+    /* Only descriptor zero is submitted and exactly one request is outstanding. */
+    volatile uint32_t *entry = (volatile uint32_t *)(vq_mem + 4096 + 4 + 8 * (vlast_used % VQN));
+    if (used[1] != (uint16_t)(vlast_used + 1) || entry[0] != 0) {
+        vio_ready = 0; vio_failed = 1;
+        return -1;
+    }
+    vlast_used++;
     return vreq_status == 0 ? 0 : -1;
 }
 static int vblk_xfer(uint64_t lba, void *buf, uint32_t n, int write) {
@@ -105,8 +113,17 @@ static int vblk_xfer(uint64_t lba, void *buf, uint32_t n, int write) {
     }
     return 0;
 }
-static int vblk_read(uint64_t lba, void *buf, uint32_t n) { return vblk_xfer(lba, buf, n, 0); }
+static int vblk_read(uint64_t lba, void *buf, uint32_t n) {
+    if (__atomic_exchange_n(&vblk_busy, 1, __ATOMIC_ACQUIRE)) return -1;
+    int r = vblk_xfer(lba, buf, n, 0);
+    __atomic_store_n(&vblk_busy, 0, __ATOMIC_RELEASE);
+    return r;
+}
 static int vblk_write(uint64_t lba, const void *buf, uint32_t n) {
-    if (!vio_writable || vblk_xfer(lba, (void *)buf, n, 1)) return -1;
-    return vblk_request(VBLK_T_FLUSH, 0, 0);
+    if (__atomic_exchange_n(&vblk_busy, 1, __ATOMIC_ACQUIRE)) return -1;
+    int r = -1;
+    if (vio_writable && !vblk_xfer(lba, (void *)buf, n, 1))
+        r = vblk_request(VBLK_T_FLUSH, 0, 0);
+    __atomic_store_n(&vblk_busy, 0, __ATOMIC_RELEASE);
+    return r;
 }

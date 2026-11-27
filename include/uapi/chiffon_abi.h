@@ -103,10 +103,18 @@ struct chi_ipc_msg {
 #define CON_OP_GRAPHICS 4   /* req: u32 0 = text mode, 1 = graphics (console stops drawing)    */
 
 /* "driver.loader": */
-#define DRV_OP_STATUS   1   /* reply: status code & driver flags                               */
-#define DRV_OP_LOAD     2   /* req: driver name to start                                       */
-#define DRV_OP_CRASH    3   /* trigger driver crash test                                       */
-#define DRV_OP_BENCH    4   /* run latency benchmark                                           */
+/* Requests have an empty payload. STATUS and LOAD return chi_drv_fb_status on
+ * success. CRASH checks the managed framebuffer and returns its dimensions as
+ * two chi_u32 values if termination was observed as EPIPE. */
+#define DRV_OP_STATUS   1
+#define DRV_OP_LOAD     2
+#define DRV_OP_CRASH    3
+#define DRV_OP_BENCH    4   /* reserved; the CLI runs its benchmark locally */
+
+struct chi_drv_fb_status {
+    chi_s32 pid;            /* zero when no managed server is running */
+    chi_s32 port;
+};
 
 /* ------------------------------------------------------------------------------------------
  * /dev/fb0 -- Linux-compatible ioctls and structures (so existing tools/programs work)

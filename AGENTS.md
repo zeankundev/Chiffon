@@ -35,7 +35,7 @@ Chiffon is a Unix-like **hybrid kernel** (microkernel core + kernel-space core s
 | `CSYS_ipc_recv`   | 1004 | Receive IPC message |
 | `CSYS_ipc_call`   | 1005 | Synchronous request-response call |
 | `CSYS_ipc_reply`  | 1006 | Reply to pending request |
-| `CSYS_cap_grant`  | 1010 | Grant capability (`CHI_CAP_MMIO`, `CHI_CAP_IRQ`, `CHI_CAP_DRIVER`, `CHI_CAP_LOADER`) |
+| `CSYS_cap_grant`  | 1010 | The boot loader grants framebuffer MMIO and framebuffer service registration to its embedded server child. Loader and IRQ grants are denied by the current device policy. |
 | `CSYS_dev_map`    | 1011 | Map device MMIO into user address space using capability |
 | `CSYS_irq_claim`  | 1012 | Claim hardware IRQ |
 | `CSYS_irq_wait`   | 1013 | Block waiting for hardware IRQ |

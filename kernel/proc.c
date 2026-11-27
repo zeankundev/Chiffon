@@ -677,15 +677,16 @@ static int spawn_process(const char *path, char **argv, char **envp, const char 
     struct proc *p = proc_alloc();
     if (!p) return -EAGAIN;
     p->mm = kmalloc(sizeof *p->mm);
-    if (!p->mm) { fdtab_put(p->ft); p->ft = 0; p->state = P_UNUSED; return -ENOMEM; }
+    if (!p->mm) { p->state = P_UNUSED; return -ENOMEM; }
     memset(p->mm, 0, sizeof *p->mm); p->mm->refs = 1;
     p->mm->root = arch_aspace_new();
+    if (!p->mm->root) { mm_put(p->mm); p->mm = 0; p->state = P_UNUSED; return -ENOMEM; }
     p->pgid = p->pid;
     p->ft = fdtab_new();
-    if (!p->ft) { p->state = P_UNUSED; return -ENOMEM; }
+    if (!p->ft) { mm_put(p->mm); p->mm = 0; p->state = P_UNUSED; return -ENOMEM; }
     for (int i = 0; i < 3; i++) {
         int r = vfs_open(console, 2, 0, &p->ft->f[i]);
-        if (r) { for (int j = 0; j < i; j++) file_close(p->ft->f[j]); mm_put(p->mm); p->mm = 0; p->state = P_UNUSED; return r; }
+        if (r) { fdtab_put(p->ft); p->ft = 0; mm_put(p->mm); p->mm = 0; p->state = P_UNUSED; return r; }
     }
     if (!as_loader && p->ft->f[0]->type == F_NODE && p->ft->f[0]->node->dev == DEV_TTY &&
         p->ft->f[0]->node->minor < TTY_ACTIVE_MINOR) {
@@ -696,7 +697,7 @@ static int spawn_process(const char *path, char **argv, char **envp, const char 
     p->is_driver_loader = as_loader;
     int r = proc_exec(p, path, argv, envp, &tf);
     if (r) {
-        for (int i = 0; i < 3; i++) file_close(p->ft->f[i]);
+        fdtab_put(p->ft); p->ft = 0;
         mm_put(p->mm); p->mm = 0; p->state = P_UNUSED;
         return r;
     }
@@ -709,7 +710,12 @@ static int spawn_process(const char *path, char **argv, char **envp, const char 
 }
 
 int proc_spawn_init(const char *path, char **argv, char **envp, const char *console) {
-    return spawn_process(path, argv, envp, console, 1, 0);
+    int pid = spawn_process(path, argv, envp, console, 1, 0);
+    if (pid > 0 && !cur) {
+        int loader = proc_spawn_driver_loader(console);
+        if (loader < 0) kprintf("driver loader startup failed (%d)\n", loader);
+    }
+    return pid;
 }
 
 int proc_spawn_driver_loader(const char *console) {

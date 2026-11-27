@@ -4,11 +4,11 @@ Use this runbook with the [production readiness roadmap](../ROADMAP.md) and [thr
 
 ## Generate and report evidence
 
-1. A maintainer can manually dispatch **Release readiness smoke checks** for the candidate ref. The [workflow](../.github/workflows/readiness.yml) checks the v1 ABI fixture with both target compilers, builds clean Demo images, and boots each image. It has no publishing permissions. The local contributor build remains the command in [.codex/AGENTS.md](../.codex/AGENTS.md).
-2. Download the readiness artifact for each architecture, even on failure. A passing run has `PASS abi` and `PASS build` in `result.txt` and `PASS boot-smoke` in `boot/result.txt`. Read `abi.log`, `build.log`, `dependencies.log`, or `boot/qemu.log` for the first failing stage. A skipped step or missing result is incomplete evidence. ABI and build checks each have a five-minute deadline. The smoke check gives QEMU 60 seconds for the expected boot banner, init prompt, `uname`, reading `/etc/chiffon.ini`, and power-off with a clean QEMU exit.
+1. A maintainer can manually dispatch **Release readiness smoke checks** for the candidate ref. The [workflow](../.github/workflows/readiness.yml) checks the v1 ABI fixture with both target compilers, runs the boot memory fixture on the Linux host, builds clean Demo images, and boots each image. It has no publishing permissions. The local contributor build remains the command in [.codex/AGENTS.md](../.codex/AGENTS.md).
+2. Download the readiness artifact for each architecture, even on failure. A passing run has `PASS abi`, `PASS bootmem-compile`, `PASS bootmem`, and `PASS build` in `result.txt`, `PASS boot-smoke` in `boot/result.txt`, and `PASS vm-probe` in `boot/qemu.log`. Read `abi.log`, `bootmem-compile.log`, `bootmem.log`, `build.log`, `dependencies.log`, or `boot/qemu.log` for the first failing stage. A skipped step or missing result is incomplete evidence. ABI and build checks each have a five-minute deadline. The smoke check gives QEMU 60 seconds for the expected boot banner, init prompt, `uname`, reading `/etc/chiffon.ini`, running the VM probe, and power-off with a clean QEMU exit.
 3. Record the candidate commit, release tag, ABI baseline, architecture, board, environment, QEMU version, full job URL, and result for each target. Preserve the artifact and record the image hashes from `boot/images.sha256`. Include the first failing stage and any recovery steps when filing a report. Mark runtime behavior verified only after examining both sets of results.
 
-To repeat the smoke check with existing Demo assets, a human operator can run the following on a Linux host with Python 3.11+ and the matching QEMU system emulators. Use a new evidence directory for each attempt.
+To repeat the smoke check with Demo assets that include `/bin/vm-probe`, a human operator can run the following on a Linux host with Python 3.11+ and the matching QEMU system emulators. Use a new evidence directory for each attempt.
 
 ```sh
 python3 tools/release/boot_smoke.py x86_64 chiffon_x86_64.bin \
@@ -18,6 +18,22 @@ python3 tools/release/boot_smoke.py aarch64 chiffon_aarch64.bin \
 ```
 
 The runner uses a temporary QEMU snapshot and writes the serial transcript and image SHA-256 digests to the evidence directory. If a timeout occurs, QEMU is stopped and the partial transcript is retained.
+
+The boot memory fixture has 15 seconds to check range selection, clipping diagnostics, overlapping reservations, page alignment, and range capacity with AddressSanitizer and UndefinedBehaviorSanitizer enabled. It exercises the shared range code with synthetic maps. Firmware parsing and guest allocation require separate evidence. [Boot memory fixture](../tools/release/bootmem_test.c)
+
+To run the VM probe directly, boot a newly built Demo or local milkos candidate in QEMU and enter `/bin/vm-probe` at the guest shell. Expect one `PASS vm-probe` line and a return to the prompt. A `FAIL vm-probe` line identifies the failing stage. The probe checks anonymous mapping, protection changes, write-and-execute denial from both syscalls, copying and modifying private data after fork, the child exit status, and unmapping. Its coverage is limited to data reads and writes and syscall results. Capture the serial output with the candidate commit and architecture.
+
+## Human milkOS guest check, 2026-11-27
+
+The maintainer confirmed that `make ENV=milkos BUSYBOX=$HOME/busybox/busybox` passed in their WSL instance using the working tree based on `2fadc20`, including its uncommitted integration changes. They booted the resulting x86_64 milkOS image with `run-gfx` and supplied a guest-console screenshot showing the following results with a 1024×768, 32-bit framebuffer.
+
+| Guest action | Observed result |
+| --- | --- |
+| `vm-probe` | Printed `PASS vm-probe` and returned to the shell. |
+| `drvloader status` | Loader ready, framebuffer on port 2, console on port 1. |
+| `drvloader start fb` | Framebuffer server ready with PID 11 on port 34. |
+| `drvloader test-crash` | The framebuffer replied before termination. The loader reported `-EPIPE`, the test printed its pass message, and the shell accepted another command. |
+| `drvloader start fb` | Replacement server ready with PID 14 on port 66. |
 
 ## Version release inputs
 

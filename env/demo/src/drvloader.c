@@ -30,39 +30,120 @@ static void print_float(long whole, long thousandths) {
     put_num(thousandths);
 }
 
-/* Spawn fbserver with capabilities */
-static int spawn_fb_server(void) {
+static int fb_pid;
+static int fb_port;
+
+static void decimal_arg(char buf[12], int value) {
+    int i = 11;
+    buf[i] = 0;
+    do {
+        buf[--i] = '0' + value % 10;
+        value /= 10;
+    } while (value);
+    for (int j = 0; i < 12; j++, i++) buf[j] = buf[i];
+}
+
+static int wait_child(int pid, int flags) {
+    return ksys(CF_wait4, pid, 0, flags, 0, 0, 0);
+}
+
+static void refresh_fb(void) {
+    if (fb_pid && wait_child(fb_pid, 1 /* WNOHANG */) != 0)
+        fb_pid = fb_port = 0;
+}
+
+static long start_fb(void) {
+    refresh_fb();
+    if (fb_pid) return 0;
+
     struct chi_dev_fb_info info;
-    if (chiffon_dev_info(DEV_TYPE_FB, &info) < 0 || info.size == 0) {
-        chiffon_puts("[drvloader] cannot get framebuffer device info\n");
-        return -1;
+    long r = chiffon_dev_info(DEV_TYPE_FB, &info);
+    if (r < 0) return r;
+    if (!info.size) return -19; /* ENODEV */
+
+    int report[2], grant[2];
+    r = chiffon_pipe(report);
+    if (r < 0) return r;
+    r = chiffon_pipe(grant);
+    if (r < 0) {
+        chiffon_close(report[0]);
+        chiffon_close(report[1]);
+        return r;
     }
 
+    int loader_pid = ksys(CF_getpid, 0, 0, 0, 0, 0, 0);
     int pid = chiffon_fork();
-    if (pid < 0) {
-        chiffon_puts("[drvloader] fork failed\n");
-        return -1;
-    }
-
-    if (pid == 0) {
-        /* Child: exec /bin/fbserver */
-        char *av[] = { "/bin/fbserver", 0 };
-        chiffon_execve("/bin/fbserver", av, 0);
-        chiffon_puts("[drvloader] execve /bin/fbserver failed\n");
+    if (!pid) {
+        chiffon_close(report[0]);
+        chiffon_close(grant[1]);
+        char report_arg[12], grant_arg[12], pid_arg[12];
+        decimal_arg(report_arg, report[1]);
+        decimal_arg(grant_arg, grant[0]);
+        decimal_arg(pid_arg, loader_pid);
+        char *av[] = { "/bin/fbserver", "--bootstrap", report_arg, grant_arg, pid_arg, 0 };
+        int error = chiffon_execve(av[0], av, 0);
+        chiffon_write(report[1], &error, sizeof error);
         chiffon_exit(1);
     }
+    chiffon_close(report[1]);
+    chiffon_close(grant[0]);
 
-    /* Parent (loader): grant capabilities to the newly spawned driver server */
-    chiffon_cap_grant(pid, CHI_CAP_MMIO, (unsigned long)info.phys, (unsigned long)info.size);
-    chiffon_cap_grant(pid, CHI_CAP_DRIVER, 0, 0);
+    int stage;
+    r = pid;
+    if (pid > 0) {
+        r = -32; /* EPIPE */
+        if (chiffon_read(report[0], &stage, sizeof stage) == sizeof stage && stage <= 0)
+            r = stage;
+        if (!r) r = chiffon_cap_grant(pid, CHI_CAP_MMIO, info.phys, info.size);
+        if (!r) r = chiffon_cap_grant(pid, CHI_CAP_DRIVER, DEV_TYPE_FB, 0);
+    }
+    /* Closing the grant pipe releases the child. Mapping and port creation
+     * still require the capabilities checked above. */
+    chiffon_close(grant[1]);
+    if (pid > 0 && !r) {
+        if (chiffon_read(report[0], &stage, sizeof stage) != sizeof stage) {
+            r = -32;
+        } else if (stage > 0) {
+            fb_pid = pid;
+            fb_port = stage;
+        } else {
+            r = stage < 0 ? stage : -32;
+        }
+    }
+    chiffon_close(report[0]);
+    if (pid > 0 && r < 0) {
+        chiffon_kill(pid, 9);
+        wait_child(pid, 0);
+    }
+    return r;
+}
 
-    /* Give server time to initialize and register the port */
-    chiffon_sleep_ms(50);
-    return pid;
+static long loader_call(int op, struct chi_ipc_msg *reply) {
+    long port = chiffon_ipc_lookup(IPC_SVC_LOADER);
+    if (port < 0) return port;
+    struct chi_ipc_msg req = { .tag = op };
+    long r = chiffon_ipc_call(port, &req, reply);
+    return r < 0 ? r : reply->tag;
 }
 
 static void cmd_status(void) {
     chiffon_puts("=== Driver Subsystem Status ===\n");
+    struct chi_ipc_msg rep;
+    long r = loader_call(DRV_OP_STATUS, &rep);
+    chiffon_puts("  Driver loader:            ");
+    if (!r && rep.len == sizeof(struct chi_drv_fb_status)) {
+        struct chi_drv_fb_status status;
+        memcpy(&status, rep.data, sizeof status);
+        if (status.pid) {
+            chiffon_puts("fbserver PID ");
+            put_num(status.pid);
+            chiffon_puts("\n");
+        } else {
+            chiffon_puts("ready\n");
+        }
+    } else {
+        chiffon_puts("unavailable\n");
+    }
     long fb = chiffon_ipc_lookup(IPC_SVC_FB);
     chiffon_puts("  Service 'fb':            ");
     if (fb > 0) { chiffon_puts("ACTIVE (port "); put_num(fb); chiffon_puts(")\n"); }
@@ -97,37 +178,45 @@ static int cmd_bench(int iters) {
     put_num(iters);
     chiffon_puts(" iterations...\n");
 
+    int ready[2];
+    if (chiffon_pipe(ready) < 0) return 1;
+    int client_pid = ksys(CF_getpid, 0, 0, 0, 0, 0, 0);
     int srv_pid = chiffon_fork();
     if (srv_pid == 0) {
-        /* Server creates its own port so pt->owner == srv_pid */
-        long port = chiffon_ipc_create("bench.echo");
-        if (port < 0) chiffon_exit(1);
+        chiffon_close(ready[0]);
+        char name[IPC_NAME_MAX] = "bench.";
+        decimal_arg(name + 6, ksys(CF_getpid, 0, 0, 0, 0, 0, 0));
+        long port = chiffon_ipc_create(name);
+        if (chiffon_write(ready[1], &port, sizeof port) != sizeof port || port < 0)
+            chiffon_exit(1);
+        chiffon_close(ready[1]);
         struct chi_ipc_msg m;
         for (;;) {
             if (chiffon_ipc_recv(port, &m, 0) < 0) break;
-            if (m.tag == -1) break; /* exit command */
-            struct chi_ipc_msg rep;
-            memset(&rep, 0, sizeof rep);
-            rep.dst = m.src;
-            rep.tag = m.tag;
-            rep.len = m.len;
-            memcpy(rep.data, m.data, m.len);
+            if (m.src == client_pid && m.tag == -1) break;
+            struct chi_ipc_msg rep = { .dst = m.src, .tag = -1 /* EPERM */ };
+            if (m.src == client_pid) {
+                rep.tag = m.tag;
+                rep.len = m.len;
+                memcpy(rep.data, m.data, m.len);
+            }
             chiffon_ipc_reply(&rep);
         }
         chiffon_ipc_close(port);
         chiffon_exit(0);
     }
 
-    /* Client benchmark loop: wait for server to register port */
+    chiffon_close(ready[1]);
     long target_port = -1;
-    for (int retry = 0; retry < 100; retry++) {
-        target_port = chiffon_ipc_lookup("bench.echo");
-        if (target_port > 0) break;
-        chiffon_sleep_ms(5);
-    }
-    if (target_port < 0) {
-        chiffon_puts("Cannot lookup bench.echo\n");
-        chiffon_kill(srv_pid, 9);
+    if (srv_pid > 0 && chiffon_read(ready[0], &target_port, sizeof target_port) != sizeof target_port)
+        target_port = -1;
+    chiffon_close(ready[0]);
+    if (target_port <= 0) {
+        chiffon_puts("Cannot start benchmark echo server\n");
+        if (srv_pid > 0) {
+            chiffon_kill(srv_pid, 9);
+            wait_child(srv_pid, 0);
+        }
         return 1;
     }
 
@@ -142,20 +231,24 @@ static int cmd_bench(int iters) {
     unsigned long min_cycles = ~0UL;
     unsigned long max_cycles = 0;
 
-    /* Warm-up */
+    int failed = 0;
     for (int i = 0; i < 50; i++) {
-        chiffon_ipc_call(target_port, &req, &rep);
+        if (chiffon_ipc_call(target_port, &req, &rep) < 0 || rep.tag != 42 || rep.src != srv_pid) {
+            failed = 1;
+            break;
+        }
     }
 
     unsigned long start_time = chiffon_cycles();
-    for (int i = 0; i < iters; i++) {
+    for (int i = 0; !failed && i < iters; i++) {
         unsigned long t0 = chiffon_cycles();
         long r = chiffon_ipc_call(target_port, &req, &rep);
         unsigned long t1 = chiffon_cycles();
-        if (r < 0 || rep.tag != 42) {
+        if (r < 0 || rep.tag != 42 || rep.src != srv_pid) {
             chiffon_puts("IPC call error during benchmark: ");
             put_num(r);
             chiffon_puts("\n");
+            failed = 1;
             break;
         }
         unsigned long diff = t1 - t0;
@@ -164,11 +257,14 @@ static int cmd_bench(int iters) {
     }
     unsigned long end_time = chiffon_cycles();
 
-    /* Tell echo server to exit */
-    req.tag = -1;
-    chiffon_ipc_call(target_port, &req, &rep);
-    int st = 0;
-    chiffon_wait(&st);
+    if (!failed) {
+        req.tag = -1;
+        long stop = chiffon_ipc_call(target_port, &req, &rep);
+        failed = stop != -32 && (stop < 0 || rep.tag != -32);
+    }
+    if (failed) chiffon_kill(srv_pid, 9);
+    wait_child(srv_pid, 0);
+    if (failed) return 1;
 
     unsigned long total_cycles = end_time - start_time;
     /* Convert cycles to microseconds */
@@ -198,106 +294,123 @@ static int cmd_bench(int iters) {
     return 0;
 }
 
-/* Phase 0 Crash Test:
- * 1. Ensure user-space fbserver is running.
- * 2. Send valid FB_OP_INFO to verify service is healthy.
- * 3. Client issues a request that induces an abrupt crash (FB_OP_CRASH).
- * 4. Verify client returns -EPIPE (-32).
- * 5. Verify the kernel survives without panic and subsequent syscalls work.
- */
-static int cmd_crash_test(void) {
-    chiffon_puts("=== Starting Phase 0 Driver Server Crash Test ===\n");
+static long crash_fb(struct chi_ipc_msg *reply) {
+    long r = start_fb();
+    if (r < 0) return r;
 
-    /* Spawn a fresh user-space fbserver */
-    chiffon_puts("[test 1/4] Spawning user-space fbserver with MMIO capabilities...\n");
-    int srv_pid = spawn_fb_server();
-    if (srv_pid < 0) {
-        chiffon_puts("FAILED: unable to start fbserver\n");
-        return 1;
-    }
-    chiffon_puts("[test 1/4] fbserver spawned with PID ");
-    put_num(srv_pid);
-    chiffon_puts("\n");
+    struct chi_ipc_msg req = { .tag = FB_OP_INFO }, rep;
+    r = chiffon_ipc_call(fb_port, &req, &rep);
+    if (r < 0) return r;
+    if (rep.tag < 0) return rep.tag;
+    if (rep.src != fb_pid || rep.len != 36) return -5; /* EIO */
+    memcpy(reply->data, rep.data, 2 * sizeof(chi_u32));
 
-    /* Step 2: Lookup "fb" and verify normal operation */
-    chiffon_puts("[test 2/4] Verifying normal IPC service communication...\n");
-    long fb_port = chiffon_ipc_lookup(IPC_SVC_FB);
-    if (fb_port <= 0) {
-        chiffon_puts("FAILED: 'fb' port lookup failed\n");
-        chiffon_kill(srv_pid, 9);
-        return 1;
-    }
-
-    struct chi_ipc_msg req, rep;
-    memset(&req, 0, sizeof req);
-    req.tag = FB_OP_INFO;
-    long r = chiffon_ipc_call(fb_port, &req, &rep);
-    if (r != 0 || rep.tag != 0) {
-        chiffon_puts("FAILED: initial FB_OP_INFO call failed (r=");
-        put_num(r); chiffon_puts(" tag="); put_num(rep.tag); chiffon_puts(")\n");
-        chiffon_kill(srv_pid, 9);
-        return 1;
-    }
-    unsigned *dim = (unsigned *)rep.data;
-    chiffon_puts("[test 2/4] Normal IPC call succeeded: screen is ");
-    put_num(dim[0]); chiffon_puts("x"); put_num(dim[1]); chiffon_puts("\n");
-
-    /* Step 3: Send FB_OP_CRASH to the user-space driver server.
-     * The server will exit immediately without calling ipc_reply().
-     * The kernel's ipc_proc_exit() must detect server termination,
-     * drop the port, wake the blocked caller, and return -EPIPE.
-     */
-    chiffon_puts("[test 3/4] Triggering abrupt server crash while client is in ipc_call...\n");
-    memset(&req, 0, sizeof req);
     req.tag = FB_OP_CRASH;
+    r = chiffon_ipc_call(fb_port, &req, &rep);
+    if (r != -32 && (r < 0 || rep.tag != -32))
+        return r < 0 ? r : -5;
 
-    long crash_res = chiffon_ipc_call(fb_port, &req, &rep);
-    long caller_status = (crash_res != 0) ? crash_res : rep.tag;
+    int dead_pid = fb_pid, dead_port = fb_port;
+    if (wait_child(dead_pid, 0) != dead_pid) return -5;
+    fb_pid = fb_port = 0;
+    req.tag = FB_OP_INFO;
+    if (chiffon_ipc_call(dead_port, &req, &rep) != -32) return -5;
+    reply->len = 2 * sizeof(chi_u32);
+    return 0;
+}
 
-    chiffon_puts("[test 3/4] Caller returned from ipc_call with status: ");
-    put_num(caller_status);
-    chiffon_puts("\n");
+static int loader_service(void) {
+    long port = chiffon_ipc_create(IPC_SVC_LOADER);
+    if (port < 0) return 1;
+    struct chi_ipc_msg req;
+    while (chiffon_ipc_recv(port, &req, 0) == 0) {
+        struct chi_ipc_msg rep = { .dst = req.src };
+        refresh_fb();
+        if (req.len) {
+            rep.tag = -22;
+        } else if (req.tag == DRV_OP_CRASH) {
+            rep.tag = crash_fb(&rep);
+        } else if (req.tag == DRV_OP_LOAD || req.tag == DRV_OP_STATUS) {
+            if (req.tag == DRV_OP_LOAD) rep.tag = start_fb();
+            if (!rep.tag) {
+                struct chi_drv_fb_status status = { .pid = fb_pid, .port = fb_port };
+                memcpy(rep.data, &status, sizeof status);
+                rep.len = sizeof status;
+            }
+        } else {
+            rep.tag = -38;
+        }
+        chiffon_ipc_reply(&rep);
+    }
+    chiffon_ipc_close(port);
+    return 1;
+}
 
-    if (caller_status != -32) { /* -EPIPE is 32 */
-        chiffon_puts("FAILED: expected -EPIPE (-32), got ");
-        put_num(caller_status);
-        chiffon_puts("\n");
+static int cmd_start(void) {
+    struct chi_ipc_msg rep;
+    long r = loader_call(DRV_OP_LOAD, &rep);
+    if (r < 0 || rep.len != sizeof(struct chi_drv_fb_status)) {
+        chiffon_puts("Unable to start fbserver (status ");
+        put_num(r < 0 ? r : -5);
+        chiffon_puts(")\n");
         return 1;
     }
-    chiffon_puts("[test 3/4] PASS: Caller received expected -EPIPE (-32)\n");
+    struct chi_drv_fb_status status;
+    memcpy(&status, rep.data, sizeof status);
+    chiffon_puts("fbserver ready (PID ");
+    put_num(status.pid);
+    chiffon_puts(", port ");
+    put_num(status.port);
+    chiffon_puts(")\n");
+    return 0;
+}
 
-    /* Step 4: Verify kernel survived completely intact and healthy */
-    chiffon_puts("[test 4/4] Verifying kernel integrity and system survival...\n");
+static int cmd_crash_test(void) {
+    struct chi_ipc_msg rep;
+    long r = loader_call(DRV_OP_CRASH, &rep);
+    if (r < 0 || rep.len != 2 * sizeof(chi_u32)) {
+        chiffon_puts("Framebuffer crash test failed (status ");
+        put_num(r < 0 ? r : -5);
+        chiffon_puts(")\n");
+        return 1;
+    }
+    chi_u32 dim[2];
+    memcpy(dim, rep.data, sizeof dim);
+    chiffon_puts("Framebuffer replied before termination (");
+    put_num(dim[0]);
+    chiffon_puts("x");
+    put_num(dim[1]);
+    chiffon_puts("). The loader received -EPIPE and replied.\n");
     char cwd[128];
     if (chiffon_getcwd(cwd, sizeof cwd) <= 0) {
-        chiffon_puts("FAILED: subsequent syscall failed\n");
+        chiffon_puts("Framebuffer crash test failed: subsequent syscall failed\n");
         return 1;
     }
-    int reap_st = 0;
-    chiffon_wait(&reap_st);
-
-    chiffon_puts("\n============================================================\n");
-    chiffon_puts("=== PHASE 0 CRASH TEST PASSED: KERNEL SURVIVED & CALLER GOT -EPIPE ===\n");
-    chiffon_puts("============================================================\n\n");
+    chiffon_puts("Framebuffer crash test passed.\n");
     return 0;
 }
 
 int main(int argc, char **argv, char **envp) {
     if (argc > 1) {
+        if (!chiffon_strcmp(argv[1], "--service")) return loader_service();
         if (!chiffon_strcmp(argv[1], "status")) {
             cmd_status();
             return 0;
         }
         if (!chiffon_strcmp(argv[1], "start") && argc > 2 && !chiffon_strcmp(argv[2], "fb")) {
-            chiffon_puts("Starting user-space fbserver...\n");
-            spawn_fb_server();
-            return 0;
+            return cmd_start();
         }
         if (!chiffon_strcmp(argv[1], "bench")) {
             int n = 1000;
             if (argc > 2) {
                 int val = 0;
-                for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++) val = val * 10 + (*p - '0');
+                const char *p = argv[2];
+                for (; *p >= '0' && *p <= '9'; p++) {
+                    int digit = *p - '0';
+                    if (val > (2147483647 - digit) / 10) return 1;
+                    val = val * 10 + digit;
+                }
+                if (*p) return 1;
                 if (val > 0) n = val;
             }
             return cmd_bench(n);
@@ -307,7 +420,7 @@ int main(int argc, char **argv, char **envp) {
         }
         if (!chiffon_strcmp(argv[1], "test")) {
             cmd_status();
-            cmd_bench(1000);
+            if (cmd_bench(1000)) return 1;
             return cmd_crash_test();
         }
     }

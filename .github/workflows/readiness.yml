@@ -40,8 +40,9 @@ jobs:
             | tee -a build/evidence/dependencies.log
           dpkg-query -W > build/evidence/packages.txt
           "$ABI_CC" --version >> build/evidence/inputs.txt
+          if [ "$ABI_CC" != gcc ]; then gcc --version >> build/evidence/inputs.txt; fi
           "qemu-system-$ARCH" --version >> build/evidence/inputs.txt
-      - name: Check the published ABI and build a clean Demo image
+      - name: Check ABI and boot memory before building Demo
         shell: bash
         run: |
           run_check() {
@@ -56,8 +57,12 @@ jobs:
           }
           run_check abi "$ABI_CC" -std=c11 -ffreestanding -Wall -Wextra -Werror \
             -Iinclude -fsyntax-only tools/release/abi_v1.c
+          run_check bootmem-compile gcc -std=c11 -g -O1 -Wall -Wextra -Werror \
+            -fsanitize=address,undefined -fno-sanitize-recover=all -fno-pie -no-pie \
+            -Iinclude -Iarch/x86_64 tools/release/bootmem_test.c -o build/bootmem-test
+          run_check bootmem timeout --kill-after=2s 15s build/bootmem-test
           run_check build make ENV=demo ARCH="$ARCH" DEVICE=qemu
-      - name: Boot the Demo image
+      - name: Boot the Demo image and run the VM probe
         run: |
           image="build/demo/$ARCH-qemu"
           python3 tools/release/boot_smoke.py "$ARCH" "$image/chiffon.bin" \

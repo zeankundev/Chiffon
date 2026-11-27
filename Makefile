@@ -84,7 +84,7 @@ ifeq ($(ARCH),x86_64)
   CFLAGS += -mno-red-zone -mcmodel=kernel -mstack-protector-guard=global
   KEXT := bin
 else
-  CFLAGS += -mcmodel=small -mstrict-align -DBOOT_DEVICE_GB_MASK=$(BOOT_DEVICE_GB_MASK) \
+  CFLAGS += -mcmodel=small -mstrict-align -mno-outline-atomics -DBOOT_DEVICE_GB_MASK=$(BOOT_DEVICE_GB_MASK) \
             -DIMAGE_TEXT_OFFSET=$(shell printf '0x%x' $$(( $(LOAD_ADDR) & 0x1fffff )))
   KEXT := bin
 endif
@@ -114,6 +114,9 @@ UCFLAGS := -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -f
            -Wno-unused-command-line-argument -Iuserland -Iinclude
 USER_SRC := $(wildcard $(ENVDIR)/src/*.c)
 USER_BIN := $(patsubst $(ENVDIR)/src/%.c,$(B)/userland/%,$(USER_SRC))
+ifneq ($(filter $(ENV),demo milkos),)
+USER_BIN += $(B)/userland/vm-probe
+endif
 ENV_FILES := $(shell find $(ENVDIR)/rootfs -type f 2>/dev/null) $(wildcard $(ENVDIR)/build.sh)
 
 .DEFAULT_GOAL := all
@@ -150,6 +153,18 @@ endif
 endif
 
 $(B)/userland/%: $(ENVDIR)/src/%.c userland/libchiffon.h include/uapi/chiffon_abi.h
+	@mkdir -p $(dir $@)
+	$(UCC) $(UCFLAGS) -o $@ $<
+
+# milkOS also ships the standard loader CLI. Build the CLI and its embedded
+# service from the same implementation so both speak the bootstrap protocol.
+ifeq ($(ENV),milkos)
+$(B)/userland/drvloader $(B)/userland/fbserver: $(B)/userland/%: env/demo/src/%.c userland/libchiffon.h include/uapi/chiffon_abi.h
+	@mkdir -p $(dir $@)
+	$(UCC) $(UCFLAGS) -o $@ $<
+endif
+
+$(B)/userland/vm-probe: tools/release/vm_probe.c userland/libchiffon.h include/uapi/chiffon_abi.h
 	@mkdir -p $(dir $@)
 	$(UCC) $(UCFLAGS) -o $@ $<
 

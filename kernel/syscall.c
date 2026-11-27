@@ -348,6 +348,8 @@ static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, l
         uint64_t size = ((uint64_t)d->info.size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
         if ((uint64_t)off > size || len > size - (uint64_t)off) return -EINVAL;
         fb_phys = d->info.phys + off;
+        if (fb_phys < d->info.phys || (fb_phys & (PAGE_SIZE - 1)) ||
+            !cap_check(cur, CHI_CAP_MMIO, fb_phys, len)) return -EPERM;
     } else if (f && f->node->lazy && node_load(f->node)) return -EIO;
     if (flags & 0x10) {
         if ((addr & (PAGE_SIZE - 1)) || addr < PAGE_SIZE) return -EINVAL;

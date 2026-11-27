@@ -20,10 +20,58 @@ static void put_num(long v) {
     chiffon_puts(b + i);
 }
 
+static int parse_arg(const char *s) {
+    unsigned value = 0;
+    if (!*s) return -1;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9' || value > (2147483647U - (*s - '0')) / 10)
+            return -1;
+        value = value * 10 + (*s - '0');
+    }
+    return value;
+}
+
+static int report_stage(int fd, int stage) {
+    return chiffon_write(fd, &stage, sizeof stage) == sizeof stage;
+}
+
+static void fill_rect(unsigned char *fb, const struct chi_dev_fb_info *info,
+                      const chi_u32 in[5]) {
+    long x = (chi_s32)in[0], y = (chi_s32)in[1];
+    long right = x + (chi_s32)in[2], bottom = y + (chi_s32)in[3];
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (right > info->width) right = info->width;
+    if (bottom > info->height) bottom = info->height;
+    if (right <= x || bottom <= y) return;
+    for (long row = y; row < bottom; row++) {
+        volatile chi_u32 *line = (volatile chi_u32 *)(fb + (size_t)row * info->pitch);
+        for (long col = x; col < right; col++) line[col] = in[4];
+    }
+}
+
 int main(int argc, char **argv, char **envp) {
+    if (argc != 5 || chiffon_strcmp(argv[1], "--bootstrap")) return 1;
+    int report = parse_arg(argv[2]), grant = parse_arg(argv[3]), loader = parse_arg(argv[4]);
+    if (report < 0 || grant < 0 || report == grant || loader <= 0) return 1;
+    int stage;
+    if (!report_stage(report, 0) ||
+        chiffon_read(grant, &stage, sizeof stage) != 0)
+        return 1;
+    chiffon_close(grant);
+
     struct chi_dev_fb_info info;
-    if (chiffon_dev_info(DEV_TYPE_FB, &info) < 0 || info.size == 0) {
+    long error = chiffon_dev_info(DEV_TYPE_FB, &info);
+    if (error < 0 || info.size == 0) {
         chiffon_puts("[fbserver] failed to get framebuffer device info\n");
+        report_stage(report, error < 0 ? error : -19);
+        return 1;
+    }
+    if (info.bpp != 32 || !info.width || !info.height || info.pitch % 4 ||
+        info.width > info.pitch / 4 || (chi_u64)info.height * info.pitch > info.size ||
+        info.size > 0xffffffffUL) {
+        chiffon_puts("[fbserver] unsupported framebuffer layout\n");
+        report_stage(report, -22); /* EINVAL */
         return 1;
     }
 
@@ -47,6 +95,7 @@ int main(int argc, char **argv, char **envp) {
         chiffon_puts("[fbserver] chiffon_dev_map failed with error ");
         put_num(m);
         chiffon_puts("\n");
+        report_stage(report, m);
         return 1;
     }
     unsigned char *fbp = (unsigned char *)m;
@@ -60,8 +109,14 @@ int main(int argc, char **argv, char **envp) {
         chiffon_puts("[fbserver] cannot create 'fb' IPC port: ");
         put_num(port);
         chiffon_puts("\n");
+        report_stage(report, port);
         return 1;
     }
+    if (!report_stage(report, port)) {
+        chiffon_ipc_close(port);
+        return 1;
+    }
+    chiffon_close(report);
     chiffon_puts("[fbserver] IPC port 'fb' registered (port ID ");
     put_num(port);
     chiffon_puts("). Driver is ready.\n");
@@ -93,21 +148,9 @@ int main(int argc, char **argv, char **envp) {
         }
         case FB_OP_FILL: {
             if (req.len >= 20) {
-                const unsigned *in = (const unsigned *)req.data;
-                int x = (int)in[0], y = (int)in[1], w = (int)in[2], h = (int)in[3];
-                unsigned rgb = in[4];
-
-                if (x < 0) { w += x; x = 0; }
-                if (y < 0) { h += y; y = 0; }
-                if (x + w > (int)info.width) w = (int)info.width - x;
-                if (y + h > (int)info.height) h = (int)info.height - y;
-
-                if (w > 0 && h > 0) {
-                    for (int r = 0; r < h; r++) {
-                        unsigned *line = (unsigned *)(fbp + (size_t)(y + r) * info.pitch + (size_t)x * 4);
-                        for (int c = 0; c < w; c++) line[c] = rgb;
-                    }
-                }
+                chi_u32 in[5];
+                memcpy(in, req.data, sizeof in);
+                fill_rect(fbp, &info, in);
                 rep.tag = 0;
             } else {
                 rep.tag = -22; /* -EINVAL */
@@ -119,6 +162,10 @@ int main(int argc, char **argv, char **envp) {
             break;
         }
         case FB_OP_CRASH: {
+            if (req.src != loader) {
+                rep.tag = -1; /* EPERM */
+                break;
+            }
             chiffon_puts("[fbserver] CRASH TEST: simulating abrupt server crash without replying!\n");
             chiffon_exit(137); /* Die immediately: kernel closes port and fails caller with -EPIPE */
         }

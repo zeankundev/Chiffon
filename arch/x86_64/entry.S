@@ -5,6 +5,9 @@
 start64:
     mov $kboot_stack_top, %rsp
     xor %ebp, %ebp
+    mov %rdi, %rbx
+    call stack_guard_init
+    mov %rbx, %rdi
     call kmain                           /* rdi = multiboot info */
 1:  hlt
     jmp 1b
