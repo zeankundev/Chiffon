@@ -15,7 +15,7 @@ These instructions define the default multi-agent workflow for feature work in t
 2. Convert the requested outcome into a short plan with affected components, dependencies, both-architecture considerations, acceptance criteria, and a verification plan.
 3. Split only independent work among 6–8 Terra/Sol workers where practical. Give each worker a narrow scope, expected output, and explicit file ownership to reduce conflicts.
 4. Have workers report back before integrating. Review changes against the plan and Chiffon's hybrid-kernel architecture. Keep scheduling, PMM, VMM, IPC, capabilities, and established core services in their existing ownership boundaries; preserve user-space peripheral servers and capability/IPC boundaries.
-5. Build verification is restricted to the single compile command below, run on the user's WSL instance. Do not run other compile, test, lint, formatting, emulator, boot, or runtime commands as verification. Do not claim any check that was not actually run.
+5. Compile verification is restricted to the single command below, run on the user's WSL instance. Workers and Astra must not run this command from Windows, a container, a remote shell, or another WSL instance. Do not run other compile, test, lint, formatting, emulator, boot, or runtime commands as verification. Do not claim any check that was not actually run.
 6. Runtime and behavioral verification belong to the human. When such verification is relevant, stop and give the human clear, concise steps to run and the expected observable result. Astra must not perform those direct checks.
 7. Review the final diff for unintended changes, error paths, architecture consistency, and documentation. Summarize files changed, build result, and any human verification still needed.
 
@@ -27,9 +27,11 @@ Workers may inspect source and reason about changes. Their only allowed verifica
 make ENV=milkos BUSYBOX=$HOME/busybox/busybox
 ```
 
-Do not modify the command, add flags/targets, substitute another environment or BusyBox path, or run it in a different environment. If a worker cannot access the user's WSL instance, it must report that the build was not run and hand the command to Astra; it must not try a local, Windows-host, container, emulator, or alternate build as a substitute.
+Do not modify the command, add flags/targets, substitute another environment or BusyBox path, or run it in a different environment. Astra may run it only through the user's WSL instance as well. If a worker or Astra cannot access that WSL instance, report that the build was not run and ask the human to run the exact command; do not try a local, Windows-host, container, emulator, or alternate build as a substitute.
 
-No worker may directly verify behavior by booting, running, testing, or interacting with Chiffon. Only the human may perform those checks. Astra may request human verification by providing steps and expected results, then wait for the human's report before claiming the behavior is verified.
+No worker or Astra may directly verify behavior by booting, running, testing, or interacting with Chiffon. Only the human may perform those checks. When a behavior check is needed, Astra must provide precise steps and expected results, then stop and wait for the human's report before claiming the behavior is verified or moving the feature to verified/completed status. If no runtime check is appropriate, Astra must say that human runtime verification was not applicable rather than implying it happened.
+
+The compile command is a build check only; it does not count as runtime or behavioral verification. Astra owns final integration and source review, while the human owns all direct behavior checks.
 
 ## Subagent task template
 
