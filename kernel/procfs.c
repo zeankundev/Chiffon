@@ -40,7 +40,9 @@ void procfs_refresh(void) {
         drivers_dump(big, sizeof big); put("/proc/drivers", big);
         ipc_dump(big, sizeof big); put("/proc/ipc", big);
         fb_dump(big, sizeof big); put("/proc/fb", big);
-        net_dump(big, sizeof big); put("/proc/net", big);
+        if (!node_find("/proc/net")) node_create("/proc/net", S_IFDIR | 0555);
+        net_proc_dev(big, sizeof big); put("/proc/net/dev", big);
+        net_dump(big, sizeof big); put("/proc/net/chiffon", big);
     }
 
     int alive[NPROC] = {0};

@@ -9,6 +9,7 @@
  * FIN, congestion control, TIME_WAIT, IPv6, and any capability check on the syscalls. */
 #include "kernel.h"
 #include "net.h"
+#include "socket.h"
 #include "uapi/chiffon_abi.h"
 
 #define ETH_IP   0x0800
@@ -30,6 +31,10 @@
 #define TCP_CONNS 2
 
 static const struct netdev *devs[NETDEV_MAX];     /* every attached NIC */
+static uint32_t dev_flags[NETDEV_MAX];
+static uint64_t dev_rx_pkts[NETDEV_MAX], dev_rx_bytes[NETDEV_MAX];
+static uint64_t dev_tx_pkts[NETDEV_MAX], dev_tx_bytes[NETDEV_MAX];
+static uint64_t lo_pkts, lo_bytes;
 static int ndevs, dev_idx;
 static const struct netdev *dev;                  /* the active interface (devs[dev_idx]) */
 static uint8_t mac[6];
@@ -78,6 +83,7 @@ int net_attach(const struct netdev *d) {
     if (ndevs >= NETDEV_MAX) return -EBUSY;
     int idx = ndevs;
     devs[idx] = d;
+    dev_flags[idx] = IFF_UP | IFF_BROADCAST | IFF_MULTICAST;
     ndevs = idx + 1;
     kprintf("net: eth%d: %s, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", idx, d->name,
             d->mac[0], d->mac[1], d->mac[2], d->mac[3], d->mac[4], d->mac[5]);
@@ -91,7 +97,12 @@ static int eth_out(const uint8_t *dst, uint16_t type, const uint8_t *pl, size_t 
     if (n > sizeof eth_buf - 14) return -EINVAL;
     memcpy(eth_buf, dst, 6); memcpy(eth_buf + 6, mac, 6); wr16(eth_buf + 12, type);
     memcpy(eth_buf + 14, pl, n);
-    return dev->send(eth_buf, 14 + n);
+    int r = dev->send(eth_buf, 14 + n);
+    if (r == 0) {
+        dev_tx_pkts[dev_idx]++;
+        dev_tx_bytes[dev_idx] += 14 + n;
+    }
+    return r;
 }
 
 struct arp_ent { uint32_t ip; uint8_t mac[6]; uint8_t valid; };
@@ -173,26 +184,38 @@ static uint64_t now_us(void) {
     return ticks * 10000u;
 #endif
 }
+__attribute__((weak)) void sock_icmp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t n) {}
+__attribute__((weak)) void sock_udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t n) {}
+__attribute__((weak)) void sock_tcp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t n) {}
+
 static uint8_t icmp_buf[1472];
-static void icmp_input(uint32_t src, const uint8_t *p, size_t n, const uint8_t *smac) {
+static void icmp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t n, const uint8_t *smac) {
     if (n < 8) return;
     if (p[0] == 8 && n <= sizeof icmp_buf) {                       /* echo request: answer at once */
         memcpy(icmp_buf, p, n); icmp_buf[0] = 0; wr16(icmp_buf + 2, 0);
         wr16(icmp_buf + 2, csum(icmp_buf, n));
-        ip_out_to(smac, src, IP_ICMP, icmp_buf, n);
+        if ((dst >> 24) == 127 || (my_ip && dst == my_ip && src == my_ip))
+            net_ip_send(dst, src, IP_ICMP, icmp_buf, n);
+        else
+            ip_out_to(smac, src, IP_ICMP, icmp_buf, n);
     } else if (p[0] == 0 && rd16(p + 4) == ping_id && rd16(p + 6) == ping_seq) ping_got = 1;
+    sock_icmp_input(src, dst, p, n);
 }
 
 /* ---- UDP (one outstanding receive at a time) ---- */
 static struct { uint16_t port; uint8_t *buf; size_t cap, len; int got; uint32_t from; } uwant;
 static uint8_t udp_buf[8 + 1472];
-static void udp_input(uint32_t src, const uint8_t *p, size_t n) {
-    if (n < 8 || !uwant.port || uwant.got || rd16(p + 2) != uwant.port) return;
+static void udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t n) {
+    if (n < 8) return;
     size_t l = rd16(p + 4);
     if (l < 8 || l > n) return;
-    size_t pl = l - 8 < uwant.cap ? l - 8 : uwant.cap;
-    memcpy(uwant.buf, p + 8, pl);
-    uwant.len = pl; uwant.from = src; uwant.got = 1;
+    if (uwant.port && !uwant.got && rd16(p + 2) == uwant.port) {
+        size_t pl = l - 8 < uwant.cap ? l - 8 : uwant.cap;
+        memcpy(uwant.buf, p + 8, pl);
+        uwant.len = pl; uwant.from = src; uwant.got = 1;
+        return;
+    }
+    sock_udp_input(src, dst, p, l);
 }
 static int udp_send(uint32_t dst, uint16_t sport, uint16_t dport, const uint8_t *pl, size_t n) {
     if (n > sizeof udp_buf - 8) return -EINVAL;
@@ -442,12 +465,12 @@ static struct tconn *tcp_find(uint32_t src, uint16_t sport, uint16_t dport) {
     }
     return 0;
 }
-static void tcp_input(uint32_t src, const uint8_t *p, size_t n) {
+static void tcp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t n) {
     if (n < 20) return;
     size_t hl = (size_t)(p[12] >> 4) * 4;
     if (hl < 20 || hl > n) return;
     struct tconn *c = tcp_find(src, rd16(p), rd16(p + 2));
-    if (!c) return;
+    if (!c) { sock_tcp_input(src, dst, p, n); return; }
     uint32_t seq = rd32(p + 4), ack = rd32(p + 8);
     uint8_t fl = p[13];
     const uint8_t *pl = p + hl;
@@ -552,20 +575,23 @@ static void ip_input(const uint8_t *p, size_t n, const uint8_t *smac) {
     size_t tot = rd16(p + 2);
     if (ihl < 20 || tot < ihl || tot > n) return;
     uint32_t src = rd32(p + 12), dst = rd32(p + 16);
-    int mine = dst == BCAST || (my_ip && (dst == my_ip || (my_mask && dst == (my_ip | ~my_mask))))
+    int mine = dst == BCAST || (dst >> 24) == 127
+               || (my_ip && (dst == my_ip || (my_mask && dst == (my_ip | ~my_mask))))
                || (!my_ip && p[9] == IP_UDP);               /* a DHCP server may unicast the offer */
     if (!mine || (rd16(p + 6) & 0x3FFF)) return;                   /* not ours, or a fragment */
     const uint8_t *pl = p + ihl;
     size_t pn = tot - ihl;
     switch (p[9]) {
-    case IP_ICMP: icmp_input(src, pl, pn, smac); break;
-    case IP_UDP:  udp_input(src, pl, pn); break;
-    case IP_TCP:  tcp_input(src, pl, pn); break;
+    case IP_ICMP: icmp_input(src, dst, pl, pn, smac); break;
+    case IP_UDP:  udp_input(src, dst, pl, pn); break;
+    case IP_TCP:  tcp_input(src, dst, pl, pn); break;
     }
 }
 
 void net_input(const uint8_t *f, size_t n) {
     if (n < 14) return;
+    dev_rx_pkts[dev_idx]++;
+    dev_rx_bytes[dev_idx] += n;
     uint16_t type = rd16(f + 12);
     if (type == ETH_ARP) arp_input(f + 14, n - 14);
     else if (type == ETH_IP) ip_input(f + 14, n - 14, f + 6);
@@ -690,5 +716,157 @@ size_t net_dump(char *buf, size_t n) {
     }
     if (o < n)
         o += ksnprintf(buf + o, n - o, "%s\n", !ndevs ? "no network interface" : configured ? "configured (* = active)" : "not configured (DHCP not done or failed)");
+    return o < n ? o : n - 1;
+}
+
+/* ---- Socket-layer & /proc/net/dev helpers ---- */
+void net_probe_only(void) {
+    if (!probed) { probed = 1; board_net_probe(); }
+}
+
+int net_ensure(void) {
+    net_probe_only();
+    if (!dev) return -ENODEV;
+    return net_configure();
+}
+
+void net_poll_once(void) { net_poll(); }
+void net_pause_once(void) { net_pause(); }
+
+int net_if_count(void) {
+    net_probe_only();
+    return 1 + ndevs;   /* 0 = lo, 1..ndevs = eth0.. */
+}
+
+int net_if_info(int idx, struct net_ifinfo *out) {
+    net_probe_only();
+    if (!out || idx < 0 || idx >= 1 + ndevs) return -ENODEV;
+    memset(out, 0, sizeof *out);
+    out->index = idx + 1;
+    if (idx == 0) {
+        strlcpy(out->name, "lo", sizeof out->name);
+        out->mtu = 65535;
+        out->flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+        out->ip = 0x7F000001u;
+        out->mask = 0xFF000000u;
+        out->rx_packets = lo_pkts; out->rx_bytes = lo_bytes;
+        out->tx_packets = lo_pkts; out->tx_bytes = lo_bytes;
+        return 0;
+    }
+    int ni = idx - 1;
+    ksnprintf(out->name, sizeof out->name, "eth%d", ni);
+    memcpy(out->mac, devs[ni]->mac, 6);
+    out->mtu = 1500;
+    out->flags = dev_flags[ni];
+    if ((out->flags & IFF_UP) && link_state(devs[ni])) out->flags |= IFF_RUNNING;
+    if (ni == dev_idx && configured) {
+        out->ip = my_ip;
+        out->mask = my_mask;
+        out->gw = my_gw;
+        out->dns = my_dns;
+    }
+    out->rx_packets = dev_rx_pkts[ni]; out->rx_bytes = dev_rx_bytes[ni];
+    out->tx_packets = dev_tx_pkts[ni]; out->tx_bytes = dev_tx_bytes[ni];
+    return 0;
+}
+
+int net_if_find(const char *name) {
+    net_probe_only();
+    if (!name) return -ENODEV;
+    if (!strcmp(name, "lo")) return 0;
+    if (name[0] == 'e' && name[1] == 't' && name[2] == 'h' && name[3] >= '0' && name[3] <= '9' && !name[4]) {
+        int ni = name[3] - '0';
+        if (ni >= 0 && ni < ndevs) return 1 + ni;
+    }
+    return -ENODEV;
+}
+
+int net_if_set_addr(int idx, uint32_t ip, uint32_t mask) {
+    net_probe_only();
+    if (idx < 0 || idx >= 1 + ndevs) return -ENODEV;
+    if (idx == 0) return 0;
+    int ni = idx - 1;
+    if (ni != dev_idx) net_select(ni);
+    my_ip = ip;
+    if (mask) my_mask = mask;
+    else if (!my_mask) my_mask = 0xFFFFFF00u;
+    configured = (ip != 0);
+    return 0;
+}
+
+int net_if_set_flags(int idx, uint32_t flags) {
+    net_probe_only();
+    if (idx < 0 || idx >= 1 + ndevs) return -ENODEV;
+    if (idx == 0) return 0;
+    dev_flags[idx - 1] = flags & ~IFF_RUNNING;
+    return 0;
+}
+
+int net_is_local_ip(uint32_t ip) {
+    if ((ip >> 24) == 127) return 1;
+    if (configured && my_ip && ip == my_ip) return 1;
+    return 0;
+}
+
+uint32_t net_source_ip(uint32_t dst) {
+    if ((dst >> 24) == 127) return 0x7F000001u;
+    return my_ip;
+}
+
+uint16_t net_csum(const void *p, size_t n) { return csum(p, n); }
+
+uint16_t net_tcp_udp_csum(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *pl, size_t n) {
+    uint8_t ph[12];
+    wr32(ph, src); wr32(ph + 4, dst); ph[8] = 0; ph[9] = proto; wr16(ph + 10, (uint16_t)n);
+    return csum_fold(csum_acc(pl, n, csum_acc(ph, 12, 0)));
+}
+
+int net_ip_send(uint32_t src, uint32_t dst, uint8_t proto, const uint8_t *pl, size_t n) {
+    if (n > 1480) return -EMSGSIZE;
+    if (!src) src = net_source_ip(dst);
+    if ((dst >> 24) == 127 || (configured && my_ip && dst == my_ip)) {
+        uint8_t *pkt = kmalloc(20 + n);
+        if (!pkt) return -ENOMEM;
+        pkt[0] = 0x45; pkt[1] = 0; wr16(pkt + 2, (uint16_t)(20 + n));
+        wr16(pkt + 4, ip_id++); wr16(pkt + 6, 0x4000);
+        pkt[8] = 64; pkt[9] = proto; wr16(pkt + 10, 0);
+        wr32(pkt + 12, src); wr32(pkt + 16, dst);
+        wr16(pkt + 10, csum(pkt, 20));
+        if (n) memcpy(pkt + 20, pl, n);
+        lo_pkts++; lo_bytes += 20 + n;
+        uint8_t smac[6] = {0};
+        ip_input(pkt, 20 + n, smac);
+        kfree(pkt);
+        return 0;
+    }
+    int r = net_ensure();
+    if (r) return r;
+    if (!(dev_flags[dev_idx] & IFF_UP)) return -ENETDOWN;
+    net_lock();
+    uint8_t m[6];
+    r = route(dst, m);
+    if (!r) r = ip_out_to(m, dst, proto, pl, n);
+    net_unlock();
+    return r;
+}
+
+size_t net_proc_dev(char *buf, size_t n) {
+    net_probe_only();
+    size_t o = 0;
+    o += ksnprintf(buf + o, n - o,
+        "Inter-|   Receive                                                |  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
+    o += ksnprintf(buf + o, n - o,
+        "%6s: %7lu %7lu    0    0    0     0          0         0 %7lu %7lu    0    0    0     0       0          0\n",
+        "lo", (unsigned long)lo_bytes, (unsigned long)lo_pkts,
+        (unsigned long)lo_bytes, (unsigned long)lo_pkts);
+    for (int i = 0; i < ndevs && o < n; i++) {
+        char name[16];
+        ksnprintf(name, sizeof name, "eth%d", i);
+        o += ksnprintf(buf + o, n - o,
+            "%6s: %7lu %7lu    0    0    0     0          0         0 %7lu %7lu    0    0    0     0       0          0\n",
+            name, (unsigned long)dev_rx_bytes[i], (unsigned long)dev_rx_pkts[i],
+            (unsigned long)dev_tx_bytes[i], (unsigned long)dev_tx_pkts[i]);
+    }
     return o < n ? o : n - 1;
 }

@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "socket.h"
 
 #ifndef MAXNODES
 #define MAXNODES 4096                      /* max files+dirs in the whole tree */
@@ -195,6 +196,7 @@ int file_close(struct file *f) {
         r = persist_flush(n);
         if (--n->refs == 0 && n->unlinked) node_free(n);
     }
+    if (f->type == F_SOCKET && f->sock) sock_close(f->sock);
     if (f->pipe) {
         if (f->type == F_PIPE_R) f->pipe->readers--; else f->pipe->writers--;
         wakeup(f->pipe);
@@ -244,6 +246,7 @@ int vfs_open(const char *path, int flags, int mode, struct file **out) {
 
 ssize_t file_read(struct file *f, void *buf, size_t n) {
     if (f->type == F_PIPE_R) return pipe_read(f->pipe, buf, n);
+    if (f->type == F_SOCKET) return sock_read(f, buf, n);
     if (f->type != F_NODE) return -EBADF;
     struct node *nd = f->node;
     if (S_ISDIR(nd->mode)) return -EISDIR;
@@ -266,6 +269,7 @@ ssize_t file_read(struct file *f, void *buf, size_t n) {
 }
 ssize_t file_write(struct file *f, const void *buf, size_t n) {
     if (f->type == F_PIPE_W) return pipe_write(f->pipe, buf, n);
+    if (f->type == F_SOCKET) return sock_write(f, buf, n);
     if (f->type != F_NODE) return -EBADF;
     struct node *nd = f->node;
     if (S_ISDIR(nd->mode)) return -EISDIR;
@@ -286,11 +290,17 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
 }
 int file_readable(struct file *f) {
     if (f->type == F_PIPE_R) return f->pipe->rd != f->pipe->wr || !f->pipe->writers;
+    if (f->type == F_SOCKET) return sock_readable(f);
     if (f->type == F_NODE && f->node->dev == DEV_TTY) {
         int m = tty_resolve(f->node->minor);
         return m < 0 ? 1 : tty_readable(m);
     }
     if (f->type == F_NODE && f->node->dev == DEV_INPUT) return input_readable();
+    return 1;
+}
+int file_writable(struct file *f) {
+    if (f->type == F_PIPE_R) return 0;
+    if (f->type == F_SOCKET) return sock_writable(f);
     return 1;
 }
 

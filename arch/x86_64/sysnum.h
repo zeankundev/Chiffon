@@ -90,6 +90,23 @@
 #define SYS_prlimit64 302
 #define SYS_getrandom 318
 
+#define SYS_socket 41
+#define SYS_connect 42
+#define SYS_accept 43
+#define SYS_sendto 44
+#define SYS_recvfrom 45
+#define SYS_sendmsg 46
+#define SYS_recvmsg 47
+#define SYS_shutdown 48
+#define SYS_bind 49
+#define SYS_listen 50
+#define SYS_getsockname 51
+#define SYS_getpeername 52
+#define SYS_socketpair 53
+#define SYS_setsockopt 54
+#define SYS_getsockopt 55
+#define SYS_accept4 288
+
 #define STAT_SIZE 144
 #define SIGACT_SIZE 32
 #define CLONE_CTID_ARG(a3, a4) (a3)

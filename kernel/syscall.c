@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "net.h"
+#include "socket.h"
 #include "sysnum.h"
 
 static void group_quiesce(void);
@@ -43,6 +44,7 @@ static void put_stat(uintptr_t u, uint32_t mode, uint64_t size, uint64_t ino, ui
 }
 static long stat_file(struct file *f, uintptr_t ub) {
     if (!uwok(ub, STAT_SIZE)) return -EFAULT;
+    if (f->type == F_SOCKET) { put_stat(ub, S_IFSOCK | 0666, 0, 1, BOOT_EPOCH); return 0; }
     if (f->type != F_NODE) { put_stat(ub, S_IFIFO | 0600, 0, 1, BOOT_EPOCH); return 0; }
     put_stat(ub, f->node->mode, f->node->size, f->node->ino, f->node->mtime);
     return 0;
@@ -191,6 +193,7 @@ static long sys_pipe2(uintptr_t ufds, int flags) {
 static long sys_ioctl(long fd, unsigned long cmd, uintptr_t arg) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
+    if (f->type == F_SOCKET) return sock_ioctl(f, cmd, arg);
     if (f->type == F_NODE && f->node->dev == DEV_TTY) {
         int m = tty_resolve(f->node->minor);
         return m < 0 ? m : tty_ioctl(m, cmd, arg);
@@ -574,7 +577,8 @@ static long do_poll(uintptr_t ufds, unsigned nfds, long tmo_ms) {
             if (!f) p[i].rev = 0x20;
             else {
                 if ((p[i].ev & 1) && file_readable(f)) p[i].rev |= 1;
-                if ((p[i].ev & 4) && f->type != F_PIPE_R) p[i].rev |= 4;
+                if ((p[i].ev & 4) && file_writable(f)) p[i].rev |= 4;
+                if (f->type == F_SOCKET && sock_hangup(f)) p[i].rev |= 0x10;
             }
             if (p[i].rev) ready++;
         }
@@ -727,6 +731,91 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case CSYS_net_info: case CSYS_net_ping: case CSYS_net_resolve: case CSYS_net_connect:
     case CSYS_net_send: case CSYS_net_recv: case CSYS_net_close:
         return net_syscall(no, a0, a1, a2, a3);
+
+    case SYS_socket: {
+        struct file *f;
+        long r = sock_create((int)a0, (int)a1, (int)a2, &f);
+        if (r) return r;
+        int fd = fd_install(f, 0, ((int)a1 & SOCK_CLOEXEC) != 0);
+        if (fd < 0) file_close(f);
+        return fd;
+    }
+    case SYS_socketpair: {
+        if (!uwok(a3, 8)) return -EFAULT;
+        struct file *f0, *f1;
+        long r = sock_socketpair((int)a0, (int)a1, (int)a2, &f0, &f1);
+        if (r) return r;
+        int clo = ((int)a1 & SOCK_CLOEXEC) != 0;
+        int d0 = fd_install(f0, 0, clo);
+        int d1 = d0 < 0 ? -1 : fd_install(f1, 0, clo);
+        if (d0 < 0 || d1 < 0) {
+            if (d0 >= 0) cur->ft->f[d0] = 0;
+            file_close(f0); file_close(f1);
+            return -EMFILE;
+        }
+        ((int *)a3)[0] = d0; ((int *)a3)[1] = d1;
+        return 0;
+    }
+    case SYS_bind: {
+        struct file *f = getfd(a0);
+        return f ? sock_bind(f, a1, (int)a2) : -EBADF;
+    }
+    case SYS_listen: {
+        struct file *f = getfd(a0);
+        return f ? sock_listen(f, (int)a1) : -EBADF;
+    }
+    case SYS_accept:
+    case SYS_accept4: {
+        struct file *f = getfd(a0);
+        if (!f) return -EBADF;
+        int fl = (no == SYS_accept4) ? (int)a3 : 0;
+        struct file *cf;
+        long r = sock_accept(f, a1, a2, fl, &cf);
+        if (r) return r;
+        int fd = fd_install(cf, 0, (fl & SOCK_CLOEXEC) != 0);
+        if (fd < 0) file_close(cf);
+        return fd;
+    }
+    case SYS_connect: {
+        struct file *f = getfd(a0);
+        return f ? sock_connect(f, a1, (int)a2) : -EBADF;
+    }
+    case SYS_getsockname: {
+        struct file *f = getfd(a0);
+        return f ? sock_getsockname(f, a1, a2) : -EBADF;
+    }
+    case SYS_getpeername: {
+        struct file *f = getfd(a0);
+        return f ? sock_getpeername(f, a1, a2) : -EBADF;
+    }
+    case SYS_sendto: {
+        struct file *f = getfd(a0);
+        return f ? sock_sendto(f, a1, (size_t)a2, (int)a3, a4, (int)a5) : -EBADF;
+    }
+    case SYS_recvfrom: {
+        struct file *f = getfd(a0);
+        return f ? sock_recvfrom(f, a1, (size_t)a2, (int)a3, a4, a5) : -EBADF;
+    }
+    case SYS_sendmsg: {
+        struct file *f = getfd(a0);
+        return f ? sock_sendmsg(f, a1, (int)a2) : -EBADF;
+    }
+    case SYS_recvmsg: {
+        struct file *f = getfd(a0);
+        return f ? sock_recvmsg(f, a1, (int)a2) : -EBADF;
+    }
+    case SYS_shutdown: {
+        struct file *f = getfd(a0);
+        return f ? sock_shutdown(f, (int)a1) : -EBADF;
+    }
+    case SYS_setsockopt: {
+        struct file *f = getfd(a0);
+        return f ? sock_setsockopt(f, (int)a1, (int)a2, a3, (int)a4) : -EBADF;
+    }
+    case SYS_getsockopt: {
+        struct file *f = getfd(a0);
+        return f ? sock_getsockopt(f, (int)a1, (int)a2, a3, a4) : -EBADF;
+    }
 
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:

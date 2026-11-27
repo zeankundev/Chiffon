@@ -44,8 +44,32 @@ typedef long off_t;
 #define ENOSPC 28
 #define EROFS 30
 #define ELOOP 40
+#define ENOTSOCK 88
+#define EDESTADDRREQ 89
+#define EMSGSIZE 90
+#define EPROTOTYPE 91
+#define ENOPROTOOPT 92
+#define EPROTONOSUPPORT 93
+#define ESOCKTNOSUPPORT 94
+#define EOPNOTSUPP 95
+#define EAFNOSUPPORT 97
+#define EADDRINUSE 98
+#define EADDRNOTAVAIL 99
+#define ENETDOWN 100
+#define ENETUNREACH 101
+#define ECONNABORTED 103
+#define ECONNRESET 104
+#define ENOBUFS 105
+#define EISCONN 106
+#define ENOTCONN 107
+#define ESHUTDOWN 108
+#define ECONNREFUSED 111
+#define EHOSTUNREACH 113
+#define EALREADY 114
+#define EINPROGRESS 115
 
 #define S_IFMT  0170000
+#define S_IFSOCK 0140000
 #define S_IFDIR 0040000
 #define S_IFREG 0100000
 #define S_IFLNK 0120000
@@ -254,9 +278,10 @@ struct fs_driver {
     int (*ident)(uint64_t base_lba, uint64_t *fs_end_lba, uint64_t *fsid);
 };
 extern const struct fs_driver ext_driver;
-enum { F_NODE = 1, F_PIPE_R, F_PIPE_W };
+enum { F_NODE = 1, F_PIPE_R, F_PIPE_W, F_SOCKET };
 struct pipe;
-struct file { int type, refs, flags; struct node *node; size_t off; struct pipe *pipe; };
+struct socket;
+struct file { int type, refs, flags; struct node *node; size_t off; struct pipe *pipe; struct socket *sock; };
 
 void vfs_init(void);
 int  vfs_ready(void);                                  /* 1 once vfs_init has run */                                   /* empty tree with "/" */
@@ -275,6 +300,7 @@ int  file_close(struct file *f);
 ssize_t file_read(struct file *f, void *buf, size_t n);
 ssize_t file_write(struct file *f, const void *buf, size_t n);
 int  file_readable(struct file *f);
+int  file_writable(struct file *f);
 int  file_getdents(struct file *f, void *buf, size_t n);
 int  pipe_create(struct file **r, struct file **w);
 int  node_is_empty_dir(struct node *d);
@@ -297,6 +323,7 @@ int  file_close(struct file *f);
 ssize_t file_read(struct file *f, void *buf, size_t n);
 ssize_t file_write(struct file *f, const void *buf, size_t n);
 int  file_readable(struct file *f);
+int  file_writable(struct file *f);
 int  file_getdents(struct file *f, void *buf, size_t n);
 int  pipe_create(struct file **r, struct file **w);
 int  node_is_empty_dir(struct node *d);
