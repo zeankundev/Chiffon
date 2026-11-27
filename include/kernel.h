@@ -135,7 +135,8 @@ void *krealloc(void *p, size_t n);
 
 enum { P_UNUSED, P_EMBRYO, P_RUNNABLE, P_RUNNING, P_SLEEPING, P_ZOMBIE };
 
-struct vma { uintptr_t start, end; int dev; };   /* dev: maps device memory (never freed to the pmm) */
+enum { VMA_RAM, VMA_DEVICE_RW, VMA_DEVICE_RO };
+struct vma { uintptr_t start, end; int dev; };   /* device pages are never freed to the PMM */
 struct mm {
     int refs;
     uintptr_t root;
@@ -220,7 +221,7 @@ int  futex_wake_key(void *key, int n);
 int  mm_map(struct mm *mm, uintptr_t va, size_t len);
 int  mm_map_prot(struct mm *mm, uintptr_t va, size_t len, int prot);
 int  mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa);   /* map device memory (e.g. /dev/fb0) */
-int  mm_map_dev_prot(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa, int prot);
+int  mm_map_dev_prot(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa, int prot, int writable);
 int  mm_protect(struct mm *mm, uintptr_t va, size_t len, int prot);
 void mm_free(struct mm *mm);
 int  mm_unmap(struct mm *mm, uintptr_t va, size_t len);

@@ -340,16 +340,21 @@ static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, l
         if (off < 0 || (off & (PAGE_SIZE - 1))) return -EINVAL;
     }
     int is_fb = f && f->node->dev == DEV_FB;
+    int fb_writable = 0;
     uintptr_t fb_phys = 0;
     if (is_fb) {
         if (prot & VM_EXEC) return -EACCES;
         struct fb_device *d = fb_primary();
         if (!d) return -ENODEV;
-        uint64_t size = ((uint64_t)d->info.size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        /* The open framebuffer authorizes only whole pages inside its pixel buffer. */
+        int access = f->flags & O_ACCMODE;
+        fb_writable = access == 2; /* O_RDWR */
+        if ((!fb_writable && access != 0) || ((prot & VM_WRITE) && !fb_writable))
+            return -EACCES;
+        uint64_t size = d->info.size;
         if ((uint64_t)off > size || len > size - (uint64_t)off) return -EINVAL;
         fb_phys = d->info.phys + off;
-        if (fb_phys < d->info.phys || (fb_phys & (PAGE_SIZE - 1)) ||
-            !cap_check(cur, CHI_CAP_MMIO, fb_phys, len)) return -EPERM;
+        if (fb_phys < d->info.phys || (fb_phys & (PAGE_SIZE - 1))) return -EINVAL;
     } else if (f && f->node->lazy && node_load(f->node)) return -EIO;
     if (flags & 0x10) {
         if ((addr & (PAGE_SIZE - 1)) || addr < PAGE_SIZE) return -EINVAL;
@@ -373,7 +378,7 @@ static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, l
             addr = next;
         }
     }
-    int r = is_fb ? mm_map_dev_prot(m, addr, len, fb_phys, prot) : mm_map_prot(m, addr, len, prot);
+    int r = is_fb ? mm_map_dev_prot(m, addr, len, fb_phys, prot, fb_writable) : mm_map_prot(m, addr, len, prot);
     if (r) return r;
     if (f && !is_fb && (size_t)off < f->node->size) {
         size_t n = f->node->size - off; if (n > len) n = len;

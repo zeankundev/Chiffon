@@ -14,7 +14,7 @@ static struct vma *vma_left(struct mm *mm, uintptr_t s, int dev) {
         if (mm->vma[i].end == s && mm->vma[i].dev == dev) return &mm->vma[i];
     return 0;
 }
-static int vma_is_dev(struct mm *mm, uintptr_t a) {
+static int vma_kind(struct mm *mm, uintptr_t a) {
     for (int i = 0; i < mm->nvma; i++) if (a >= mm->vma[i].start && a < mm->vma[i].end) return mm->vma[i].dev;
     return 0;
 }
@@ -55,13 +55,14 @@ int mm_map(struct mm *mm, uintptr_t va, size_t len) {
     return mm_map_prot(mm, va, len, VM_READ | VM_WRITE);
 }
 /* Map physical device memory at va. These pages are never handed to the page allocator. */
-int mm_map_dev_prot(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa, int prot) {
+int mm_map_dev_prot(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa, int prot, int writable) {
     if (!pa || ((pa | va) & (PAGE_SIZE - 1)) || len > USER_TOP || PGUP(len) > UINTPTR_MAX - pa)
         return -EINVAL;
-    return map_pages(mm, va, len, pa, 1, prot);
+    if (!writable && (prot & VM_WRITE)) return -EACCES;
+    return map_pages(mm, va, len, pa, writable ? VMA_DEVICE_RW : VMA_DEVICE_RO, prot);
 }
 int mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa) {
-    return mm_map_dev_prot(mm, va, len, pa, VM_READ | VM_WRITE);
+    return mm_map_dev_prot(mm, va, len, pa, VM_READ | VM_WRITE, 1);
 }
 int mm_protect(struct mm *mm, uintptr_t va, size_t len, int prot) {
     if ((va & (PAGE_SIZE - 1)) || va >= USER_TOP || len > USER_TOP - va ||
@@ -70,7 +71,9 @@ int mm_protect(struct mm *mm, uintptr_t va, size_t len, int prot) {
     uintptr_t end = PGUP(va + len);
     for (uintptr_t a = va; a < end; a += PAGE_SIZE) {
         if (!arch_translate(mm->root, a)) return -ENOMEM;
-        if ((prot & VM_EXEC) && vma_is_dev(mm, a)) return -EACCES;
+        int kind = vma_kind(mm, a);
+        if ((prot & VM_EXEC) && kind != VMA_RAM) return -EACCES;
+        if ((prot & VM_WRITE) && kind == VMA_DEVICE_RO) return -EACCES;
     }
     for (uintptr_t a = va; a < end; a += PAGE_SIZE) {
         if ((prot & VM_EXEC) && !(arch_page_prot(mm->root, a) & VM_EXEC))
