@@ -1,0 +1,71 @@
+name: Release readiness smoke checks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            compiler: gcc
+            packages: qemu-system-x86
+          - arch: aarch64
+            compiler: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      ABI_CC: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and emulator dependencies
+        shell: bash
+        env:
+          PACKAGES: ${{ matrix.packages }}
+        run: |
+          mkdir -p build/evidence
+          {
+            git rev-parse HEAD
+            printf 'architecture=%s\nabi_baseline=v1\nenvironment=demo\nboard=qemu\n' "$ARCH"
+          } > build/evidence/inputs.txt
+          sudo apt-get update 2>&1 | tee build/evidence/dependencies.log
+          sudo apt-get install -y build-essential e2fsprogs $PACKAGES 2>&1 \
+            | tee -a build/evidence/dependencies.log
+          dpkg-query -W > build/evidence/packages.txt
+          "$ABI_CC" --version >> build/evidence/inputs.txt
+          "qemu-system-$ARCH" --version >> build/evidence/inputs.txt
+      - name: Check the published ABI and build a clean Demo image
+        shell: bash
+        run: |
+          run_check() {
+            local name=$1
+            shift
+            if timeout --kill-after=5s 300s "$@" 2>&1 | tee "build/evidence/$name.log"; then
+              printf 'PASS %s %s\n' "$name" "$ARCH" | tee -a build/evidence/result.txt
+            else
+              printf 'FAIL %s %s\n' "$name" "$ARCH" | tee -a build/evidence/result.txt
+              return 1
+            fi
+          }
+          run_check abi "$ABI_CC" -std=c11 -ffreestanding -Wall -Wextra -Werror \
+            -Iinclude -fsyntax-only tools/release/abi_v1.c
+          run_check build make ENV=demo ARCH="$ARCH" DEVICE=qemu
+      - name: Boot the Demo image
+        run: |
+          image="build/demo/$ARCH-qemu"
+          python3 tools/release/boot_smoke.py "$ARCH" "$image/chiffon.bin" \
+            "$image/disk.img" build/evidence/boot
+      - name: Preserve logs and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-${{ matrix.arch }}
+          path: build/evidence/
+          if-no-files-found: warn

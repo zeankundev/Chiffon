@@ -67,36 +67,76 @@ void irq_dispatch(unsigned irq) { if (irq < NIRQ && irq_fn[irq]) irq_fn[irq](irq
 
 /* ---- Hybrid Capabilities and User-space Driver Backend ---- */
 
+static uintptr_t virtual_fb_phys;
+static const size_t virtual_fb_size = 640 * 480 * 4;
+
+/* Calculate the full extent exposed by page tables before checking authority. */
+static int device_pages(uintptr_t phys, size_t len, uintptr_t *first, size_t *size) {
+    if (!phys || !len || len > UINTPTR_MAX - phys ||
+        phys + len > UINTPTR_MAX - (PAGE_SIZE - 1)) return -EINVAL;
+    *first = phys & ~(PAGE_SIZE - 1);
+    *size = ((phys + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)) - *first;
+    return *first ? 0 : -EINVAL;
+}
+
 int cap_check(struct proc *p, uint32_t type, uintptr_t val1, size_t val2) {
     if (!p) return 0;
-    if (p->pid == 1 || p->is_driver_loader) return 1;
+    if (type == CHI_CAP_LOADER) return p->is_driver_loader && !val1 && !val2;
     for (int i = 0; i < p->ncaps; i++) {
-        if (p->caps[i].type == type) {
-            if (type == CHI_CAP_MMIO) {
-                if (val1 >= p->caps[i].base && val1 + val2 <= p->caps[i].base + p->caps[i].size) return 1;
-            } else if (type == CHI_CAP_IRQ) {
-                if (val1 == p->caps[i].base) return 1;
-            } else if (type == CHI_CAP_DRIVER || type == CHI_CAP_LOADER) {
-                return 1;
-            }
-        }
+        const struct proc_cap *cap = &p->caps[i];
+        if (cap->type != type || val1 < cap->base) continue;
+        if (type == CHI_CAP_MMIO && val2 && val1 - cap->base < cap->size &&
+            val2 <= cap->size - (val1 - cap->base)) return 1;
+        if ((type == CHI_CAP_IRQ || type == CHI_CAP_DRIVER) && val1 == cap->base && !val2) return 1;
     }
     return 0;
 }
 
 long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2) {
-    if (!cur || (!cur->is_driver_loader && cur->pid != 1)) return -EPERM;
+    if (!cap_check(cur, CHI_CAP_LOADER, 0, 0)) return -EPERM;
     struct proc *target = 0;
     for (int i = 0; i < NPROC; i++) {
-        if (ptable[i].state != P_UNUSED && ptable[i].pid == pid) {
+        if (ptable[i].state != P_UNUSED && ptable[i].state != P_EMBRYO &&
+            ptable[i].state != P_ZOMBIE && ptable[i].pid == pid) {
             target = &ptable[i];
             break;
         }
     }
     if (!target) return -ESRCH;
-    if (type == CHI_CAP_LOADER) {
-        target->is_driver_loader = 1;
-        return 0;
+    if (target->ppid != cur->pid || !target->is_fb_server || target->mm->refs != 1)
+        return -EPERM;
+
+    if (type == CHI_CAP_MMIO) {
+        struct fb_device *fb = fb_primary();
+        uintptr_t phys = fb ? fb->info.phys : virtual_fb_phys;
+        size_t bytes = fb ? fb->info.size : virtual_fb_size;
+        uintptr_t first;
+        size_t span;
+        if (val1 != phys || val2 != bytes) return -EPERM;
+        if (device_pages(phys, bytes, &first, &span) || first != phys)
+            return -EINVAL;
+        val1 = first;
+        val2 = span;
+    } else if (type == CHI_CAP_DRIVER) {
+        if ((val1 && val1 != DEV_TYPE_FB) || val2) return -EINVAL;
+        if (!target->ncaps || target->caps[0].type != CHI_CAP_MMIO) return -EPERM;
+        val1 = DEV_TYPE_FB;
+    } else if (type == CHI_CAP_IRQ || type == CHI_CAP_LOADER) {
+        /* The registered user framebuffer has no IRQ. The loader is boot-only. */
+        return -EPERM;
+    } else {
+        return -EINVAL;
+    }
+
+    /* The user device catalog currently contains one exclusive framebuffer. */
+    for (int i = 0; i < NPROC; i++) {
+        struct proc *owner = &ptable[i];
+        for (int j = 0; j < owner->ncaps; j++) {
+            const struct proc_cap *cap = &owner->caps[j];
+            if (cap->type != type) continue;
+            if (owner == target && cap->base == val1 && cap->size == val2) return 0;
+            return -EBUSY;
+        }
     }
     if (target->ncaps >= MAX_PROC_CAPS) return -ENOMEM;
     target->caps[target->ncaps++] = (struct proc_cap){ .type = type, .base = val1, .size = val2 };
@@ -104,18 +144,26 @@ long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2) {
 }
 
 long dev_mmap_phys(uintptr_t phys, size_t len) {
-    if (!cur) return -EINVAL;
-    if (!cap_check(cur, CHI_CAP_MMIO, phys, len)) return -EPERM;
-    if (!len) return -EINVAL;
-    uintptr_t p_aligned = phys & ~(PAGE_SIZE - 1);
-    size_t l_aligned = ((phys + len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)) - p_aligned;
-    if (arch_map_device(p_aligned, l_aligned)) return -EIO;
-    if (cur->mm->mmap_next < MMAP_BASE) cur->mm->mmap_next = MMAP_BASE;
-    uintptr_t va = cur->mm->mmap_next;
-    if (va + l_aligned > USER_STACK_TOP - STACK_SIZE * 8) return -ENOMEM;
-    cur->mm->mmap_next += l_aligned;
-    int r = mm_map_dev(cur->mm, va, l_aligned, p_aligned);
+    uintptr_t p_aligned;
+    size_t l_aligned;
+    int r = device_pages(phys, len, &p_aligned, &l_aligned);
     if (r) return r;
+    if (!cap_check(cur, CHI_CAP_MMIO, p_aligned, l_aligned)) return -EPERM;
+    uintptr_t va = cur->mm->mmap_next;
+    uintptr_t limit = USER_STACK_TOP - STACK_SIZE * 8;
+    if (va < MMAP_BASE) va = MMAP_BASE;
+    for (;;) {
+        if (va >= limit || l_aligned > limit - va) return -ENOMEM;
+        uintptr_t next = va;
+        for (int i = 0; i < cur->mm->nvma; i++)
+            if (cur->mm->vma[i].start < va + l_aligned && cur->mm->vma[i].end > next)
+                next = cur->mm->vma[i].end;
+        if (next == va) break;
+        va = next;
+    }
+    r = mm_map_dev(cur->mm, va, l_aligned, p_aligned);
+    if (r) return r;
+    cur->mm->mmap_next = va + l_aligned;
     return (long)(va + (phys & (PAGE_SIZE - 1)));
 }
 
@@ -153,6 +201,10 @@ long dev_irq_wait(unsigned irq) {
 
 void dev_driver_cleanup(struct proc *p) {
     if (!p) return;
+    p->ncaps = 0;
+    p->is_driver_loader = 0;
+    p->driver_bootstrap = 0;
+    p->is_fb_server = 0;
     for (unsigned i = 0; i < NIRQ; i++) {
         if (irq_owner_pid[i] == p->pid) {
             irq_owner_pid[i] = 0;
@@ -162,14 +214,11 @@ void dev_driver_cleanup(struct proc *p) {
     }
 }
 
-static uintptr_t virtual_fb_phys;
-static size_t virtual_fb_size;
-
 long dev_info_query(int type, void *uinfo) {
     if (!cur) return -EINVAL;
     switch (type) {
     case DEV_TYPE_FB: {
-        if (!uok((uintptr_t)uinfo, sizeof(struct chi_dev_fb_info))) return -EFAULT;
+        if (!uwok((uintptr_t)uinfo, sizeof(struct chi_dev_fb_info))) return -EFAULT;
         struct chi_dev_fb_info info;
         memset(&info, 0, sizeof info);
         struct fb_device *d = fb_primary();
@@ -181,15 +230,14 @@ long dev_info_query(int type, void *uinfo) {
             info.pitch = d->info.pitch;
             info.bpp = d->info.bpp;
         } else {
-            if (!virtual_fb_phys) {
-                uint32_t w = 640, h = 480, pitch = w * 4;
-                size_t sz = (size_t)pitch * h;
-                uint8_t *vbuf = kmalloc(sz + PAGE_SIZE);
-                if (vbuf) {
-                    virtual_fb_phys = V2P((uintptr_t)vbuf);
-                    virtual_fb_size = sz;
-                }
+            if (!virtual_fb_phys && cap_check(cur, CHI_CAP_LOADER, 0, 0)) {
+                uint8_t *vbuf = kmalloc(virtual_fb_size + PAGE_SIZE);
+                if (!vbuf) return -ENOMEM;
+                uintptr_t aligned = ((uintptr_t)vbuf + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                memset((void *)aligned, 0, virtual_fb_size);
+                virtual_fb_phys = V2P(aligned);
             }
+            if (!virtual_fb_phys) return -ENODEV;
             info.phys = virtual_fb_phys;
             info.size = virtual_fb_size;
             info.width = 640;
@@ -201,7 +249,7 @@ long dev_info_query(int type, void *uinfo) {
         return 0;
     }
     case DEV_TYPE_UART: {
-        if (!uok((uintptr_t)uinfo, sizeof(struct chi_dev_uart_info))) return -EFAULT;
+        if (!uwok((uintptr_t)uinfo, sizeof(struct chi_dev_uart_info))) return -EFAULT;
         struct chi_dev_uart_info info;
         memset(&info, 0, sizeof info);
 #if defined(__aarch64__)

@@ -3,13 +3,16 @@
 #include "x86io.h"
 static uint64_t ata_nsect;
 static int ata_ready;
-static int ata_wait(int need_drq) {
+static int ata_timed_out;
+/* drq is the required state, or -1 while identifying the device. */
+static int ata_wait(int drq) {
     for (int i = 0; i < 2000000; i++) {
         uint8_t st = inb(0x1F7);
         if (st & 0x80) continue;
         if (st & 0x21) return -1;
-        if (!need_drq || (st & 8)) return 0;
+        if (drq < 0 || !!(st & 8) == drq) return 0;
     }
+    ata_timed_out = 1;
     return -1;
 }
 static int ata_init(void) {
@@ -17,7 +20,7 @@ static int ata_init(void) {
     if (inb(0x1F7) == 0xFF) return -1;
     outb(0x1F6, 0xA0); outb(0x1F7, 0xEC);
     if (inb(0x1F7) == 0) return -1;
-    if (ata_wait(0) || inb(0x1F4) || inb(0x1F5)) return -1;
+    if (ata_wait(-1) || inb(0x1F4) || inb(0x1F5)) return -1;
     if (ata_wait(1)) return -1;
     uint16_t id[256];
     for (int i = 0; i < 256; i++) id[i] = inw(0x1F0);
@@ -26,7 +29,7 @@ static int ata_init(void) {
     return ata_ready ? 0 : -1;
 }
 static int ata_write(uint64_t lba, const void *buf, uint32_t n) {
-    if (!ata_ready || lba + n > ata_nsect || lba + n > 0x0FFFFFFF) return -1;
+    if (!ata_ready || ata_timed_out || lba + n > ata_nsect || lba + n > 0x0FFFFFFF) return -1;
     const uint8_t *b = buf;
     while (n) {
         uint32_t c = n > 128 ? 128 : n;
@@ -39,13 +42,16 @@ static int ata_write(uint64_t lba, const void *buf, uint32_t n) {
             for (int w = 0; w < 256; w++) outw(0x1F0, ((const uint16_t *)b)[w]);
             b += 512;
         }
+        for (int i = 0; i < 4; i++) inb(0x3F6);
+        if (ata_wait(0)) return -1;
         lba += c; n -= c;
     }
     outb(0x1F7, 0xE7);                                                  /* CACHE FLUSH */
+    for (int i = 0; i < 4; i++) inb(0x3F6);
     return ata_wait(0) ? -1 : 0;
 }
 static int ata_read(uint64_t lba, void *buf, uint32_t n) {
-    if (!ata_ready || lba + n > ata_nsect || lba + n > 0x0FFFFFFF) return -1;
+    if (!ata_ready || ata_timed_out || lba + n > ata_nsect || lba + n > 0x0FFFFFFF) return -1;
     uint8_t *b = buf;
     while (n) {
         uint32_t c = n > 128 ? 128 : n;
@@ -58,6 +64,8 @@ static int ata_read(uint64_t lba, void *buf, uint32_t n) {
             for (int w = 0; w < 256; w++) ((uint16_t *)b)[w] = inw(0x1F0);
             b += 512;
         }
+        for (int i = 0; i < 4; i++) inb(0x3F6);
+        if (ata_wait(0)) return -1;
         lba += c; n -= c;
     }
     return 0;

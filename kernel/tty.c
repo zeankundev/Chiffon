@@ -228,7 +228,7 @@ long tty_ioctl(int minor, unsigned long cmd, uintptr_t arg) {
     struct tty *t = &ttys[minor];
     switch (cmd) {
     case 0x5401:                                   /* TCGETS */
-        if (!uok(arg, sizeof t->tio)) return -EFAULT;
+        if (!uwok(arg, sizeof t->tio)) return -EFAULT;
         memcpy((void *)arg, &t->tio, sizeof t->tio); return 0;
     case 0x5402: case 0x5403: case 0x5404:         /* TCSETS{,W,F} */
         if (!uok(arg, sizeof t->tio)) return -EFAULT;
@@ -236,12 +236,12 @@ long tty_ioctl(int minor, unsigned long cmd, uintptr_t arg) {
         if (cmd == 0x5404) { t->itail = t->ihead; t->llen = 0; }
         return 0;
     case 0x5413: {                                 /* TIOCGWINSZ */
-        if (!uok(arg, 8)) return -EFAULT;
+        if (!uwok(arg, 8)) return -EFAULT;
         uint16_t *w = (uint16_t *)arg; int c = 80, r = 24; vt_size(&c, &r);
         w[0] = r; w[1] = c; w[2] = w[3] = 0; return 0; }
     case 0x5414: return 0;                         /* TIOCSWINSZ */
     case 0x541B:                                   /* FIONREAD */
-        if (!uok(arg, 4)) return -EFAULT;
+        if (!uwok(arg, 4)) return -EFAULT;
         *(int *)arg = kbd_direct(t) ? (int)((t->khead - t->ktail) * sizeof(struct chi_input_event))
                                     : (int)(t->ihead - t->itail);
         return 0;
@@ -260,13 +260,13 @@ long tty_ioctl(int minor, unsigned long cmd, uintptr_t arg) {
         wakeup(t);
         return 0;
     case CHI_KBDGETMODE:
-        if (!uok(arg, 4)) return -EFAULT;
+        if (!uwok(arg, 4)) return -EFAULT;
         *(int *)arg = kbd_direct(t) ? CHI_KBDMODE_DIRECT : CHI_KBDMODE_TTY; return 0;
     case CHI_KDSETMODE:                            /* a graphics program takes over the display */
         if (arg != CHI_KD_TEXT && arg != CHI_KD_GRAPHICS) return -EINVAL;
         vt_set_graphics(arg == CHI_KD_GRAPHICS); return 0;
     case CHI_KDGETMODE:
-        if (!uok(arg, 4)) return -EFAULT;
+        if (!uwok(arg, 4)) return -EFAULT;
         *(int *)arg = vt_graphics(); return 0;
     default: return -ENOTTY;                       /* no job control (TIOCGPGRP/TIOCSPGRP) yet */
     }

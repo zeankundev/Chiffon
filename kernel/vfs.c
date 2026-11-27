@@ -97,10 +97,12 @@ int vfs_resolve(const char *in, int follow_last, char *out) {
         if (n && S_ISLNK(n->mode) && (!last || follow_last)) {
             if (++links > 16) return -ELOOP;
             char tgt[PATH_MAX];
-            size_t tl = n->size < sizeof tgt - 1 ? n->size : sizeof tgt - 1;
+            if (n->size >= sizeof tgt) return -ENAMETOOLONG;
+            size_t tl = n->size;
             memcpy(tgt, n->data, tl); tgt[tl] = 0;
             if (tgt[0] == '/') strlcpy(res, "/", sizeof res); else pop_comp(res);
-            strlcpy(nw, tgt, sizeof nw); strlcat(nw, "/", sizeof nw); strlcat(nw, q, sizeof nw);
+            strlcpy(nw, tgt, sizeof nw); strlcat(nw, "/", sizeof nw);
+            if (strlcat(nw, q, sizeof nw) >= sizeof nw) return -ENAMETOOLONG;
             strlcpy(work, nw, sizeof work);
             p = work;
             continue;
@@ -118,6 +120,7 @@ int vfs_resolve(const char *in, int follow_last, char *out) {
 static int node_make_dynamic(struct node *n) {
     if (n->lazy) { int r = node_load(n); if (r) return r; }
     if (!n->is_static) return 0;
+    if (n->size > (size_t)-1 - 256) return -ENOMEM;
     size_t cap = n->size + 256;
     uint8_t *d = kmalloc(cap);
     if (!d) return -ENOMEM;
@@ -126,10 +129,12 @@ static int node_make_dynamic(struct node *n) {
     return 0;
 }
 static ssize_t node_write(struct node *n, size_t off, const void *buf, size_t len) {
+    if (len > (size_t)-1 - off) return -ENOMEM;
     int r = node_make_dynamic(n);
     if (r) return r;
     if (off + len > n->cap) {
-        size_t nc = (off + len) * 2 + 256;
+        size_t nc = off + len;
+        if (nc <= ((size_t)-1 - 256) / 2) nc = nc * 2 + 256;
         uint8_t *d = krealloc(n->data, nc);
         if (!d) return -ENOMEM;
         n->data = d; n->cap = nc;
@@ -182,11 +187,12 @@ static ssize_t pipe_write(struct pipe *p, const void *buf, size_t n) {
 
 /* ---- open files ---- */
 struct file *file_dup(struct file *f) { f->refs++; return f; }
-void file_close(struct file *f) {
-    if (--f->refs > 0) return;
+int file_close(struct file *f) {
+    if (--f->refs > 0) return 0;
+    int r = 0;
     if (f->type == F_NODE && f->node) {
         struct node *n = f->node;
-        if (n->unflushed && !n->unlinked) persist_flush(n);
+        r = persist_flush(n);
         if (--n->refs == 0 && n->unlinked) node_free(n);
     }
     if (f->pipe) {
@@ -195,6 +201,7 @@ void file_close(struct file *f) {
         if (!f->pipe->readers && !f->pipe->writers) kfree(f->pipe);
     }
     kfree(f);
+    return r;
 }
 
 int vfs_open(const char *path, int flags, int mode, struct file **out) {
@@ -216,14 +223,17 @@ int vfs_open(const char *path, int flags, int mode, struct file **out) {
     } else if ((flags & O_CREAT) && (flags & O_EXCL)) return -EEXIST;
     if (S_ISDIR(n->mode) && (flags & O_ACCMODE)) return -EISDIR;
     if (n->readonly && ((flags & O_ACCMODE) || (flags & O_TRUNC))) return -EROFS;
+    struct file *f = kmalloc(sizeof *f);
+    if (!f) {
+        if (created) node_unlink(n);
+        return -ENOMEM;
+    }
     if ((flags & O_TRUNC) && (n->mode & S_IFMT) == S_IFREG) {
         if (n->is_static) { n->data = 0; n->cap = 0; n->is_static = 0; }
         n->lazy = 0;
         n->size = 0;
         persist_touch(n);
     }
-    struct file *f = kmalloc(sizeof *f);
-    if (!f) return -ENOMEM;
     memset(f, 0, sizeof *f);
     f->type = F_NODE; f->refs = 1; f->flags = flags; f->node = n;
     n->refs++;
@@ -329,13 +339,19 @@ int file_getdents(struct file *f, void *buf, size_t n) {
 }
 
 /* ---- initramfs ---- */
-static uint32_t hex8(const char *s) {
+static int hex8(const uint8_t *s, uint32_t *out) {
     uint32_t v = 0;
     for (int i = 0; i < 8; i++) {
         char c = s[i];
-        v = v << 4 | (c >= 'a' ? c - 'a' + 10 : c >= 'A' ? c - 'A' + 10 : c - '0');
+        unsigned digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        else return -1;
+        v = (v << 4) | digit;
     }
-    return v;
+    *out = v;
+    return 0;
 }
 static void mkparents(const char *abs) {
     char tmp[PATH_MAX];
@@ -378,17 +394,17 @@ int node_load(struct node *n) {
 }
 
 struct node *vfs_put_node(const char *abs, uint32_t mode, const uint8_t *data, size_t size) {
-    struct node *n = node_find(abs);
-    if (!n) {
-        mkparents(abs);
-        n = node_create(abs, mode);
-        if (!n) return 0;
-    }
     uint8_t *d = 0;
     if (size) {
         d = kmalloc(size);
         if (!d) return 0;
         memcpy(d, data, size);
+    }
+    struct node *n = node_find(abs);
+    if (!n) {
+        mkparents(abs);
+        n = node_create(abs, mode);
+        if (!n) { kfree(d); return 0; }
     }
     if (!n->is_static) kfree(n->data);
     n->data = d; n->cap = size; n->size = size;
@@ -411,18 +427,31 @@ static void initramfs_shell_link(void) {
     kprintf("vfs: initramfs: /bin/sh was missing, linked to /bin/busybox\n");
 }
 
-void vfs_load_cpio(const void *cpio, size_t size) {
-    const uint8_t *p = cpio, *end = p + size;
+/* Validate the entire embedded archive before making any entry visible. */
+static int cpio_walk(const uint8_t *p, size_t remaining, int install) {
     int count = 0, lost = 0;
-    while (p + 110 <= end && !memcmp(p, "070701", 6)) {
-        uint32_t mode = hex8((const char *)p + 14), fsz = hex8((const char *)p + 54), nsz = hex8((const char *)p + 94);
+    for (;;) {
+        uint32_t mode, fsz, nsz;
+        if (remaining < 110 || memcmp(p, "070701", 6) ||
+            hex8(p + 14, &mode) || hex8(p + 54, &fsz) || hex8(p + 94, &nsz))
+            return -EINVAL;
+        uint64_t header = (110ULL + nsz + 3) & ~3ULL;
+        uint64_t payload = ((uint64_t)fsz + 3) & ~3ULL;
+        if (!nsz || header + payload > remaining) return -EINVAL;
         const char *name = (const char *)p + 110;
-        const uint8_t *data = p + ((110 + nsz + 3) & ~3u);
-        p = data + ((fsz + 3) & ~3u);
-        if (!strcmp(name, "TRAILER!!!")) break;
+        if (name[nsz - 1] || strlen(name) != nsz - 1) return -EINVAL;
+        const uint8_t *data = p + header;
+        p = data + payload;
+        remaining -= header + payload;
+        if (!strcmp(name, "TRAILER!!!")) {
+            if (fsz) return -EINVAL;
+            break;
+        }
         while (name[0] == '.' && name[1] == '/') name += 2;
         while (name[0] == '/') name++;
         if (!name[0] || !strcmp(name, ".")) continue;
+        if (strlen(name) >= PATH_MAX - 1) return -EINVAL;
+        if (!install) continue;
         char abs[PATH_MAX];
         abs[0] = '/'; strlcpy(abs + 1, name, sizeof abs - 1);
         mkparents(abs);
@@ -433,9 +462,16 @@ void vfs_load_cpio(const void *cpio, size_t size) {
         if ((mode & S_IFMT) == S_IFREG || S_ISLNK(mode)) { n->data = (uint8_t *)data; n->size = fsz; n->is_static = 1; }
         count++;
     }
+    if (!install) return 0;
     if (lost) kprintf("vfs: initramfs: %d entries did not fit in the file table\n", lost);
     kprintf("vfs: initramfs: %d entries\n", count);
     initramfs_shell_link();
+    return 0;
+}
+
+void vfs_load_cpio(const void *cpio, size_t size) {
+    if (cpio_walk(cpio, size, 0) || cpio_walk(cpio, size, 1))
+        panic("vfs: malformed embedded initramfs");
 }
 
 void vfs_finish(void) {
@@ -473,19 +509,45 @@ int vfs_rename(const char *from, const char *to) {
         if (S_ISDIR(t->mode) != S_ISDIR(n->mode)) return S_ISDIR(t->mode) ? -EISDIR : -ENOTDIR;
         if (S_ISDIR(t->mode) && !node_is_empty_dir(t)) return -ENOTEMPTY;
     }
-    persist_renamed(from, to);
-    if (t) node_unlink(t);
+    struct rename_path {
+        struct rename_path *next;
+        struct node *node;
+        char *path;
+    } *paths = 0;
+    int r = 0;
+    size_t tl = strlen(to);
     for (int i = 0; i < MAXNODES; i++) {
         struct node *c = nodes[i];
         if (!c || (c != n && !(S_ISDIR(n->mode) && !strncmp(c->path, from, fl) && c->path[fl] == '/'))) continue;
-        char *np = kmalloc(strlen(to) + strlen(c->path) - fl + 1);
-        if (!np) return -ENOMEM;
-        persist_moved(c);
-        strlcpy(np, to, strlen(to) + 1);
-        strlcat(np, c->path + fl, strlen(to) + strlen(c->path) - fl + 1);
-        kfree(c->path); c->path = np;
+        size_t len = tl + strlen(c->path + fl) + 1;
+        if (len > PATH_MAX) { r = -ENAMETOOLONG; break; }
+        struct rename_path *move = kmalloc(sizeof *move);
+        char *path = kmalloc(len);
+        if (!move || !path) {
+            kfree(move); kfree(path);
+            r = -ENOMEM;
+            break;
+        }
+        memcpy(path, to, tl);
+        strlcpy(path + tl, c->path + fl, len - tl);
+        move->node = c; move->path = path;
+        move->next = paths;
+        paths = move;
     }
-    return 0;
+    if (!r && t) node_unlink(t);
+    while (paths) {
+        struct rename_path *move = paths;
+        paths = move->next;
+        if (r) kfree(move->path);
+        else {
+            persist_moved(move->node);
+            kfree(move->node->path);
+            move->node->path = move->path;
+        }
+        kfree(move);
+    }
+    if (!r) persist_renamed(from, to);
+    return r;
 }
 int vfs_symlink(const char *target, const char *abs) {
     if (node_find(abs)) return -EEXIST;

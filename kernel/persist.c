@@ -13,13 +13,15 @@
  *   the compaction target.
  *
  * Header (512 bytes, little endian):
- *   "CHIFLOG1" | gen u64 | fsid u64 | 8 zero bytes | crc32 u32 of the first 32 bytes
+ *   "CHIFLOG2" | gen u64 | fsid u64 | 8 zero bytes | crc32 u32 of the first 32 bytes
  *
  * Record (24-byte header, then path, then data; all little endian):
  *   magic u32 | type u32 | mode u32 | plen u32 | dlen u32 | crc32 u32
  *   crc32 covers the first 20 header bytes, the path and the data.
- *   A record with a bad magic or crc ends the log.  Every append is followed by a zero
- *   magic, so stale bytes after the end are never parsed.
+ *   Records start on sector boundaries. The next record's first sector is cleared
+ *   before writing the body and publishing the first sector of the current record.
+ *   A record with a bad magic or CRC ends the log. CHIFLOG1 packs records without
+ *   alignment and is replayed read-only before migrating to the other slot.
  *
  * Record types:
  *   PUT    path, mode, data : create or replace a whole node (file contents or symlink target)
@@ -50,7 +52,9 @@
 #define PST_SLOT_SECTORS    4096u                       /* 2 MiB per slot */
 #endif
 #define PST_SLOT_BYTES      ((PST_SLOT_SECTORS - 1) * 512u)
-#define PST_HDR_MAGIC       "CHIFLOG1"
+#define PST_HDR_LEGACY      "CHIFLOG1"
+#define PST_HDR_MAGIC       "CHIFLOG2"
+#define PST_SECTOR_BYTES    512u
 #define REC_MAGIC           0xC1F0C0DEu
 #define REC_HDR             24u
 
@@ -59,6 +63,8 @@ enum { REC_PUT = 1, REC_DEL, REC_RENAME, REC_CHMOD };
 static struct {
     int on;               /* log is attached: changes are recorded */
     int replaying;        /* applying the log at boot: do not record */
+    int error;            /* persistence unavailable or replay/tracking failed */
+    int snapshot;         /* recover a failed append or migrate the legacy slot */
     uint64_t region;      /* first device sector of the reserved area */
     uint64_t fsid;
     uint64_t gen;         /* generation of the active slot */
@@ -98,14 +104,15 @@ static int persistable(const char *p) {
 
 /* ---- tombstones: base paths that must not come back on replay ---- */
 
-static void tomb_add(const char *p) {
+static int tomb_add(const char *p) {
     for (struct tomb *t = tombs; t; t = t->next)
-        if (!strcmp(t->path, p)) return;
+        if (!strcmp(t->path, p)) return 0;
     struct tomb *t = kmalloc(sizeof *t);
     char *s = kmalloc(strlen(p) + 1);
-    if (!t || !s) { kfree(t); kfree(s); kprintf("[persist] out of memory: tombstone dropped\n"); return; }
+    if (!t || !s) { kfree(t); kfree(s); return -ENOMEM; }
     strlcpy(s, p, strlen(p) + 1);
     t->path = s; t->next = tombs; tombs = t;
+    return 0;
 }
 
 static void tomb_del(const char *p) {
@@ -122,30 +129,21 @@ static void tomb_del(const char *p) {
 
 static uint64_t slot_lba(int slot) { return P.region + (uint64_t)slot * PST_SLOT_SECTORS; }
 
-/* Write `len` bytes at byte offset `off` from device sector `lba`, keeping the rest of
- * the covering sectors unchanged. */
-static int dev_write(uint64_t lba, uint32_t off, const void *buf, uint32_t len) {
-    uint32_t in = off % 512, nsec = (in + len + 511) / 512;
-    uint8_t *tmp = kmalloc((size_t)nsec * 512);
-    if (!tmp) return -ENOMEM;
-    uint64_t first = lba + off / 512;
-    int r = 0;
-    if (board_blk_read(first, tmp, nsec)) r = -EIO;
-    else {
-        memcpy(tmp + in, buf, len);
-        if (board_blk_write(first, tmp, nsec)) r = -EIO;
-    }
-    kfree(tmp);
-    return r;
+static int clear_sector(uint64_t lba) {
+    uint8_t zero[PST_SECTOR_BYTES] = { 0 };
+    return board_blk_write(lba, zero, 1) ? -EIO : 0;
 }
 
-static int hdr_read(int slot, uint64_t *gen, uint64_t *fsid) {
+static int hdr_read(int slot, uint64_t *gen, uint64_t *fsid, int *nonempty) {
     uint8_t s[512];
-    if (board_blk_read(slot_lba(slot), s, 1)) return 0;
-    if (memcmp(s, PST_HDR_MAGIC, 8) || crc32(0, s, 32) != get32(s + 32)) return 0;
+    if (board_blk_read(slot_lba(slot), s, 1)) return -EIO;
+    for (unsigned i = 0; i < sizeof s; i++)
+        if (s[i]) { *nonempty = 1; break; }
+    int version = !memcmp(s, PST_HDR_MAGIC, 8) ? 2 : !memcmp(s, PST_HDR_LEGACY, 8) ? 1 : 0;
+    if (!version || crc32(0, s, 32) != get32(s + 32)) return 0;
     *gen = get64(s + 8);
     *fsid = get64(s + 16);
-    return 1;
+    return version;
 }
 
 static int hdr_write(int slot, uint64_t gen, uint64_t fsid) {
@@ -155,7 +153,7 @@ static int hdr_write(int slot, uint64_t gen, uint64_t fsid) {
     put64(s + 8, gen);
     put64(s + 16, fsid);
     put32(s + 32, crc32(0, s, 32));
-    return dev_write(slot_lba(slot), 0, s, sizeof s);
+    return board_blk_write(slot_lba(slot), s, 1) ? -EIO : 0;
 }
 
 /* ---- records ---- */
@@ -164,24 +162,32 @@ static int rec_put(int slot, uint32_t *pos, uint32_t type, uint32_t mode,
                    const char *path, const void *data, uint32_t dlen) {
     uint32_t plen = (uint32_t)strlen(path);
     uint64_t total = REC_HDR + (uint64_t)plen + dlen;
-    if ((uint64_t)*pos + total + 4 > PST_SLOT_BYTES) return -ENOSPC;
-    uint8_t *b = kmalloc(total + 4);
+    if ((uint64_t)*pos + total > PST_SLOT_BYTES) return -ENOSPC;
+    uint32_t bytes = ((uint32_t)total + PST_SECTOR_BYTES - 1) & ~(PST_SECTOR_BYTES - 1);
+    uint32_t sectors = bytes / PST_SECTOR_BYTES;
+    uint64_t first = slot_lba(slot) + 1 + *pos / PST_SECTOR_BYTES;
+    uint8_t *b = kmalloc(bytes);
     if (!b) return -ENOMEM;
     put32(b, REC_MAGIC); put32(b + 4, type); put32(b + 8, mode);
     put32(b + 12, plen); put32(b + 16, dlen);
     memcpy(b + REC_HDR, path, plen);
     if (dlen) memcpy(b + REC_HDR + plen, data, dlen);
     put32(b + 20, crc32(crc32(0, b, 20), b + REC_HDR, plen + dlen));
-    memset(b + total, 0, 4);
-    int r = dev_write(slot_lba(slot) + 1, *pos, b, (uint32_t)(total + 4));
+    memset(b + total, 0, bytes - total);
+    int r = 0;
+    if (*pos + bytes < PST_SLOT_BYTES) r = clear_sector(first + sectors);
+    if (!r && sectors > 1 && board_blk_write(first + 1, b + PST_SECTOR_BYTES, sectors - 1))
+        r = -EIO;
+    if (!r && board_blk_write(first, b, 1)) r = -EIO;
     kfree(b);
-    if (!r) *pos += (uint32_t)total;
+    if (!r) *pos += bytes;
     return r;
 }
 
 static int payload(struct node *n, const void **d, uint32_t *len) {
     *d = 0; *len = 0;
     if ((n->mode & S_IFMT) == S_IFREG || S_ISLNK(n->mode)) {
+        if (n->size > PST_SLOT_BYTES) return -ENOSPC;
         if (n->lazy && node_load(n)) return -EIO;
         *d = n->data;
         *len = (uint32_t)n->size;
@@ -201,11 +207,19 @@ static int snap_node(struct node *n, void *c) {
     return rec_put(s->slot, &s->pos, REC_PUT, n->mode, n->path, d, len);
 }
 
+static int mark_flushed(struct node *n, void *ctx) {
+    (void)ctx;
+    n->unflushed = 0;
+    return 0;
+}
+
 /* Copy the live state into the inactive slot and make it the active one. */
 static int compact(void) {
     int t = 1 - P.active;
     struct snap s = { t, 0 };
-    int r = 0;
+    if (P.gen == ~(uint64_t)0) return -ENOSPC;
+    int r = clear_sector(slot_lba(t));
+    if (!r) r = clear_sector(slot_lba(t) + 1);
     for (struct tomb *x = tombs; x && !r; x = x->next)
         r = rec_put(t, &s.pos, REC_DEL, 0, x->path, 0, 0);
     if (!r) r = vfs_each_node(snap_node, &s);
@@ -214,14 +228,18 @@ static int compact(void) {
     P.active = t;
     P.gen++;
     P.end = s.pos;
+    P.snapshot = 0;
+    vfs_each_node(mark_flushed, 0);
     return 0;
 }
 
-/* Append to the active log, compacting first if the slot is full. */
+/* The live tree already includes the change, so a snapshot can commit it directly. */
 static int log_rec(uint32_t type, uint32_t mode, const char *path, const void *data, uint32_t dlen) {
+    if (P.error) return P.error;
+    if (P.snapshot) return compact();
     int r = rec_put(P.active, &P.end, type, mode, path, data, dlen);
-    if (r == -ENOSPC && !compact())
-        r = rec_put(P.active, &P.end, type, mode, path, data, dlen);
+    if (r) P.snapshot = 1;
+    if (r == -ENOSPC) r = compact();
     return r;
 }
 
@@ -242,14 +260,15 @@ static char *dup_n(const uint8_t *s, uint32_t n) {
     return r;
 }
 
-static void apply(uint32_t type, uint32_t mode, const uint8_t *p, uint32_t plen, const uint8_t *d, uint32_t dlen) {
+static int apply(uint32_t type, uint32_t mode, const uint8_t *p, uint32_t plen, const uint8_t *d, uint32_t dlen) {
     char *path = dup_n(p, plen);
-    if (!path) return;
-    if (path[0] == '/' && persistable(path)) {
+    if (!path) return -ENOMEM;
+    int r = 0;
+    if (persistable(path)) {
         switch (type) {
         case REC_PUT:
-            if (!vfs_put_node(path, mode, d, dlen)) kprintf("[persist] replay: cannot restore %s\n", path);
-            tomb_del(path);
+            if (!vfs_put_node(path, mode, d, dlen)) r = -ENOMEM;
+            else tomb_del(path);
             break;
         case REC_DEL: {
             struct node *n = node_find(path);
@@ -259,32 +278,48 @@ static void apply(uint32_t type, uint32_t mode, const uint8_t *p, uint32_t plen,
         }
         case REC_RENAME: {
             char *to = dup_n(d, dlen);
-            if (to) { vfs_rename(path, to); kfree(to); }
+            if (!to) r = -ENOMEM;
+            else { r = vfs_rename(path, to); kfree(to); }
             break;
         }
         case REC_CHMOD: {
             struct node *n = node_find(path);
             if (n) { n->mode = (n->mode & S_IFMT) | (mode & 07777); n->base = 0; }
+            else r = -ENOENT;
             break;
         }
         }
     }
     kfree(path);
+    return r;
 }
 
 /* Parse records from the start of the slot's record area.  Returns the end offset. */
-static uint32_t replay_buf(const uint8_t *d, uint32_t len, uint32_t *count) {
+static uint32_t replay_buf(const uint8_t *d, uint32_t len, int version, uint32_t *count) {
     uint32_t pos = 0;
     *count = 0;
     while ((uint64_t)pos + REC_HDR <= len) {
-        if (get32(d + pos) != REC_MAGIC) break;
+        uint32_t magic = get32(d + pos);
+        if (!magic) break;
+        if (magic != REC_MAGIC) { P.snapshot = 1; break; }
         uint32_t type = get32(d + pos + 4), mode = get32(d + pos + 8);
         uint32_t plen = get32(d + pos + 12), dlen = get32(d + pos + 16), crc = get32(d + pos + 20);
-        if ((uint64_t)pos + REC_HDR + plen + dlen > len) break;
+        if ((uint64_t)pos + REC_HDR + plen + dlen > len) { P.snapshot = 1; break; }
         const uint8_t *body = d + pos + REC_HDR;
-        if (crc32(crc32(0, d + pos, 20), body, plen + dlen) != crc) break;
-        apply(type, mode, body, plen, body + plen, dlen);
-        pos += REC_HDR + plen + dlen;
+        if (crc32(crc32(0, d + pos, 20), body, plen + dlen) != crc) {
+            P.snapshot = 1;
+            break;
+        }
+        if (!plen || plen >= PATH_MAX || type < REC_PUT || type > REC_CHMOD ||
+            (type == REC_RENAME && (!dlen || dlen >= PATH_MAX)) ||
+            ((type == REC_DEL || type == REC_CHMOD) && dlen) ||
+            apply(type, mode, body, plen, body + plen, dlen) || P.error) {
+            P.error = -EIO;
+            break;
+        }
+        uint32_t bytes = REC_HDR + plen + dlen;
+        if (version == 2) bytes = (bytes + PST_SECTOR_BYTES - 1) & ~(PST_SECTOR_BYTES - 1);
+        pos += bytes;
         (*count)++;
     }
     return pos;
@@ -296,6 +331,7 @@ static void disable(const char *why) {
     kprintf("[persist] disabled: %s\n", why);
     P.on = 0;
     P.replaying = 0;
+    P.error = -EIO;
 }
 
 static int attach(uint64_t fs_end, uint64_t fsid) {
@@ -308,11 +344,12 @@ static int attach(uint64_t fs_end, uint64_t fsid) {
     P.fsid = fsid;
 
     uint64_t gen[2] = { 0, 0 };
-    int valid[2] = { 0, 0 }, best = -1;
+    int valid[2] = { 0, 0 }, best = -1, nonempty = 0;
     for (int s = 0; s < 2; s++) {
         uint64_t id = 0;
-        if (!hdr_read(s, &gen[s], &id)) continue;
-        valid[s] = 1;
+        valid[s] = hdr_read(s, &gen[s], &id, &nonempty);
+        if (valid[s] < 0) { disable("cannot read a log header"); return -1; }
+        if (!valid[s]) continue;
         if (id == fsid && (best < 0 || gen[s] > gen[best])) best = s;
     }
 
@@ -321,7 +358,11 @@ static int attach(uint64_t fs_end, uint64_t fsid) {
             disable("the log on this disk belongs to another filesystem (rebuild with make to reset it)");
             return -1;
         }
-        if (hdr_write(0, 1, fsid)) { disable("cannot write the log header"); return -1; }
+        if (nonempty) { disable("both log headers are invalid"); return -1; }
+        if (clear_sector(slot_lba(0) + 1) || hdr_write(0, 1, fsid)) {
+            disable("cannot initialize the log");
+            return -1;
+        }
         P.active = 0; P.gen = 1; P.end = 0; P.on = 1;
         kprintf("[persist] new log on disk\n");
         return 0;
@@ -338,9 +379,12 @@ static int attach(uint64_t fs_end, uint64_t fsid) {
         return -1;
     }
     uint32_t count;
-    P.end = replay_buf(buf, PST_SLOT_BYTES, &count);
+    P.end = replay_buf(buf, PST_SLOT_BYTES, valid[best], &count);
     kfree(buf);
     P.replaying = 0;
+    if (P.error) { disable("cannot replay the complete log"); return -1; }
+    if (board_blk_write(P.region, 0, 0)) { disable("cannot flush the log device"); return -1; }
+    P.snapshot |= valid[best] == 1;
     kprintf("[persist] log gen %lu: %u records replayed, %u bytes used\n",
             (unsigned long)P.gen, count, P.end);
     return 0;
@@ -361,23 +405,22 @@ void persist_touch(struct node *n) {
 }
 
 void persist_node_created(struct node *n) {
-    if (!P.on || P.replaying) return;
-    n->base = 0;
-    tomb_del(n->path);
-    if (!persistable(n->path) || n->dev) return;
-    if (log_node(n)) kprintf("[persist] cannot record creation of %s\n", n->path);
-    n->unflushed = 0;
+    if (P.replaying || !persistable(n->path) || n->dev) return;
+    persist_touch(n);
+    if (P.on && persist_flush(n)) kprintf("[persist] cannot record creation of %s\n", n->path);
 }
 
 void persist_deleted(const char *abs) {
     if (!P.on || !persistable(abs)) return;
-    tomb_add(abs);
+    int r = tomb_add(abs);
+    if (r) { P.error = r; kprintf("[persist] cannot track removal of %s\n", abs); return; }
     if (!P.replaying && log_rec(REC_DEL, 0, abs, 0, 0)) kprintf("[persist] cannot record removal of %s\n", abs);
 }
 
 void persist_renamed(const char *from, const char *to) {
     if (!P.on || P.replaying) return;
     if (!persistable(from) && !persistable(to)) return;
+    if (!persistable(from) || !persistable(to)) P.snapshot = 1;
     if (log_rec(REC_RENAME, 0, from, to, (uint32_t)strlen(to)))
         kprintf("[persist] cannot record rename of %s\n", from);
 }
@@ -385,23 +428,31 @@ void persist_renamed(const char *from, const char *to) {
 /* Called for each node about to change its path (rename).  The old path must not come back. */
 void persist_moved(struct node *n) {
     if (!P.on) return;
-    if (persistable(n->path)) tomb_add(n->path);
+    if (persistable(n->path)) {
+        int r = tomb_add(n->path);
+        if (r) { P.error = r; kprintf("[persist] cannot track move of %s\n", n->path); }
+    }
     n->base = 0;
 }
 
 void persist_chmod(struct node *n) {
-    if (!P.on) return;
+    if (!persistable(n->path) || n->dev) return;
     n->base = 0;
-    if (!P.replaying && persistable(n->path) && log_rec(REC_CHMOD, n->mode & 07777, n->path, 0, 0))
+    if (P.on && !P.replaying && log_rec(REC_CHMOD, n->mode & 07777, n->path, 0, 0))
         kprintf("[persist] cannot record chmod of %s\n", n->path);
 }
 
 int persist_flush(struct node *n) {
-    if (!P.on || P.replaying || !n->unflushed) return 0;
-    if (n->unlinked || n->dev || !persistable(n->path)) { n->unflushed = 0; return 0; }
-    if (log_node(n)) {
+    if (P.replaying || n->unlinked || n->dev ||
+        (!persistable(n->path) && strcmp(n->path, "/"))) return 0;
+    if (P.error) return P.error;
+    if (!P.on) return 0;
+    if (P.snapshot) return compact();
+    if (!n->unflushed || !persistable(n->path)) return 0;
+    int r = log_node(n);
+    if (r) {
         kprintf("[persist] cannot save %s\n", n->path);
-        return -EIO;
+        return r;
     }
     n->unflushed = 0;
     tomb_del(n->path);
@@ -409,15 +460,12 @@ int persist_flush(struct node *n) {
 }
 
 static int sync_one(struct node *n, void *c) {
-    if (n->unflushed && !n->unlinked) {
-        int r = persist_flush(n);
-        if (r) *(int *)c = r;
-    }
-    return 0;
+    (void)c;
+    return n->unflushed ? persist_flush(n) : 0;
 }
 
 int persist_sync_all(void) {
-    int err = 0;
-    if (P.on) vfs_each_node(sync_one, &err);
-    return err;
+    if (P.error) return P.error;
+    if (P.snapshot) return compact();
+    return P.on ? vfs_each_node(sync_one, 0) : 0;
 }

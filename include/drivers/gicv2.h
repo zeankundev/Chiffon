@@ -21,6 +21,9 @@ static inline void gicv2_cpu_init(uintptr_t dist, uintptr_t cpu, unsigned timer_
     c[1] = 0xFF;                                                 /* PMR */
     c[0] = 1;                                                    /* CTLR */
 }
-static inline void gicv2_sgi(uintptr_t dist, unsigned target_cpu, unsigned sgi) {
-    gic_regs(dist)[0xF00 / 4] = (1u << (16 + target_cpu)) | sgi; /* SGIR: target list filter 0 */
+static inline uint32_t gicv2_cpu_target(uintptr_t dist) {
+    return gic_regs(dist)[0x800 / 4] & 0xffu;                    /* banked ITARGETSR0 */
+}
+static inline void gicv2_sgi(uintptr_t dist, uint32_t target, unsigned sgi) {
+    gic_regs(dist)[0xF00 / 4] = (target << 16) | sgi;           /* SGIR: target list filter 0 */
 }

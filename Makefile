@@ -77,11 +77,11 @@ ifneq ($(RAMCAP),)
 endif
 CFLAGS += $(PROFILE_FLAGS)
 CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -ffreestanding -fno-builtin \
-          -fno-pic -fno-pie -fno-stack-protector \
+          -fno-pic -fno-pie -fstack-protector-strong \
           $(shell $(CC) -fno-tree-loop-distribute-patterns -E -x c /dev/null -o /dev/null 2>/dev/null && echo -fno-tree-loop-distribute-patterns) \
           -fno-asynchronous-unwind-tables -mgeneral-regs-only -Iinclude -Iarch/$(ARCH) -I$(BOARD_DIR) $(PROFILE_FLAGS)
 ifeq ($(ARCH),x86_64)
-  CFLAGS += -mno-red-zone -mcmodel=kernel
+  CFLAGS += -mno-red-zone -mcmodel=kernel -mstack-protector-guard=global
   KEXT := bin
 else
   CFLAGS += -mcmodel=small -mstrict-align -DBOOT_DEVICE_GB_MASK=$(BOOT_DEVICE_GB_MASK) \
@@ -142,8 +142,14 @@ $(B)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DINITRD_FILE='"$(abspath $(B)/initramfs.cpio)"' -c $< -o $@
 $(B)/kernel/initrd.o: $(B)/initramfs.cpio
+ifneq ($(filter $(B)/userland/drvloader,$(USER_BIN)),)
+ifneq ($(filter $(B)/userland/fbserver,$(USER_BIN)),)
+$(B)/kernel/initrd.o: CFLAGS += -DDRIVER_LOADER_FILE='"$(abspath $(B)/userland/drvloader)"' -DFB_SERVER_FILE='"$(abspath $(B)/userland/fbserver)"'
+$(B)/kernel/initrd.o: $(B)/userland/drvloader $(B)/userland/fbserver
+endif
+endif
 
-$(B)/userland/%: $(ENVDIR)/src/%.c userland/libchiffon.h
+$(B)/userland/%: $(ENVDIR)/src/%.c userland/libchiffon.h include/uapi/chiffon_abi.h
 	@mkdir -p $(dir $@)
 	$(UCC) $(UCFLAGS) -o $@ $<
 

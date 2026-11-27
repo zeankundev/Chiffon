@@ -167,15 +167,17 @@ long ipc_syscall(long nr, long a0, long a1, long a2) {
         memcpy(&m, (void *)a1, sizeof m);
         return ipc_send_k(a0, &m, (int)a2);
     case CSYS_ipc_recv:
-        if (!uok(a1, sizeof m)) return -EFAULT;
+        if (!uwok(a1, sizeof m)) return -EFAULT;
         if ((r = ipc_recv_k(a0, &m, (int)a2))) return r;
+        if (!uwok(a1, sizeof m)) return -EFAULT;
         memcpy((void *)a1, &m, sizeof m);
         return 0;
     case CSYS_ipc_call: {
         struct chi_ipc_msg rep;
-        if (!uok(a1, sizeof m) || !uok(a2, sizeof rep)) return -EFAULT;
+        if (!uok(a1, sizeof m) || !uwok(a2, sizeof rep)) return -EFAULT;
         memcpy(&m, (void *)a1, sizeof m);
         if ((r = ipc_call_k(a0, &m, &rep))) return r;
+        if (!uwok(a2, sizeof rep)) return -EFAULT;
         memcpy((void *)a2, &rep, sizeof rep);
         return 0; }
     case CSYS_ipc_reply:

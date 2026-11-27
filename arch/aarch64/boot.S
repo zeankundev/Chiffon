@@ -132,6 +132,10 @@ boot_stack_top:
     .section .text.boot, "ax"
     .globl secondary_start
 secondary_start:
+    msr  daifset, #0xf
+    cbz  x0, .Lsecondary_park
+    cmp  x0, #MAX_CPUS
+    b.hs .Lsecondary_park
     mov  x19, x0
     mov  x1, #(3 << 20)
     msr  cpacr_el1, x1
@@ -173,8 +177,9 @@ secondary_high:
     mov  x29, xzr
     mov  x0, x19
     bl   secondary_main
-1:  wfi
-    b    1b
+.Lsecondary_park:
+    wfi
+    b    .Lsecondary_park
 
     .bss
     .balign 16

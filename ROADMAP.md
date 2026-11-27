@@ -4,7 +4,7 @@ This is a readiness checklist, not a feature wish list. Chiffon is **not product
 
 ## Current baseline
 
-The repository describes Chiffon as a Unix-like hybrid kernel for AArch64 and x86_64. Current project notes report IPC, user-space framebuffer service crash handling, read-only ext filesystem access, and a write-ahead persistence log. The kernel now has a global big kernel lock, per-CPU state, AArch64 PSCI startup, and an experimental opt-in x86 SMP path. These features do **not** establish full SMP safety or production security. The supplied project audit reports single-CPU process verification, while `PLAN.md` predates these additions and should be reconciled with measured results.
+The repository describes Chiffon as a Unix-like hybrid kernel for AArch64 and x86_64. Current project notes report IPC, user-space framebuffer service crash handling, read-only ext filesystem access, and a write-ahead persistence log. The kernel now has a global big kernel lock, per-CPU state, AArch64 PSCI startup, and x86_64 boot-CPU-only execution. These features do **not** establish full SMP safety or production security. The supplied project audit reports single-CPU process verification, with current verification pending. See [CPU startup](docs/SMP.md), [the threat model](docs/THREAT_MODEL.md), [device trust](docs/DMA.md), [page permissions](docs/PAGE_PROTECTION.md), and [persistence semantics](docs/STORAGE_DURABILITY.md) for source-level changes and outstanding checks.
 
 ## P0 — Required before any production claim
 

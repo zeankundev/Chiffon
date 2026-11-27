@@ -11,8 +11,6 @@ The only permitted compile verification is exactly `make ENV=milkos BUSYBOX=$HOM
 
 Only I may directly verify runtime or behavior. When needed, stop and instruct me with precise steps and the expected observable result, then wait for my report before calling the behavior verified or marking the feature complete. The compile result is only a build check. If no human runtime check applies, explicitly say so. Do not claim verification that has not happened.
 
-Keep Chiffon's hybrid-kernel architecture and relevant aarch64/x86_64 behavior in view. Begin by reporting your short plan and proposed worker task split, then proceed with the implementation and integration. After implementation, report the build status and any required human verification. Once all required human checks are reported, provide a concise changelog-ready list of what is new. The feature request is:
-
-<PASTE FEATURE REQUEST HERE>
+Keep Chiffon's hybrid-kernel architecture and relevant aarch64/x86_64 behavior in view. Begin by reporting your short plan and proposed worker task split, then proceed with the implementation and integration. After implementation, report the build status and any required human verification. Once all required human checks are reported, provide a concise changelog-ready list of what is new. The feature request are attached in @ROADMAP.md. The feature is complete when all acceptance criteria are met, the build passes, and all required human checks are reported.
 ```
 

@@ -50,7 +50,7 @@ struct chi_netinfo {
 
 #define CHI_CAP_MMIO     1      /* MMIO physical mapping */
 #define CHI_CAP_IRQ      2      /* Hardware IRQ binding */
-#define CHI_CAP_DRIVER   4      /* Register / supersede driver IPC services */
+#define CHI_CAP_DRIVER   4      /* Register the framebuffer IPC service */
 #define CHI_CAP_LOADER   8      /* Grant capabilities to other processes */
 
 #define DEV_TYPE_FB      1      /* Primary framebuffer */

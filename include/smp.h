@@ -24,7 +24,7 @@ struct cpu {
     int idle;                             /* parked waiting for work: an IPI wakes it */
 };
 extern struct cpu cpus[MAX_CPUS];
-extern int ncpus;                         /* the boot CPU plus every secondary CPU that was started */
+extern int ncpus;                         /* online CPU count; read and update under the kernel lock */
 struct cpu *this_cpu(void);
 #define cur (this_cpu()->proc)            /* the process running on this CPU */
 
@@ -36,6 +36,6 @@ void smp_init(void);                      /* boot CPU: start the secondary CPUs 
 void secondary_main(uint64_t id) __attribute__((noreturn));   /* entered from boot.S */
 
 /* board hooks (weak defaults in smp.c; a board opts in by providing them) */
-int  board_smp_start(uintptr_t entry_pa); /* start secondaries at entry_pa; returns how many started */
+int  board_smp_start(uintptr_t entry_pa); /* request secondary startup; returns accepted requests */
 void board_secondary_init(int id);        /* per-CPU interrupt controller and timer setup */
 void board_ipi_send(int cpu);

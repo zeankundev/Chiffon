@@ -20,6 +20,11 @@ mb_header:
     .globl _start
 _start:
     cli
+    cmp $0x2badb002, %eax
+    je 9f
+8:  hlt
+    jmp 8b
+9:
     mov $boot_stack_top, %esp
     mov %ebx, mbi_saved
 

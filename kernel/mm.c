@@ -1,13 +1,5 @@
 #include "kernel.h"
 
-/* Physical frame allocator.  One bit per 4 KiB frame of the usable RAM range, indexed from the
- * first usable frame (not from physical address 0), so a 1 MiB machine at 0x40000000 needs a
- * 32-byte bitmap instead of a 128 KiB one.  CHI_MAXFRAMES is the largest range supported; the
- * default (4 GiB) keeps the old behaviour.  PROFILE=tiny sets it to 4 MiB. */
-#ifndef CHI_MAXFRAMES
-#define CHI_MAXFRAMES (1u << 20)
-#endif
-#define MAXFRAMES CHI_MAXFRAMES
 /* Physical frame allocator.  Usable RAM is a list of ranges: the primary range given to pmm_init()
  * and any number added with pmm_add_range() (external RAM such as PSRAM, or a second memory node).
  * Every frame of every range has one bit in one global bitmap, so the allocator treats them alike.
@@ -17,7 +9,7 @@
 #endif
 #define MAXFRAMES CHI_MAXFRAMES
 #define MAXPRANGES 8
-static uint32_t bm[MAXFRAMES / 32];
+static uint32_t bm[(MAXFRAMES + 31) / 32];
 struct prange { uintptr_t base; size_t first, n; };
 static struct prange pr[MAXPRANGES];
 static int npr;
@@ -41,11 +33,28 @@ static long frame_index(uintptr_t pa) {
 
 /* Add a range of RAM (page-aligned by this call).  Returns the number of frames added. */
 size_t pmm_add_range(uintptr_t start, uintptr_t end) {
+    if (start == 0 || end <= start || start > UINTPTR_MAX - (PAGE_SIZE - 1)) {
+        kprintf("mem: rejecting invalid PMM range %lx..%lx\n", start, end);
+        return 0;
+    }
     start = (start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     end &= ~(PAGE_SIZE - 1);
-    if (end <= start || npr == MAXPRANGES) return 0;
+    if (end <= start) return 0;
+    for (int r = 0; r < npr; r++)
+        if (start < pr[r].base + pr[r].n * PAGE_SIZE && pr[r].base < end) {
+            kprintf("mem: rejecting overlapping PMM range %lx..%lx\n", start, end);
+            return 0;
+        }
+    if (npr == MAXPRANGES) {
+        kprintf("mem: PMM range capacity reached, ignoring %lx..%lx\n", start, end);
+        return 0;
+    }
     size_t n = (end - start) / PAGE_SIZE;
-    if (n > MAXFRAMES - nframes) n = MAXFRAMES - nframes;
+    if (n > MAXFRAMES - nframes) {
+        kprintf("mem: PMM frame capacity reached, ignoring %lu frames at %lx\n",
+                (unsigned long)(n - (MAXFRAMES - nframes)), start + (MAXFRAMES - nframes) * PAGE_SIZE);
+        n = MAXFRAMES - nframes;
+    }
     if (!n) return 0;
     pr[npr].base = start; pr[npr].first = nframes; pr[npr].n = n; npr++;
     for (size_t i = nframes; i < nframes + n; i++) { bclr(i); freec++; totalc++; }
@@ -53,7 +62,7 @@ size_t pmm_add_range(uintptr_t start, uintptr_t end) {
     return n;
 }
 void pmm_init(uintptr_t start, uintptr_t end) {
-    for (size_t i = 0; i < MAXFRAMES / 32; i++) bm[i] = ~0u;
+    for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) bm[i] = ~0u;
     npr = 0; nframes = 0; freec = 0; totalc = 0; hint = 0;
     pmm_add_range(start, end);
 }
@@ -70,6 +79,7 @@ uintptr_t pmm_alloc(void) {
     return 0;
 }
 void pmm_free(uintptr_t pa) {
+    if (pa & (PAGE_SIZE - 1)) return;
     long i = frame_index(pa);
     if (i >= 0 && btst((size_t)i)) { bclr((size_t)i); freec++; }
 }
@@ -93,14 +103,40 @@ void heap_add_region(void *base, size_t size) {
 }
 void heap_init(void *base, size_t size) { nhreg = 0; heap_add_region(base, size); }
 
+static struct hdr *heap_block(uint8_t *p, uint8_t *end) {
+    struct hdr *h = (struct hdr *)p;
+    size_t left = (size_t)(end - p);
+    if (left < sizeof *h || h->free > 1 || h->size > left - sizeof *h ||
+        (h->size < left - sizeof *h && (h->size & 15)))
+        panic("heap: invalid block metadata");
+    return h;
+}
+
+static struct hdr *heap_allocation(void *ptr, int *region) {
+    for (int r = 0; r < nhreg; r++) {
+        if ((uintptr_t)ptr < (uintptr_t)hreg[r].s || (uintptr_t)ptr >= (uintptr_t)hreg[r].e)
+            continue;
+        for (uint8_t *p = hreg[r].s; p < hreg[r].e;) {
+            struct hdr *h = heap_block(p, hreg[r].e);
+            if (h + 1 == ptr && !h->free) {
+                *region = r;
+                return h;
+            }
+            p += sizeof *h + h->size;
+        }
+    }
+    panic("heap: invalid or already freed allocation");
+}
+
 void *kmalloc(size_t n) {
+    if (n > (size_t)-1 - 15) return 0;
     n = (n + 15) & ~15UL;
     if (!n) n = 16;
     for (int r = 0; r < nhreg; r++)
         for (uint8_t *p = hreg[r].s; p < hreg[r].e; p += sizeof(struct hdr) + ((struct hdr *)p)->size) {
-            struct hdr *h = (struct hdr *)p;
+            struct hdr *h = heap_block(p, hreg[r].e);
             if (!h->free || h->size < n) continue;
-            if (h->size >= n + sizeof *h + 32) {
+            if (h->size - n >= sizeof *h + 32) {
                 struct hdr *nb = (struct hdr *)(p + sizeof *h + n);
                 nb->size = h->size - n - sizeof *h; nb->free = 1;
                 h->size = n;
@@ -112,22 +148,21 @@ void *kmalloc(size_t n) {
 }
 void kfree(void *ptr) {
     if (!ptr) return;
-    uint8_t *q = (uint8_t *)ptr - sizeof(struct hdr);
-    ((struct hdr *)q)->free = 1;
-    for (int r = 0; r < nhreg; r++) {
-        if (q < hreg[r].s || q >= hreg[r].e) continue;
-        for (uint8_t *p = hreg[r].s; p < hreg[r].e;) {
-            struct hdr *h = (struct hdr *)p;
-            uint8_t *nx = p + sizeof *h + h->size;
-            if (h->free && nx < hreg[r].e && ((struct hdr *)nx)->free) h->size += sizeof *h + ((struct hdr *)nx)->size;
-            else p = nx;
-        }
-        return;
+    int r;
+    struct hdr *allocation = heap_allocation(ptr, &r);
+    allocation->free = 1;
+    for (uint8_t *p = hreg[r].s; p < hreg[r].e;) {
+        struct hdr *h = heap_block(p, hreg[r].e);
+        uint8_t *nx = p + sizeof *h + h->size;
+        if (h->free && nx < hreg[r].e && heap_block(nx, hreg[r].e)->free)
+            h->size += sizeof *h + ((struct hdr *)nx)->size;
+        else p = nx;
     }
 }
 void *krealloc(void *ptr, size_t n) {
     if (!ptr) return kmalloc(n);
-    size_t old = ((struct hdr *)((uint8_t *)ptr - sizeof(struct hdr)))->size;
+    int region;
+    size_t old = heap_allocation(ptr, &region)->size;
     if (old >= n) return ptr;
     void *q = kmalloc(n);
     if (!q) return 0;

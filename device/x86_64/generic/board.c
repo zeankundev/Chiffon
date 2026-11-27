@@ -6,6 +6,7 @@
 #define BOARD_NAME "generic"
 #endif
 #include "kernel.h"
+#include "bootmem.h"
 #include "drivers/ns16550_io.h"
 #include "drivers/pic_pit.h"
 #include "drivers/ata_pio.h"
@@ -15,26 +16,112 @@
 #endif
 
 #define COM1 0x3F8
-static uintptr_t ram_end;
+static struct bootmem memory;
 static char cmdline_buf[256];
 static int com1_ok;                              /* a serial port answered at COM1; output is optional */
+
+static const void *mb_pointer(uintptr_t start, size_t size) {
+    if (!start || start >= BOOTMEM_LIMIT || size > BOOTMEM_LIMIT - start)
+        panic("mem: invalid Multiboot data at %lx", start);
+    return P2V(start);
+}
+
+static void mb_reserve(uintptr_t start, size_t size) {
+    if (!size) return;
+    mb_pointer(start, size);
+    bootmem_add(memory.reserved, &memory.nreserved, start, size);
+}
+
+static const char *mb_string(uintptr_t start) {
+    const char *s = mb_pointer(start, 1);
+    size_t limit = BOOTMEM_LIMIT - start;
+    if (limit > 4096) limit = 4096;
+    for (size_t i = 0; i < limit; i++) {
+        if (!s[i]) {
+            mb_reserve(start, i + 1);
+            return s;
+        }
+    }
+    panic("mem: unterminated Multiboot string at %lx", start);
+}
+
+static void mb_memory_map(uintptr_t start, size_t size) {
+    if (!size) panic("mem: empty Multiboot memory map");
+    const uint8_t *p = mb_pointer(start, size);
+    mb_reserve(start, size);
+    while (size) {
+        uint32_t length, type;
+        uint64_t base, bytes;
+        if (size < sizeof length) panic("mem: truncated Multiboot memory map");
+        memcpy(&length, p, sizeof length);
+        if (length < 20 || length > size - sizeof length)
+            panic("mem: invalid Multiboot memory record length");
+        memcpy(&base, p + 4, sizeof base);
+        memcpy(&bytes, p + 12, sizeof bytes);
+        memcpy(&type, p + 20, sizeof type);
+        if (type == 1)
+            bootmem_add(memory.ram, &memory.nram, base, bytes);
+        else
+            bootmem_add(memory.reserved, &memory.nreserved, base, bytes);
+        p += sizeof length + length;
+        size -= sizeof length + length;
+    }
+}
 
 void board_early_init(uintptr_t mbi) {
     com1_ok = ns16550_io_probe(COM1);
     if (com1_ok) ns16550_io_init(COM1);
-    uint32_t *m = P2V(mbi);                          /* multiboot info: flags, mem_lower, mem_upper, ..., cmdline@16 */
-    uint64_t upper_kb = (m[0] & 1) ? m[2] : 64 * 1024;
-    ram_end = 0x100000 + upper_kb * 1024;
-    if (ram_end > 0xC0000000UL) ram_end = 0xC0000000UL;           /* stay below the PCI hole */
-    mb_fb_boot_info(m);                              /* framebuffer from the bootloader, if any */
-    if (m[0] & 4) {
-        const char *c = P2V(m[4]);
-        size_t i = 0;
-        while (c[i] && i < sizeof cmdline_buf - 1) { cmdline_buf[i] = c[i]; i++; }
-        cmdline_buf[i] = 0;
+
+    if (mbi & 3) panic("mem: unaligned Multiboot information");
+    const uint32_t *m = mb_pointer(mbi, 88);
+    uint32_t flags = m[0];
+    mb_reserve(mbi, flags & (1u << 12) ? 116 : 88);
+    bootmem_add(memory.reserved, &memory.nreserved, 0, arch_kernel_end());
+    if (flags & (1u << 6)) {
+        mb_memory_map(m[12], m[11]);
+    } else if (flags & 1u) {
+        kprintf("mem: no Multiboot map, using reported contiguous upper memory\n");
+        bootmem_add(memory.ram, &memory.nram, 0x100000, (uintptr_t)m[2] * 1024);
+    } else {
+        panic("mem: no Multiboot memory information");
     }
+    if (flags & (1u << 2))
+        strlcpy(cmdline_buf, mb_string(m[4]), sizeof cmdline_buf);
+    if (flags & (1u << 3) && m[5]) {
+        if (m[6] & 3) panic("mem: unaligned Multiboot module table");
+        const uint32_t *mods = mb_pointer(m[6], (size_t)m[5] * 16);
+        mb_reserve(m[6], (size_t)m[5] * 16);
+        for (uint32_t i = 0; i < m[5]; i++, mods += 4) {
+            if (mods[1] < mods[0]) panic("mem: invalid Multiboot module range");
+            mb_reserve(mods[0], mods[1] - mods[0]);
+            if (mods[2]) mb_string(mods[2]);
+        }
+    }
+    if ((flags & (3u << 4)) == (3u << 4)) panic("mem: conflicting Multiboot symbol tables");
+    if (flags & (1u << 4)) mb_reserve(m[9], (size_t)m[7] + m[8]);
+    if (flags & (1u << 5)) mb_reserve(m[9], (size_t)m[7] * m[8]);
+    if (flags & (1u << 7)) mb_reserve(m[14], m[13]);               /* BIOS drive table */
+    if (flags & (1u << 8)) {
+        uint16_t length;
+        memcpy(&length, mb_pointer(m[15], sizeof length), sizeof length);
+        mb_reserve(m[15], sizeof length + length);               /* BIOS configuration table */
+    }
+    if (flags & (1u << 9)) mb_string(m[16]);                     /* bootloader name */
+    if (flags & (1u << 10)) mb_reserve(m[17], 20);                /* APM table */
+    if (flags & (1u << 11)) {
+        mb_reserve(m[18], 512);                                  /* VBE controller info */
+        mb_reserve(m[19], 256);                                  /* VBE mode info */
+    }
+    if (flags & (1u << 12)) {
+        uint64_t base;
+        memcpy(&base, (const uint8_t *)m + 88, sizeof base);
+        bootmem_add(memory.reserved, &memory.nreserved, base, (uint64_t)m[24] * m[26]);
+        mb_fb_boot_info(m);
+    }
+    bootmem_prepare(&memory, 0xC0000000UL);                       /* leave the PCI hole unused */
 }
-void board_mem_range(uintptr_t *s, uintptr_t *e) { *s = (arch_kernel_end() + 0xFFFF) & ~0xFFFFUL; *e = ram_end; }
+void board_mem_range(uintptr_t *s, uintptr_t *e) { bootmem_get(&memory, 0, s, e); }
+int board_mem_extra(int i, uintptr_t *s, uintptr_t *e) { return bootmem_get(&memory, i + 1, s, e); }
 const char *board_cmdline(void) { return cmdline_buf; }
 void board_console_putc(int c) { if (com1_ok) ns16550_io_putc(COM1, c); }
 int board_console_getc(void) { return com1_ok ? ns16550_io_getc(COM1) : -1; }

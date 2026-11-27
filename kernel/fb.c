@@ -152,7 +152,7 @@ long fb_ioctl(unsigned long cmd, uintptr_t arg) {
     struct fb_info *i = &primary->info;
     switch (cmd) {
     case CHI_FBIOGET_VSCREENINFO: {
-        if (!uok(arg, sizeof(struct chi_fb_var_screeninfo))) return -EFAULT;
+        if (!uwok(arg, sizeof(struct chi_fb_var_screeninfo))) return -EFAULT;
         struct chi_fb_var_screeninfo v; fill_var(&v);
         memcpy((void *)arg, &v, sizeof v);
         return 0; }
@@ -162,12 +162,12 @@ long fb_ioctl(unsigned long cmd, uintptr_t arg) {
         struct chi_fb_var_screeninfo v; memcpy(&v, (void *)arg, sizeof v);
         if (cmd == CHI_FBIOPUT_VSCREENINFO && (v.xres != i->width || v.yres != i->height || v.bits_per_pixel != i->bpp)) return -EINVAL;
         if (v.xoffset == i->xoff && v.yoffset == i->yoff) return 0;
-        if (!primary->pan || v.xoffset != 0 || v.yoffset + i->height > i->vheight) return -EINVAL;
+        if (!primary->pan || v.xoffset != 0 || i->height > i->vheight || v.yoffset > i->vheight - i->height) return -EINVAL;
         if (primary->pan(primary, v.xoffset, v.yoffset)) return -EIO;
         i->xoff = v.xoffset; i->yoff = v.yoffset;
         return 0; }
     case CHI_FBIOGET_FSCREENINFO: {
-        if (!uok(arg, sizeof(struct chi_fb_fix_screeninfo))) return -EFAULT;
+        if (!uwok(arg, sizeof(struct chi_fb_fix_screeninfo))) return -EFAULT;
         struct chi_fb_fix_screeninfo f; memset(&f, 0, sizeof f);
         strlcpy(f.id, primary->name, sizeof f.id);
         f.smem_start = i->phys; f.smem_len = i->size; f.type = 0; f.visual = 2;       /* PACKED_PIXELS, TRUECOLOR */

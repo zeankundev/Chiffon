@@ -66,8 +66,8 @@ static void net_pause(void) {
     else yield();
 }
 static void net_poll(void) { if (dev) dev->poll(); }
-static void net_lock(void) { while (busy) net_pause(); busy = 1; }
-static void net_unlock(void) { busy = 0; }
+static void net_lock(void) { while (busy) sleep_on(&busy); busy = 1; }
+static void net_unlock(void) { busy = 0; wakeup(&busy); }
 
 static void net_select(int idx);
 static int link_state(const struct netdev *d) { return d->link ? d->link() : 1; }
@@ -497,6 +497,9 @@ static long tcp_send(struct tconn *c, const uint8_t *buf, size_t n) {
     while (done < n) {
         if (c->state != TS_ESTAB) return -EPIPE;
         size_t chunk = n - done < TCP_MSS ? n - done : TCP_MSS;
+        uint8_t packet[TCP_MSS];
+        if (!uok((uintptr_t)buf + done, chunk)) return done ? (long)done : -EFAULT;
+        memcpy(packet, buf + done, chunk);
         uint32_t seq = c->snd_nxt, target = seq + (uint32_t)chunk;
         c->snd_nxt = target;
         int tries = 0;
@@ -504,7 +507,7 @@ static long tcp_send(struct tconn *c, const uint8_t *buf, size_t n) {
         for (;;) {
             if (tries == 0 || ticks >= until) {
                 if (tries++ == 5) { c->state = TS_CLOSED; return -ETIMEDOUT; }
-                tcp_out(c, TCP_PSH | TCP_ACK, seq, buf + done, chunk, 0);
+                tcp_out(c, TCP_PSH | TCP_ACK, seq, packet, chunk, 0);
                 until = ticks + MS(1000);
             }
             net_poll();
@@ -524,6 +527,7 @@ static long tcp_recv(struct tconn *c, uint8_t *buf, size_t cap, int timeout_ms) 
         return c->err ? -EPIPE : -ETIMEDOUT;
     }
     size_t n = c->rxlen < cap ? c->rxlen : cap;
+    if (!uwok((uintptr_t)buf, n)) return -EFAULT;
     memcpy(buf, c->rx, n);
     memmove(c->rx, c->rx + n, c->rxlen - n);
     c->rxlen -= (uint16_t)n;
@@ -603,7 +607,6 @@ static int dotted_quad(const char *s, uint32_t *out) {
     *out = v;
     return 1;
 }
-static char namebuf[128];
 
 /* The NIC is probed on the first network call, not at boot: probing and DHCP both wait, and waiting
  * needs a running process (boot has none). */
@@ -613,9 +616,9 @@ long net_syscall(long nr, long a0, long a1, long a2, long a3) {
     if (!dev) return -ENODEV;
     switch (nr) {
     case CSYS_net_info: {
-        if (!uok(a0, sizeof(struct chi_netinfo))) return -EFAULT;
         int r = net_configure();
         if (r) return r;
+        if (!uwok(a0, sizeof(struct chi_netinfo))) return -EFAULT;
         struct chi_netinfo *u = (struct chi_netinfo *)a0;
         u->ip = my_ip; u->mask = my_mask; u->gateway = my_gw; u->dns = my_dns;
         memcpy(u->mac, mac, 6); u->configured = (uint8_t)configured; u->_pad = 0;
@@ -625,18 +628,20 @@ long net_syscall(long nr, long a0, long a1, long a2, long a3) {
         { int r = net_configure(); if (r) return r; }
         return net_ping((uint32_t)a0, (int)a1);      /* round trip in microseconds */
     case CSYS_net_resolve: {
+        char namebuf[128];
         int cr = ustrcpy(namebuf, a0, sizeof namebuf);     /* 0 on success, -errno otherwise */
         if (cr) return cr;
-        if (!uok(a1, 4)) return -EFAULT;
         cr = net_configure();
         if (cr) return cr;
         uint32_t ip;
-        if (dotted_quad(namebuf, &ip)) { *(uint32_t *)a1 = ip; return 0; }
-        net_lock();
-        int r = dns_query(namebuf, &ip);
-        net_unlock();
-        if (r) return r;
-        *(uint32_t *)a1 = ip;
+        if (!dotted_quad(namebuf, &ip)) {
+            net_lock();
+            int r = dns_query(namebuf, &ip);
+            net_unlock();
+            if (r) return r;
+        }
+        if (!uwok(a1, sizeof ip)) return -EFAULT;
+        memcpy((void *)a1, &ip, sizeof ip);
         return 0;
     }
     case CSYS_net_connect:
@@ -657,7 +662,7 @@ long net_syscall(long nr, long a0, long a1, long a2, long a3) {
     }
     case CSYS_net_recv: {
         if (a0 < 0 || a0 >= TCP_CONNS || tc[a0].state == TS_FREE) return -EBADF;
-        if (!uok(a1, a2)) return -EFAULT;
+        if (!uwok(a1, a2)) return -EFAULT;
         net_lock();
         long r = tcp_recv(&tc[a0], (uint8_t *)a1, (size_t)a2, (int)a3);
         net_unlock();

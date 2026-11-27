@@ -54,7 +54,11 @@ void arch_halt(void) { __asm__ volatile("msr daifset,#2"); for (;;) __asm__ vola
 /* ---------------- virtual memory (TTBR0 = user, TTBR1 = kernel direct map) ---------------- */
 #define PA_MASK 0x0000FFFFFFFFF000UL
 #define PTE_TABLE 3UL
-#define PTE_USER_PAGE (3UL | (1UL << 2) | (1UL << 6) | (3UL << 8) | (1UL << 10) | (1UL << 11) | (1UL << 53))
+#define PTE_EL0 (1UL << 6)
+#define PTE_RO  (1UL << 7)
+#define PTE_UXN (1UL << 54)
+#define PTE_ACCESS (PTE_EL0 | PTE_RO | PTE_UXN)
+#define PTE_USER_PAGE (3UL | (3UL << 8) | (1UL << 10) | (1UL << 11) | (1UL << 53))
 static uint8_t empty_l0[4096] __attribute__((aligned(4096)));
 
 uintptr_t arch_kernel_root(void) { return V2P(empty_l0); }
@@ -82,7 +86,11 @@ void arch_aspace_free(uintptr_t root) {
     struct cpu *c = this_cpu();
     if (c->aspace == root) c->aspace = ~0UL;
 }
-int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
+static uint64_t page_access(int prot) {
+    return (prot ? PTE_EL0 : 0) | ((prot & VM_WRITE) ? 0 : PTE_RO) |
+           ((prot & VM_EXEC) ? 0 : PTE_UXN);
+}
+static int map_user_page(uintptr_t root, uintptr_t va, uintptr_t pa, uint64_t flags) {
     uint64_t *t = P2V(root);
     for (int lvl = 3; lvl > 0; lvl--) {
         uint64_t *e = &t[(va >> (12 + 9 * lvl)) & 511];
@@ -93,23 +101,15 @@ int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
         }
         t = P2V(*e & PA_MASK);
     }
-    t[(va >> 12) & 511] = pa | PTE_USER_PAGE;
+    t[(va >> 12) & 511] = pa | PTE_USER_PAGE | flags;
     return 0;
 }
-int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa) {
-    uint64_t *t = P2V(root);
-    for (int lvl = 3; lvl > 0; lvl--) {
-        uint64_t *e = &t[(va >> (12 + 9 * lvl)) & 511];
-        if (!(*e & 1)) {
-            uintptr_t np = pmm_alloc();
-            if (!np) return -1;
-            *e = np | PTE_TABLE;
-        }
-        t = P2V(*e & PA_MASK);
-    }
+int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa, int prot) {
+    return map_user_page(root, va, pa, (1UL << 2) | page_access(prot));
+}
+int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa, int prot) {
     /* AttrIdx 0 is the nGnRnE device-memory attribute used by the direct map. */
-    t[(va >> 12) & 511] = pa | (PTE_USER_PAGE & ~(7UL << 2));
-    return 0;
+    return map_user_page(root, va, pa, page_access(prot & ~VM_EXEC));
 }
 static uint64_t *walk(uintptr_t root, uintptr_t va) {
     uint64_t *t = P2V(root);
@@ -123,6 +123,21 @@ static uint64_t *walk(uintptr_t root, uintptr_t va) {
 uintptr_t arch_translate(uintptr_t root, uintptr_t va) {
     uint64_t *e = walk(root, va);
     return (e && (*e & 1)) ? (*e & PA_MASK) : 0;
+}
+int arch_page_prot(uintptr_t root, uintptr_t va) {
+    uint64_t *e = walk(root, va);
+    if (!e || (*e & (1 | PTE_EL0)) != (1 | PTE_EL0)) return 0;
+    return VM_READ | ((*e & PTE_RO) ? 0 : VM_WRITE) | ((*e & PTE_UXN) ? 0 : VM_EXEC);
+}
+void arch_protect(uintptr_t root, uintptr_t va, int prot) {
+    uint64_t *e = walk(root, va);
+    if (!e || !(*e & 1)) return;
+    uint64_t next = (*e & ~PTE_ACCESS) | page_access(prot);
+    if (*e == next) return;
+    *e = 0;
+    __asm__ volatile("dsb ishst; tlbi vaae1is,%0; dsb ish; isb" :: "r"(va >> 12) : "memory");
+    *e = next;
+    __asm__ volatile("dsb ishst; isb" ::: "memory");
 }
 uintptr_t arch_unmap(uintptr_t root, uintptr_t va) {
     uint64_t *e = walk(root, va);

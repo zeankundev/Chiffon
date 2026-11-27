@@ -83,12 +83,20 @@ void arch_init(void) {
 
     /* SSE for userland (kernel itself is built without it) */
     uint64_t cr0, cr4;
-    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0)); cr0 = (cr0 & ~4UL) | 2; __asm__ volatile("mov %0,%%cr0" :: "r"(cr0));
+    __asm__ volatile("mov %%cr0,%0" : "=r"(cr0));
+    cr0 = (cr0 & ~4UL) | 2 | (1UL << 16); /* supervisor writes obey read-only pages */
+    __asm__ volatile("mov %0,%%cr0" :: "r"(cr0) : "memory");
     __asm__ volatile("mov %%cr4,%0" : "=r"(cr4)); cr4 |= 0x600; __asm__ volatile("mov %0,%%cr4" :: "r"(cr4));
     __asm__ volatile("fninit");
 
-    /* SYSCALL/SYSRET */
-    wrmsr(0xC0000080, rdmsr(0xC0000080) | 1);
+    /* Require NX before installing user page-table entries that use it. */
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x80000000U));
+    if (eax < 0x80000001U) panic("x86_64 requires NX support");
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x80000001U));
+    if (!(edx & (1U << 20))) panic("x86_64 requires NX support");
+    /* EFER.SCE and EFER.NXE */
+    wrmsr(0xC0000080, rdmsr(0xC0000080) | 1 | (1UL << 11));
     wrmsr(0xC0000081, (0x10UL << 48) | (0x08UL << 32));
     wrmsr(0xC0000082, (uint64_t)syscall_entry);
     wrmsr(0xC0000084, 0x200 | 0x100 | 0x400);
@@ -120,6 +128,10 @@ void arch_halt(void) { __asm__ volatile("cli"); for (;;) __asm__ volatile("hlt")
 
 /* ---------------- virtual memory (4-level paging) ---------------- */
 #define PTE_ADDR 0x000FFFFFFFFFF000UL
+#define PTE_RW  2UL
+#define PTE_US  4UL
+#define PTE_NX  (1UL << 63)
+#define PTE_ACCESS (PTE_RW | PTE_US | PTE_NX)
 uintptr_t arch_kernel_root(void) { return (uintptr_t)boot_pml4; }
 static uintptr_t cur_root;
 void arch_aspace_switch(uintptr_t root) {
@@ -148,7 +160,11 @@ void arch_aspace_free(uintptr_t root) {
     }
     pmm_free(root);
 }
-int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
+static uint64_t page_access(int prot) {
+    return (prot ? PTE_US : 0) | ((prot & VM_WRITE) ? PTE_RW : 0) |
+           ((prot & VM_EXEC) ? 0 : PTE_NX);
+}
+static int map_user_page(uintptr_t root, uintptr_t va, uintptr_t pa, uint64_t flags) {
     uint64_t *t = P2V(root);
     for (int lvl = 3; lvl > 0; lvl--) {
         uint64_t *e = &t[(va >> (12 + 9 * lvl)) & 511];
@@ -159,22 +175,14 @@ int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa) {
         }
         t = P2V(*e & PTE_ADDR);
     }
-    t[(va >> 12) & 511] = pa | 7;                    /* P | RW | US */
+    t[(va >> 12) & 511] = pa | 1 | flags;
     return 0;
 }
-int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa) {
-    uint64_t *t = P2V(root);
-    for (int lvl = 3; lvl > 0; lvl--) {
-        uint64_t *e = &t[(va >> (12 + 9 * lvl)) & 511];
-        if (!(*e & 1)) {
-            uintptr_t np = pmm_alloc();
-            if (!np) return -1;
-            *e = np | 7;
-        }
-        t = P2V(*e & PTE_ADDR);
-    }
-    t[(va >> 12) & 511] = pa | 7 | DM_PCD | DM_PWT; /* user RW, uncached device mapping */
-    return 0;
+int arch_map(uintptr_t root, uintptr_t va, uintptr_t pa, int prot) {
+    return map_user_page(root, va, pa, page_access(prot));
+}
+int arch_map_device_user(uintptr_t root, uintptr_t va, uintptr_t pa, int prot) {
+    return map_user_page(root, va, pa, page_access(prot & ~VM_EXEC) | DM_PCD | DM_PWT);
 }
 static uint64_t *walk(uintptr_t root, uintptr_t va) {
     uint64_t *t = P2V(root);
@@ -188,6 +196,19 @@ static uint64_t *walk(uintptr_t root, uintptr_t va) {
 uintptr_t arch_translate(uintptr_t root, uintptr_t va) {
     uint64_t *e = walk(root, va);
     return (e && (*e & 1)) ? (*e & PTE_ADDR) : 0;
+}
+int arch_page_prot(uintptr_t root, uintptr_t va) {
+    uint64_t *e = walk(root, va);
+    if (!e || (*e & (1 | PTE_US)) != (1 | PTE_US)) return 0;
+    return VM_READ | ((*e & PTE_RW) ? VM_WRITE : 0) | ((*e & PTE_NX) ? 0 : VM_EXEC);
+}
+void arch_protect(uintptr_t root, uintptr_t va, int prot) {
+    uint64_t *e = walk(root, va);
+    if (!e || !(*e & 1)) return;
+    uint64_t next = (*e & ~PTE_ACCESS) | page_access(prot);
+    if (*e == next) return;
+    *e = next;
+    __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
 }
 uintptr_t arch_unmap(uintptr_t root, uintptr_t va) {
     uint64_t *e = walk(root, va);

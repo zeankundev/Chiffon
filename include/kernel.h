@@ -111,6 +111,8 @@ void kprintf(const char *fmt, ...);
 void kvprintf(const char *fmt, __builtin_va_list ap);
 int ksnprintf(char *buf, size_t n, const char *fmt, ...);
 void panic(const char *fmt, ...) __attribute__((noreturn));
+int hardware_random_word(uint64_t *out);
+void stack_guard_init(void);
 
 int kstrcasecmp(const char *a, const char *b);
 void cfg_load(const char *text, size_t len);
@@ -168,6 +170,8 @@ struct proc {
     struct chi_ipc_msg ipc_rep;
     /* Hybrid driver capabilities */
     int is_driver_loader;
+    int driver_bootstrap;
+    int is_fb_server;
     int ncaps;
     struct proc_cap caps[MAX_PROC_CAPS];
 };
@@ -198,12 +202,14 @@ void proc_signal(struct proc *p, int sig);
 void timer_tick(int from_user);
 extern int init_pid;
 int  proc_spawn_init(const char *path, char **argv, char **envp, const char *console);
+int  proc_spawn_driver_loader(const char *console);
 void init_exited(int wstatus);
 void check_killed(void);
 int  proc_spawn_console(const char *path, char **argv, char **envp, const char *console);
 int  proc_thread(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t tls, uintptr_t ctid);
 void proc_exit_group(int wstatus) __attribute__((noreturn));
-int  proc_kill_tid(int tid, int sig);
+int  proc_kill_tid(int tgid, int tid, int sig);
+int  proc_may_control(const struct proc *target);
 void mm_put(struct mm *m);
 void *futex_key(struct mm *m, uintptr_t uaddr);
 int  futex_wake_key(void *key, int n);
@@ -212,11 +218,17 @@ int  futex_wake_key(void *key, int n);
 #endif
 
 int  mm_map(struct mm *mm, uintptr_t va, size_t len);
+int  mm_map_prot(struct mm *mm, uintptr_t va, size_t len, int prot);
 int  mm_map_dev(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa);   /* map device memory (e.g. /dev/fb0) */
+int  mm_map_dev_prot(struct mm *mm, uintptr_t va, size_t len, uintptr_t pa, int prot);
+int  mm_protect(struct mm *mm, uintptr_t va, size_t len, int prot);
 void mm_free(struct mm *mm);
 int  mm_unmap(struct mm *mm, uintptr_t va, size_t len);
 int  mm_copyout(struct mm *mm, uintptr_t va, const void *src, size_t len);
+int  mm_load_bytes(struct mm *mm, uintptr_t va, const void *src, size_t len);
+int  mm_user_write(struct mm *mm, uintptr_t va, size_t len);
 int  uok(uintptr_t va, size_t len);
+int  uwok(uintptr_t va, size_t len);
 int  ustrcpy(char *dst, uintptr_t usrc, size_t max);
 
 enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT };
@@ -258,7 +270,7 @@ struct node *node_create(const char *abs, uint32_t mode);
 int  node_unlink(struct node *n);
 int  vfs_open(const char *path, int flags, int mode, struct file **out);
 struct file *file_dup(struct file *f);
-void file_close(struct file *f);
+int  file_close(struct file *f);
 ssize_t file_read(struct file *f, void *buf, size_t n);
 ssize_t file_write(struct file *f, const void *buf, size_t n);
 int  file_readable(struct file *f);
@@ -280,7 +292,7 @@ struct node *node_create(const char *abs, uint32_t mode);
 int  node_unlink(struct node *n);
 int  vfs_open(const char *path, int flags, int mode, struct file **out);
 struct file *file_dup(struct file *f);
-void file_close(struct file *f);
+int  file_close(struct file *f);
 ssize_t file_read(struct file *f, void *buf, size_t n);
 ssize_t file_write(struct file *f, const void *buf, size_t n);
 int  file_readable(struct file *f);

@@ -4,7 +4,7 @@ static uint32_t le16(const void *p) { const uint8_t *b = p; return b[0] | b[1] <
 static uint32_t le32(const void *p) { const uint8_t *b = p; return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
 
 static struct {
-    uint64_t base, *itable;
+    uint64_t base, blocks, *itable;
     uint32_t bs, ipg, isz, ngroups, incompat;
     uint8_t *blk, *xbuf;
 } E;
@@ -15,6 +15,7 @@ struct einode { uint32_t mode, flags; uint64_t size; uint8_t blk[60]; };
 
 static int rdblk(uint64_t pblk, void *buf) {
     uint32_t spb = E.bs / 512;
+    if (pblk >= E.blocks) return -EIO;
     return board_blk_read(E.base + pblk * spb, buf, spb);
 }
 
@@ -29,8 +30,8 @@ static int get_inode(uint32_t ino, struct einode *o) {
     uint32_t g = (ino - 1) / E.ipg, idx = (ino - 1) % E.ipg;
     if (g >= E.ngroups) return -EIO;
     uint64_t off = E.itable[g] * E.bs + (uint64_t)idx * E.isz;
-    uint8_t t[1024];
-    if (board_blk_read(E.base + off / 512, t, 2)) return -EIO;
+    uint8_t t[512];
+    if (off / E.bs >= E.blocks || board_blk_read(E.base + off / 512, t, 1)) return -EIO;
     const uint8_t *p = t + off % 512;
     o->mode = le16(p); o->flags = le32(p + 32);
     o->size = le32(p + 4);
@@ -54,13 +55,16 @@ static int bmap(const struct einode *in, uint64_t lblk, uint64_t *pblk) {
         for (int guard = 0; guard < 8; guard++) {
             if (le16(nd) != 0xF30A) return -EIO;
             uint32_t ent = le16(nd + 2), depth = le16(nd + 6);
+            if (ent > ((guard ? E.bs : sizeof in->blk) - 12) / 12) return -EIO;
             if (depth == 0) {
                 for (uint32_t i = 0; i < ent; i++) {
                     const uint8_t *e = nd + 12 + i * 12;
                     uint32_t start = le32(e), len = le16(e + 4);
-                    if (len > 32768) len -= 32768;
+                    int unwritten = len > 32768;
+                    if (unwritten) len -= 32768;
                     if (lblk >= start && lblk < (uint64_t)start + len) {
-                        *pblk = ((uint64_t)le16(e + 6) << 32 | le32(e + 8)) + (lblk - start);
+                        if (!unwritten)
+                            *pblk = ((uint64_t)le16(e + 6) << 32 | le32(e + 8)) + (lblk - start);
                         return 0;
                     }
                 }
@@ -89,6 +93,7 @@ static int bmap(const struct einode *in, uint64_t lblk, uint64_t *pblk) {
         *pblk = v; return 0;
     }
     lblk -= (uint64_t)ppb * ppb;
+    if (lblk >= (uint64_t)ppb * ppb * ppb) return -EIO;
     if ((r = ind_get(le32(in->blk + 56), lblk / ((uint64_t)ppb * ppb), &v))) return r;
     if ((r = ind_get(v, (lblk / ppb) % ppb, &v))) return r;
     if ((r = ind_get(v, lblk % ppb, &v))) return r;
@@ -128,10 +133,13 @@ static void walk(uint32_t dino, const char *path, int depth) {
         if (read_range(&di, off, dbuf, E.bs)) break;
         for (uint32_t p = 0; p + 8 <= E.bs;) {
             uint32_t ino = le32(dbuf + p), rl = le16(dbuf + p + 4), nl = dbuf[p + 6];
-            if (rl < 8 || p + rl > E.bs) break;
+            if (rl < 8 || (rl & 3) || p + rl > E.bs || nl > rl - 8) break;
             const char *name = (const char *)dbuf + p + 8;
             int dots = nl == 1 && name[0] == '.' ? 1 : nl == 2 && name[0] == '.' && name[1] == '.' ? 1 : 0;
-            if (ino && nl && !dots && nl < 255 && strlen(path) + nl + 2 < PATH_MAX) {
+            int valid = 1;
+            for (uint32_t j = 0; j < nl; j++)
+                if (!name[j] || name[j] == '/') { valid = 0; break; }
+            if (ino && nl && valid && !dots && strlen(path) + nl + 2 < PATH_MAX) {
                 strlcpy(cp, path, PATH_MAX); strlcat(cp, "/", PATH_MAX);
                 size_t l = strlen(cp); memcpy(cp + l, name, nl); cp[l + nl] = 0;
                 struct einode ci;
@@ -160,6 +168,7 @@ static int ext_mount(uint64_t base) {
     uint8_t sb[1024];
     if (board_blk_read(base + 2, sb, 2)) return -EIO;
     E.base = base;
+    if (le32(sb + 24) > 6) return -EINVAL;
     E.bs = 1024u << le32(sb + 24);
     uint32_t bpg = le32(sb + 32), rev = le32(sb + 76), first = le32(sb + 20);
     E.ipg = le32(sb + 40);
@@ -167,39 +176,51 @@ static int ext_mount(uint64_t base) {
     E.incompat = rev ? le32(sb + 96) : 0;
     int is64 = E.incompat & 0x80;
     uint32_t dsz = is64 ? le16(sb + 254) : 32;
-    if (!dsz) dsz = 64;
     uint64_t blocks = le32(sb + 4) | (is64 ? (uint64_t)le32(sb + 0x150) << 32 : 0);
-    if (E.bs > 65536 || !bpg || !E.ipg || E.isz < 128 || E.isz > 1024) { kprintf("[ext] bad superblock\n"); return -EINVAL; }
+    uint64_t sectors = board_blk_sectors();
+    if (!bpg || !E.ipg || E.isz < 128 || E.isz > 1024 || (E.isz & (E.isz - 1)) ||
+        first != (E.bs == 1024) || blocks <= first || base >= sectors ||
+        blocks > (sectors - base) / (E.bs / 512) || blocks > UINT64_MAX / E.bs ||
+        dsz < (is64 ? 64u : 32u) || dsz > E.bs || E.bs % dsz) return -EINVAL;
+    E.blocks = blocks;
     if (E.incompat & ~INCOMPAT_SUPPORTED) { kprintf("[ext] unsupported incompat features 0x%x\n", E.incompat & ~INCOMPAT_SUPPORTED); return -EINVAL; }
-    if (E.incompat & 0x4) kprintf("[ext] warning: journal needs recovery, showing on-disk state\n");
-    E.ngroups = (blocks - first + bpg - 1) / bpg;
-    E.itable = kmalloc(E.ngroups * 8);
+    uint64_t groups = 1 + (blocks - first - 1) / bpg;
+    if (groups > UINT32_MAX) return -EINVAL;
+    E.ngroups = groups;
+    E.itable = kmalloc(groups * sizeof *E.itable);
     E.blk = kmalloc(E.bs); E.xbuf = kmalloc(E.bs);
-    uint32_t gdblocks = (E.ngroups * dsz + E.bs - 1) / E.bs;
-    uint8_t *gd = kmalloc(gdblocks * E.bs);
-    if (!E.itable || !E.blk || !E.xbuf || !gd) return -ENOMEM;
-    for (uint32_t i = 0; i < gdblocks; i++)
-        if (rdblk(first + 1 + i, gd + i * E.bs)) return -EIO;
+    int err = -ENOMEM;
+    if (!E.itable || !E.blk || !E.xbuf) goto fail;
+    err = -EIO;
     for (uint32_t g = 0; g < E.ngroups; g++) {
-        const uint8_t *d = gd + g * dsz;
+        uint64_t off = (uint64_t)g * dsz;
+        if (!(off % E.bs) && rdblk(first + 1 + off / E.bs, E.blk)) goto fail;
+        const uint8_t *d = E.blk + off % E.bs;
         E.itable[g] = le32(d + 8) | (is64 && dsz >= 64 ? (uint64_t)le32(d + 0x28) << 32 : 0);
+        uint64_t table_blocks = ((uint64_t)E.ipg * E.isz + E.bs - 1) / E.bs;
+        if (!E.itable[g] || E.itable[g] >= blocks || table_blocks > blocks - E.itable[g]) goto fail;
     }
-    kfree(gd);
     kprintf("ext: block size %u, %u groups, inode size %u, features 0x%x\n", E.bs, E.ngroups, E.isz, E.incompat);
     truncated = 0;
     walk(2, "", 0);
     if (truncated) kprintf("ext: warning: tree larger than the VFS node table; some files are missing\n");
     return 0;
+fail:
+    kfree(E.itable); kfree(E.blk); kfree(E.xbuf);
+    return err;
 }
 
 /* Where the filesystem ends, and a 64-bit id from its UUID.  The persistence log uses both. */
 static int ext_ident(uint64_t base, uint64_t *end, uint64_t *fsid) {
     uint8_t sb[1024];
     if (board_blk_read(base + 2, sb, 2)) return -EIO;
+    if (le32(sb + 24) > 6) return -EINVAL;
     uint32_t bs = 1024u << le32(sb + 24);
     if (bs > 65536) return -EINVAL;
     uint32_t rev = le32(sb + 76), inc = rev ? le32(sb + 96) : 0;
     uint64_t blocks = le32(sb + 4) | ((inc & 0x80) ? (uint64_t)le32(sb + 0x150) << 32 : 0);
+    uint64_t sectors = board_blk_sectors();
+    if (base > sectors || blocks > (sectors - base) / (bs / 512)) return -EINVAL;
     *end = base + blocks * (bs / 512);
     uint64_t h = 0xcbf29ce484222325ULL;
     for (int i = 0; i < 16; i++) { h ^= sb[104 + i]; h *= 0x100000001b3ULL; }

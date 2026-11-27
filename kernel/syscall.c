@@ -42,7 +42,7 @@ static void put_stat(uintptr_t u, uint32_t mode, uint64_t size, uint64_t ino, ui
     *(uint64_t *)(b + 72) = *(uint64_t *)(b + 88) = *(uint64_t *)(b + 104) = mtime;
 }
 static long stat_file(struct file *f, uintptr_t ub) {
-    if (!uok(ub, STAT_SIZE)) return -EFAULT;
+    if (!uwok(ub, STAT_SIZE)) return -EFAULT;
     if (f->type != F_NODE) { put_stat(ub, S_IFIFO | 0600, 0, 1, BOOT_EPOCH); return 0; }
     put_stat(ub, f->node->mode, f->node->size, f->node->ino, f->node->mtime);
     return 0;
@@ -53,7 +53,7 @@ static long stat_path(const char *path, int follow, uintptr_t ub) {
     if (r) return r;
     struct node *n = node_find(abs);
     if (!n) return -ENOENT;
-    if (!uok(ub, STAT_SIZE)) return -EFAULT;
+    if (!uwok(ub, STAT_SIZE)) return -EFAULT;
     put_stat(ub, n->mode, n->size, n->ino, n->mtime);
     return 0;
 }
@@ -65,31 +65,62 @@ static long __attribute__((unused)) stat_path_u(uintptr_t up, int follow, uintpt
 }
 
 /* ---- io ---- */
-static long sys_read(long fd, uintptr_t buf, size_t n) {
-    struct file *f = getfd(fd);
-    if (!f) return -EBADF;
-    if (!uok(buf, n)) return -EFAULT;
-    return file_read(f, (void *)buf, n);
+/* File operations may sleep while another thread changes the user's mappings. */
+static long user_io(struct file *f, uintptr_t buf, size_t n, int wr) {
+    if (!(wr ? uok(buf, n) : uwok(buf, n))) return -EFAULT;
+    if (!n) return 0;
+    size_t cap = n < PAGE_SIZE ? n : PAGE_SIZE;
+    uint8_t *tmp = kmalloc(cap);
+    if (!tmp) return -ENOMEM;
+    size_t done = 0;
+    long r = 0;
+    while (done < n) {
+        size_t chunk = n - done < cap ? n - done : cap;
+        if (wr) {
+            if (!uok(buf + done, chunk)) { r = -EFAULT; break; }
+            memcpy(tmp, (const void *)(buf + done), chunk);
+            r = file_write(f, tmp, chunk);
+        } else {
+            r = file_read(f, tmp, chunk);
+            if (r > 0) {
+                if (!uwok(buf + done, r)) { r = -EFAULT; break; }
+                memcpy((void *)(buf + done), tmp, r);
+            }
+        }
+        if (r <= 0) break;
+        done += (size_t)r;
+        if ((size_t)r < chunk || (!wr && (f->type != F_NODE || f->node->dev))) break;
+    }
+    kfree(tmp);
+    return done ? (long)done : r;
 }
-static long sys_write(long fd, uintptr_t buf, size_t n) {
+static long sys_io(long fd, uintptr_t buf, size_t n, int wr) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (!uok(buf, n)) return -EFAULT;
-    return file_write(f, (const void *)buf, n);
+    file_dup(f);
+    long r = user_io(f, buf, n, wr);
+    file_close(f);
+    return r;
 }
 struct iovec { uintptr_t base; size_t len; };
 static long sys_iov(long fd, uintptr_t uiov, long cnt, int wr) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
     if (cnt < 0 || cnt > 1024 || !uok(uiov, cnt * sizeof(struct iovec))) return -EINVAL;
-    struct iovec *v = (struct iovec *)uiov; long tot = 0;
+    if (!cnt) return 0;
+    struct iovec *v = kmalloc(cnt * sizeof *v);
+    if (!v) return -ENOMEM;
+    memcpy(v, (const void *)uiov, cnt * sizeof *v);
+    file_dup(f);
+    long tot = 0;
     for (long i = 0; i < cnt; i++) {
-        if (!uok(v[i].base, v[i].len)) return tot ? tot : -EFAULT;
-        long r = wr ? file_write(f, (void *)v[i].base, v[i].len) : file_read(f, (void *)v[i].base, v[i].len);
-        if (r < 0) return tot ? tot : r;
+        long r = user_io(f, v[i].base, v[i].len, wr);
+        if (r < 0) { if (!tot) tot = r; break; }
         tot += r;
         if ((size_t)r < v[i].len) break;
     }
+    file_close(f);
+    kfree(v);
     return tot;
 }
 static long sys_lseek(long fd, long off, int whence) {
@@ -97,7 +128,7 @@ static long sys_lseek(long fd, long off, int whence) {
     if (!f) return -EBADF;
     if (f->type != F_NODE || (f->node->dev && f->node->dev != DEV_FB)) return -ESPIPE;
     long base = whence == 0 ? 0 : whence == 1 ? (long)f->off : whence == 2 ? (long)f->node->size : -1;
-    if (base < 0 || base + off < 0) return -EINVAL;
+    if (base < 0 || off < -base || off > __LONG_MAX__ - base) return -EINVAL;
     f->off = base + off;
     return f->off;
 }
@@ -113,8 +144,9 @@ static long sys_openat(long dirfd, uintptr_t upathp, int flags, int mode) {
 static long sys_close(long fd) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    file_close(f); cur->ft->f[fd] = 0; cur->cloexec &= ~(1u << fd);
-    return 0;
+    cur->ft->f[fd] = 0;
+    cur->cloexec &= ~(1u << fd);
+    return file_close(f);
 }
 static long sys_dup2(long o, long n, int cloexec) {
     struct file *f = getfd(o);
@@ -144,7 +176,7 @@ static long sys_fcntl(long fd, int cmd, long arg) {
 }
 static long sys_pipe2(uintptr_t ufds, int flags) {
     struct file *r, *w;
-    if (!uok(ufds, 8)) return -EFAULT;
+    if (!uwok(ufds, 8)) return -EFAULT;
     int e = pipe_create(&r, &w);
     if (e) return e;
     int a = fd_install(r, 0, flags & O_CLOEXEC), b = a < 0 ? -1 : fd_install(w, 0, flags & O_CLOEXEC);
@@ -182,7 +214,7 @@ static int ro_parent(const char *abs) {
 static long sys_getcwd(uintptr_t buf, size_t size) {
     size_t l = strlen(cur->cwd) + 1;
     if (l > size) return -ERANGE;
-    if (!uok(buf, l)) return -EFAULT;
+    if (!uwok(buf, l)) return -EFAULT;
     memcpy((void *)buf, cur->cwd, l);
     return l;
 }
@@ -212,7 +244,7 @@ static long sys_readlink(uintptr_t up, uintptr_t buf, size_t sz) {
     struct node *n = node_find(abs);
     if (!n) return -ENOENT;
     if (!S_ISLNK(n->mode)) return -EINVAL;
-    if (!uok(buf, sz)) return -EFAULT;
+    if (!uwok(buf, sz)) return -EFAULT;
     size_t l = n->size < sz ? n->size : sz;
     memcpy((void *)buf, n->data, l);
     return l;
@@ -292,38 +324,61 @@ static long sys_brk(uintptr_t addr) {
     if (!addr || addr < m->brk_start || addr >= MMAP_BASE) return m->brk_end;
     uintptr_t oe = (m->brk_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1), ne = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (ne > oe) { if (mm_map(m, oe, ne - oe)) return m->brk_end; }
-    else if (ne < oe) mm_unmap(m, ne, oe - ne);
+    else if (ne < oe && mm_unmap(m, ne, oe - ne)) return m->brk_end;
     m->brk_end = addr;
     return addr;
 }
 static long sys_mmap(uintptr_t addr, size_t len, int prot, int flags, long fd, long off) {
     struct mm *m = cur->mm;
-    if (!len) return -EINVAL;
+    if (!len || len > USER_TOP || (prot & ~(VM_READ | VM_WRITE | VM_EXEC))) return -EINVAL;
+    if ((prot & (VM_WRITE | VM_EXEC)) == (VM_WRITE | VM_EXEC)) return -EACCES;
     len = (len + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     struct file *f = 0;
-    if (!(flags & 0x20)) { f = getfd(fd); if (!f || f->type != F_NODE) return -EBADF; }
-    if (flags & 0x10) {
-        if (addr & (PAGE_SIZE - 1)) return -EINVAL;
-        mm_unmap(m, addr, len);
-    } else {
-        addr = m->mmap_next;
-        if (addr + len > USER_STACK_TOP - STACK_SIZE * 8) return -ENOMEM;
-        m->mmap_next += len;
+    if (!(flags & 0x20)) {
+        f = getfd(fd);
+        if (!f || f->type != F_NODE) return -EBADF;
+        if (off < 0 || (off & (PAGE_SIZE - 1))) return -EINVAL;
     }
-    if (f && f->node->dev == DEV_FB) {                  /* map the framebuffer's pixel memory straight into the process */
+    int is_fb = f && f->node->dev == DEV_FB;
+    uintptr_t fb_phys = 0;
+    if (is_fb) {
+        if (prot & VM_EXEC) return -EACCES;
         struct fb_device *d = fb_primary();
         if (!d) return -ENODEV;
-        if ((uint64_t)off & (PAGE_SIZE - 1) || (uint64_t)off + len > ((uint64_t)d->info.size + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE) return -EINVAL;
-        int e = mm_map_dev(m, addr, len, d->info.phys + off);
-        return e ? e : (long)addr;
+        uint64_t size = ((uint64_t)d->info.size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        if ((uint64_t)off > size || len > size - (uint64_t)off) return -EINVAL;
+        fb_phys = d->info.phys + off;
+    } else if (f && f->node->lazy && node_load(f->node)) return -EIO;
+    if (flags & 0x10) {
+        if ((addr & (PAGE_SIZE - 1)) || addr < PAGE_SIZE) return -EINVAL;
+        uintptr_t stack_base = USER_STACK_TOP - STACK_SIZE;
+        if (addr >= USER_TOP || len > USER_TOP - addr) return -EINVAL;
+        if (addr < stack_base && addr + len > stack_base - PAGE_SIZE)
+            return -EINVAL;
+        int r = mm_unmap(m, addr, len);
+        if (r) return r;
+    } else {
+        uintptr_t limit = USER_STACK_TOP - STACK_SIZE * 8;
+        addr = m->mmap_next;
+        for (;;) {
+            if (addr >= limit || len > limit - addr) return -ENOMEM;
+            uintptr_t next = addr;
+            for (int i = 0; i < m->nvma; i++) {
+                const struct vma *v = &m->vma[i];
+                if (v->start < addr + len && v->end > next) next = v->end;
+            }
+            if (next == addr) break;
+            addr = next;
+        }
     }
-    int r = mm_map(m, addr, len);
+    int r = is_fb ? mm_map_dev_prot(m, addr, len, fb_phys, prot) : mm_map_prot(m, addr, len, prot);
     if (r) return r;
-    if (f && f->node->lazy && node_load(f->node)) return -EIO;
-    if (f && (size_t)off < f->node->size) {
+    if (f && !is_fb && (size_t)off < f->node->size) {
         size_t n = f->node->size - off; if (n > len) n = len;
-        memcpy((void *)addr, f->node->data + off, n);
+        r = mm_load_bytes(m, addr, f->node->data + off, n);
+        if (r) { mm_unmap(m, addr, len); return r; }
     }
+    if (!(flags & 0x10)) m->mmap_next = addr + len;
     return addr;
 }
 
@@ -380,7 +435,7 @@ static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack
 #if ARCH_AARCH64
         int tid = proc_thread(tf, flags, stack, tls, ctid);
         if (tid < 0) return tid;
-        if ((flags & 0x100000) && uok(ptid, 4)) *(int *)ptid = tid;       /* CLONE_PARENT_SETTID */
+        if ((flags & 0x100000) && uwok(ptid, 4)) *(int *)ptid = tid;       /* CLONE_PARENT_SETTID */
         return tid;
 #else
         return -ENOSYS;                               /* x86_64 threads need fs_base TLS support first */
@@ -390,7 +445,7 @@ static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack
     if (pid < 0) return pid;
     struct proc *c = find_proc(pid);
     if (stack) TF_SP(c->tf) = stack;
-    if ((flags & 0x100000) && uok(ptid, 4)) *(int *)ptid = pid;
+    if ((flags & 0x100000) && uwok(ptid, 4)) *(int *)ptid = pid;
     if (flags & 0x1000000) mm_copyout(c->mm, ctid, &pid, 4);
     return pid;
 }
@@ -418,6 +473,7 @@ static void group_quiesce(void) {
 /* futex(uaddr, op, val, timeout): FUTEX_WAIT sleeps while *uaddr == val; FUTEX_WAKE wakes waiters. */
 static long sys_futex(uintptr_t uaddr, int op, uint32_t val, uintptr_t timeout) {
     op &= ~128;                                       /* FUTEX_PRIVATE_FLAG: same behaviour here */
+    if (uaddr & 3) return -EINVAL;
     if (!uok(uaddr, 4)) return -EFAULT;
     if (op == 0 || op == 9) {                         /* FUTEX_WAIT, FUTEX_WAIT_BITSET */
         uint64_t deadline = 0;
@@ -429,6 +485,7 @@ static long sys_futex(uintptr_t uaddr, int op, uint32_t val, uintptr_t timeout) 
         void *key = futex_key(cur->mm, uaddr);
         cur->futex_woken = 0;
         for (;;) {
+            if (!uok(uaddr, 4)) return -EFAULT;
             if (*(volatile uint32_t *)uaddr != val) return -EAGAIN;
             if (cur->killed) return -EINTR;
             if (timeout && ticks >= deadline) return -ETIMEDOUT;
@@ -445,7 +502,7 @@ static long sys_futex(uintptr_t uaddr, int op, uint32_t val, uintptr_t timeout) 
 static long sys_sigaction(int sig, uintptr_t act, uintptr_t oact) {
     if (sig <= 0 || sig > 64 || sig == 9 || sig == 19) return -EINVAL;
     if (oact) {
-        if (!uok(oact, SIGACT_SIZE)) return -EFAULT;
+        if (!uwok(oact, SIGACT_SIZE)) return -EFAULT;
         memset((void *)oact, 0, SIGACT_SIZE);
         *(uint64_t *)oact = cur->sigh[sig];
     }
@@ -458,7 +515,7 @@ static long sys_sigaction(int sig, uintptr_t act, uintptr_t oact) {
 
 // Stub here: glibc aint starting if kernel is old af
 static long sys_uname(uintptr_t u) {
-    if (!uok(u, 390)) return -EFAULT;
+    if (!uwok(u, 390)) return -EFAULT;
 
     char *b = (char *)u;
     memset(b, 0, 390);
@@ -478,7 +535,7 @@ static long sys_uname(uintptr_t u) {
 }
 
 static long sys_clock_gettime(uintptr_t u) {
-    if (!uok(u, 16)) return -EFAULT;
+    if (!uwok(u, 16)) return -EFAULT;
     uint64_t t = ticks;
     ((uint64_t *)u)[0] = BOOT_EPOCH + t / HZ;
     ((uint64_t *)u)[1] = (t % HZ) * (1000000000UL / HZ);
@@ -497,10 +554,11 @@ static long sys_nanosleep(uintptr_t req) {
 
 /* ---- poll ---- */
 static long do_poll(uintptr_t ufds, unsigned nfds, long tmo_ms) {
-    if (nfds > NOFILE * 4 || !uok(ufds, nfds * 8)) return -EINVAL;
+    if (nfds > NOFILE * 4) return -EINVAL;
     uint64_t dl = tmo_ms > 0 ? ticks + (tmo_ms * HZ + 999) / 1000 : 0;
     struct pfd { int fd; short ev, rev; } *p = (struct pfd *)ufds;
     for (;;) {
+        if (!uwok(ufds, nfds * 8)) return -EFAULT;
         int ready = 0;
         for (unsigned i = 0; i < nfds; i++) {
             p[i].rev = 0;
@@ -529,8 +587,8 @@ static long do_poll(uintptr_t ufds, unsigned nfds, long tmo_ms) {
 
 static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, long a3, long a4, long a5) {
     switch (no) {
-    case SYS_read: return sys_read(a0, a1, a2);
-    case SYS_write: return sys_write(a0, a1, a2);
+    case SYS_read: return sys_io(a0, a1, a2, 0);
+    case SYS_write: return sys_io(a0, a1, a2, 1);
     case SYS_readv: return sys_iov(a0, a1, a2, 0);
     case SYS_writev: return sys_iov(a0, a1, a2, 1);
     case SYS_close: return sys_close(a0);
@@ -551,7 +609,7 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_fcntl: return sys_fcntl(a0, a1, a2);
     case SYS_pipe2: return sys_pipe2(a0, a1);
     case SYS_ioctl: return sys_ioctl(a0, a1, a2);
-    case SYS_getdents64: { struct file *f = getfd(a0); if (!f) return -EBADF; if (!uok(a1, a2)) return -EFAULT; return file_getdents(f, (void *)a1, a2); }
+    case SYS_getdents64: { struct file *f = getfd(a0); if (!f) return -EBADF; if (!uwok(a1, a2)) return -EFAULT; return file_getdents(f, (void *)a1, a2); }
     case SYS_getcwd: return sys_getcwd(a0, a1);
     case SYS_chdir: return sys_chdir(a0);
     case SYS_renameat: return sys_rename(a1, a3);
@@ -569,32 +627,39 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_brk: return sys_brk(a0);
     case SYS_mmap: return sys_mmap(a0, a1, a2, a3, a4, a5);
     case SYS_munmap: return mm_unmap(cur->mm, a0, a1);
-    case SYS_mprotect: case SYS_madvise: return 0;
+    case SYS_mprotect: return mm_protect(cur->mm, a0, a1, a2);
+    case SYS_madvise: return 0;
     case SYS_mremap: return -ENOMEM;
 
     case SYS_clone: return sys_clone(tf, a0, a1, a2, CLONE_TLS_ARG(a3, a4), CLONE_CTID_ARG(a3, a4));
     case SYS_futex: return sys_futex(a0, a1, a2, a3);
     case SYS_getcpu: {
         uint32_t id = this_cpu()->id;
-        if (a0 && uok(a0, 4)) *(uint32_t *)a0 = id;
-        if (a1 && uok(a1, 4)) *(uint32_t *)a1 = 0;
+        if (a0 && uwok(a0, 4)) *(uint32_t *)a0 = id;
+        if (a1 && uwok(a1, 4)) *(uint32_t *)a1 = 0;
         return 0; }
     case SYS_execve: return sys_execve(tf, a0, a1, a2);
     case SYS_exit: proc_exit((a0 & 0xff) << 8);                 /* this thread only */
     case SYS_exit_group: proc_exit_group((a0 & 0xff) << 8);     /* the whole thread group */
     case SYS_wait4: return proc_wait(a0, a1, a2);
     case SYS_kill: return proc_kill(a0, a1);
-    case SYS_tgkill: return proc_kill_tid(a1, a2);
+    case SYS_tgkill: return proc_kill_tid(a0, a1, a2);
     case SYS_rt_sigaction: return sys_sigaction(a0, a1, a2);
     case SYS_rt_sigprocmask:
-        if (a2 && uok(a2, 8)) *(uint64_t *)a2 = 0;
+        if (a2 && uwok(a2, 8)) *(uint64_t *)a2 = 0;
         return 0;
     case SYS_sigaltstack: return 0;
     case SYS_getpid: return cur->tgid;
     case SYS_gettid: return cur->pid;
     case SYS_getppid: return cur->ppid;
     case SYS_getuid: case SYS_geteuid: case SYS_getgid: case SYS_getegid: return 0;
-    case SYS_setpgid: { struct proc *p = a0 ? find_proc(a0) : cur; if (!p) return -ESRCH; p->pgid = a1 ? a1 : p->pid; return 0; }
+    case SYS_setpgid: {
+        struct proc *p = a0 ? find_proc(a0) : cur;
+        if (!p) return -ESRCH;
+        if (a1 < 0 || a1 > __INT_MAX__) return -EINVAL;
+        if (!proc_may_control(p) || (p->tgid != cur->tgid && p->ppid != cur->tgid)) return -EPERM;
+        p->pgid = a1 ? a1 : p->pid;
+        return 0; }
     case SYS_getpgid: { struct proc *p = a0 ? find_proc(a0) : cur; return p ? p->pgid : -ESRCH; }
     case SYS_setsid: cur->pgid = cur->pid; cur->ctty = 0; return cur->pid;
     case SYS_sched_yield: yield(); return 0;
@@ -604,25 +669,33 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_clock_gettime: return sys_clock_gettime(a1);
     case SYS_gettimeofday: {
         if (!a0) return 0;
-        if (!uok(a0, 16)) return -EFAULT;
+        if (!uwok(a0, 16)) return -EFAULT;
         ((uint64_t *)a0)[0] = BOOT_EPOCH + ticks / HZ; ((uint64_t *)a0)[1] = (ticks % HZ) * (1000000 / HZ);
         return 0; }
     case SYS_nanosleep: return sys_nanosleep(a0);
     case SYS_clock_nanosleep: return sys_nanosleep(a2);
     case SYS_prlimit64: {
         if (a3) {
-            if (!uok(a3, 16)) return -EFAULT;
+            if (!uwok(a3, 16)) return -EFAULT;
             ((uint64_t *)a3)[0] = ((uint64_t *)a3)[1] = ~0UL;
             if (a1 == 3) ((uint64_t *)a3)[0] = 8 << 20;
             if (a1 == 7) ((uint64_t *)a3)[0] = ((uint64_t *)a3)[1] = NOFILE;
         }
         return 0; }
     case SYS_getrandom: {
-        if (!uok(a0, a1)) return -EFAULT;
-        for (long i = 0; i < a1; i++) ((uint8_t *)a0)[i] = (uint8_t)(ticks * 2654435761UL >> 7) ^ (uint8_t)(i * 167 + (uintptr_t)tf);
+        if (a2 & ~3UL) return -EINVAL;
+        if (!uwok(a0, a1)) return -EFAULT;
+        for (long i = 0; i < a1;) {
+            uint64_t word;
+            int err = hardware_random_word(&word);
+            if (err) return i ? i : err;
+            size_t n = a1 - i < 8 ? (size_t)(a1 - i) : sizeof word;
+            memcpy((uint8_t *)a0 + i, &word, n);
+            i += n;
+        }
         return a1; }
     case SYS_sysinfo: {
-        if (!uok(a0, 112)) return -EFAULT;
+        if (!uwok(a0, 112)) return -EFAULT;
         uint64_t *s = (uint64_t *)a0; memset(s, 0, 112);
         s[0] = ticks / HZ; s[4] = pmm_total_count() * PAGE_SIZE; s[5] = pmm_free_count() * PAGE_SIZE;
         *(uint16_t *)((char *)s + 80) = NPROC; *(uint32_t *)((char *)s + 104) = 1;
@@ -651,7 +724,7 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:
         if (a0 == 0x1002) { cur->uctx.fs_base = a1; arch_uctx_restore(&cur->uctx); return 0; }
-        if (a0 == 0x1003) { if (!uok(a1, 8)) return -EFAULT; *(uint64_t *)a1 = cur->uctx.fs_base; return 0; }
+        if (a0 == 0x1003) { if (!uwok(a1, 8)) return -EFAULT; *(uint64_t *)a1 = cur->uctx.fs_base; return 0; }
         return -EINVAL;
 #endif
 #ifdef SYS_open
@@ -672,10 +745,10 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_poll: return do_poll(a0, a1, a2);
     case SYS_getpgrp: return cur->pgid;
     case SYS_getrlimit: {
-        if (!uok(a1, 16)) return -EFAULT;
+        if (!uwok(a1, 16)) return -EFAULT;
         ((uint64_t *)a1)[0] = ((uint64_t *)a1)[1] = a0 == 7 ? NOFILE : ~0UL;
         return 0; }
-    case SYS_time: if (a0 && uok(a0, 8)) *(uint64_t *)a0 = BOOT_EPOCH + ticks / HZ; return BOOT_EPOCH + ticks / HZ;
+    case SYS_time: if (a0 && uwok(a0, 8)) *(uint64_t *)a0 = BOOT_EPOCH + ticks / HZ; return BOOT_EPOCH + ticks / HZ;
 #endif
     }
     TRACE("[chiffon] unimplemented syscall: %ld (pid %d)\n", no, cur->pid);

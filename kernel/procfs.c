@@ -26,6 +26,15 @@ void procfs_refresh(void) {
     ksnprintf(buf, sizeof buf, "MemTotal:       %8lu kB\nMemFree:        %8lu kB\nMemAvailable:   %8lu kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n", tot, fr, fr);
     put("/proc/meminfo", buf);
     put("/proc/version", "Chiffon " VERSION " (" ARCH_NAME ")\n");
+    /* CPU IDs need not be contiguous after a partial secondary startup. */
+    {
+        char cpuinfo[MAX_CPUS * 32];
+        size_t used = 0;
+        for (int i = 0; i < MAX_CPUS; i++)
+            if (cpus[i].online)
+                used += ksnprintf(cpuinfo + used, sizeof cpuinfo - used, "processor\t: %d\n\n", i);
+        put("/proc/cpuinfo", cpuinfo);
+    }
     {
         static char big[2048];
         drivers_dump(big, sizeof big); put("/proc/drivers", big);
