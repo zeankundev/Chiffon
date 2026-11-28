@@ -48,10 +48,12 @@ struct chi_netinfo {
     chi_u8  _pad;
 };
 
+#define CHI_DRIVER_ABI_VERSION 2 /* v2 reserves the deny-only DMA grant type */
 #define CHI_CAP_MMIO     1      /* MMIO physical mapping */
 #define CHI_CAP_IRQ      2      /* Hardware IRQ binding */
 #define CHI_CAP_DRIVER   4      /* Register the framebuffer IPC service */
 #define CHI_CAP_LOADER   8      /* Grant capabilities to other processes */
+#define CHI_CAP_DMA     16      /* Reserved. No user DMA domain on either target. */
 
 #define DEV_TYPE_FB      1      /* Primary framebuffer */
 #define DEV_TYPE_UART    2      /* Primary serial / UART */

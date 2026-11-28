@@ -122,8 +122,9 @@ long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2) {
         if ((val1 && val1 != DEV_TYPE_FB) || val2) return -EINVAL;
         if (!target->ncaps || target->caps[0].type != CHI_CAP_MMIO) return -EPERM;
         val1 = DEV_TYPE_FB;
-    } else if (type == CHI_CAP_IRQ || type == CHI_CAP_LOADER) {
-        /* The registered user framebuffer has no IRQ. The loader is boot-only. */
+    } else if (type == CHI_CAP_IRQ || type == CHI_CAP_LOADER || type == CHI_CAP_DMA) {
+        /* The framebuffer has no IRQ, loader authority is boot-only and DMA
+         * remains kernel-owned until a device isolation domain exists. */
         return -EPERM;
     } else {
         return -EINVAL;

@@ -69,7 +69,7 @@ def smoke(command, arch, log, timeout):
             output = expect("filesystem read completion", prompt)
             if not re.search(rb"hostname = demo\r?\n", output):
                 raise RuntimeError("expected Demo filesystem contents")
-            for probe in ("vm-probe", "clock-probe", "hid-probe"):
+            for probe in ("vm-probe", "clock-probe", "hid-probe", "cap-probe"):
                 guest.stdin.write(f"/bin/{probe}\n".encode())
                 output = expect(f"{probe} completion", prompt)
                 marker = rb"(?:^|\n)PASS " + re.escape(probe.encode()) + rb"\r?\n"

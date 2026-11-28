@@ -290,7 +290,8 @@ void proc_signal(struct proc *p, int sig) {
 /* kill(pid): every thread of the process group leader pid (pid > 0), or a process group. */
 int proc_may_control(const struct proc *target) {
     if (target->tgid == cur->tgid || cur->pid == init_pid || cur->is_driver_loader) return 1;
-    return !target->is_driver_loader && !target->ncaps;
+    return !target->is_driver_loader && !target->driver_bootstrap &&
+           !target->is_fb_server && !target->ncaps;
 }
 int proc_kill(int pid, int sig) {
     if (sig < 0 || sig > 64) return -EINVAL;
