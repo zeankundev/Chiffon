@@ -20,12 +20,6 @@ static int rdblk(uint64_t pblk, void *buf) {
     return board_blk_read(E.base + pblk * spb, buf, spb);
 }
 
-static int ext_probe(uint64_t base) {
-    uint8_t sb[1024];
-    if (board_blk_read(base + 2, sb, 2)) return -1;
-    return le16(sb + 56) == 0xEF53 ? 0 : -1;
-}
-
 static int get_inode(uint32_t ino, struct einode *o) {
     if (!ino) return -EIO;
     uint32_t g = (ino - 1) / E.ipg, idx = (ino - 1) % E.ipg;
@@ -191,9 +185,11 @@ out:
     return err;
 }
 
-static int ext_mount(uint64_t base) {
+static int ext_mount(uint64_t base, uint64_t limit, uint64_t *end, uint64_t *fsid) {
     uint8_t sb[1024];
+    if (base > limit || limit - base < 4) return -EINVAL;
     if (board_blk_read(base + 2, sb, 2)) return -EIO;
+    if (le16(sb + 56) != 0xEF53) return -ENOENT;
     /* No ext journal replay, orphan cleanup or in-inode directory reader. */
     if (le16(sb + 58) != 1 || le32(sb + 232) ||
         (le32(sb + 100) & 0x10000)) {
@@ -210,10 +206,9 @@ static int ext_mount(uint64_t base) {
     int is64 = E.incompat & 0x80;
     uint32_t dsz = is64 ? le16(sb + 254) : 32;
     uint64_t blocks = le32(sb + 4) | (is64 ? (uint64_t)le32(sb + 0x150) << 32 : 0);
-    uint64_t sectors = board_blk_sectors();
     if (!bpg || !E.ipg || E.isz < 128 || E.isz > 1024 || (E.isz & (E.isz - 1)) ||
-        first != (E.bs == 1024) || blocks <= first || base >= sectors ||
-        blocks > (sectors - base) / (E.bs / 512) || blocks > UINT64_MAX / E.bs ||
+        first != (E.bs == 1024) || blocks <= first ||
+        blocks > (limit - base) / (E.bs / 512) || blocks > UINT64_MAX / E.bs ||
         dsz < (is64 ? 64u : 32u) || dsz > E.bs || E.bs % dsz) return -EINVAL;
     E.blocks = blocks;
     if (E.incompat & ~INCOMPAT_SUPPORTED) { kprintf("[ext] unsupported incompat features 0x%x\n", E.incompat & ~INCOMPAT_SUPPORTED); return -EINVAL; }
@@ -240,28 +235,14 @@ static int ext_mount(uint64_t base) {
     err = walk(2, "", 0, &state);
     vfs_mount_finish(snapshot, err != 0);
     if (err) goto fail;
+    *end = base + blocks * (E.bs / 512);
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (int i = 0; i < 16; i++) { h ^= sb[104 + i]; h *= 0x100000001b3ULL; }
+    *fsid = h;
     return 0;
 fail:
     kfree(E.itable); kfree(E.blk); kfree(E.xbuf);
     return err;
 }
 
-/* Where the filesystem ends, and a 64-bit id from its UUID.  The persistence log uses both. */
-static int ext_ident(uint64_t base, uint64_t *end, uint64_t *fsid) {
-    uint8_t sb[1024];
-    if (board_blk_read(base + 2, sb, 2)) return -EIO;
-    if (le32(sb + 24) > 6) return -EINVAL;
-    uint32_t bs = 1024u << le32(sb + 24);
-    if (bs > 65536) return -EINVAL;
-    uint32_t rev = le32(sb + 76), inc = rev ? le32(sb + 96) : 0;
-    uint64_t blocks = le32(sb + 4) | ((inc & 0x80) ? (uint64_t)le32(sb + 0x150) << 32 : 0);
-    uint64_t sectors = board_blk_sectors();
-    if (base > sectors || blocks > (sectors - base) / (bs / 512)) return -EINVAL;
-    *end = base + blocks * (bs / 512);
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (int i = 0; i < 16; i++) { h ^= sb[104 + i]; h *= 0x100000001b3ULL; }
-    *fsid = h;
-    return 0;
-}
-
-const struct fs_driver ext_driver = { "ext2/3/4", ext_probe, ext_mount, ext_read, ext_ident };
+const struct fs_driver ext_driver = { .name = "ext2/3/4", .mount = ext_mount, .read = ext_read };

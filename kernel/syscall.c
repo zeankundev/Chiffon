@@ -114,6 +114,115 @@ static long user_io(struct file *f, uintptr_t buf, size_t n, int wr) {
     kfree(tmp);
     return done ? (long)done : r;
 }
+/* ---- sendfile / mount / umount2 / rseq ---- */
+
+/* sendfile(out, in, *offset, count).  With an offset the input's file position is left alone and
+ * *offset is advanced; without one the position advances as read(2) would.  Data moves through a
+ * page-sized kernel buffer.  On a short write the input position reflects only what was written. */
+static long sys_sendfile(long out_fd, long in_fd, uintptr_t uoff, size_t count) {
+    struct file *in = getfd(in_fd), *out = getfd(out_fd);
+    if (!in || !out) return -EBADF;
+    if (in->type != F_NODE || S_ISDIR(in->node->mode)) return -EINVAL;   /* input must be a regular file */
+    uint64_t start = 0;
+    if (uoff) {
+        if (!uwok(uoff, sizeof start)) return -EFAULT;
+        memcpy(&start, (const void *)uoff, sizeof start);
+        if ((int64_t)start < 0) return -EINVAL;
+    }
+    uint8_t *tmp = kmalloc(PAGE_SIZE);
+    if (!tmp) return -ENOMEM;
+    size_t saved = in->off;
+    if (uoff) in->off = (size_t)start;
+    file_dup(in); file_dup(out);
+    size_t done = 0;
+    long err = 0;
+    while (done < count) {
+        size_t chunk = count - done < PAGE_SIZE ? count - done : PAGE_SIZE;
+        ssize_t r = file_read(in, tmp, chunk);
+        if (r <= 0) { if (r < 0) err = r; break; }
+        ssize_t w = 0;
+        while (w < r) {
+            ssize_t k = file_write(out, tmp + w, (size_t)(r - w));
+            if (k <= 0) { err = k < 0 ? k : -EIO; break; }
+            w += k;
+        }
+        done += (size_t)w;
+        if (w < r) break;
+    }
+    file_close(in); file_close(out);
+    kfree(tmp);
+    if (uoff) {
+        uint64_t next = start + done;
+        memcpy((void *)uoff, &next, sizeof next);
+        in->off = saved;
+    } else {
+        in->off = saved + done;
+    }
+    if (done) return (long)done;
+    return err;
+}
+
+/* Chiffon mounts its root and pseudo filesystems during boot and keeps no mount table yet, so a
+ * runtime mount is refused with EPERM (or ENODEV for an unknown filesystem type).  The argument
+ * checks are real: the target must exist and be a directory. */
+static int known_fstype(const char *t) {
+    static const char *const types[] = { "ext2", "ext3", "ext4", "vfat", "fat", "exfat", "proc",
+                                         "sysfs", "tmpfs", "ramfs", "devtmpfs", 0 };
+    for (int i = 0; types[i]; i++) if (!strcmp(t, types[i])) return 1;
+    return 0;
+}
+static long sys_mount(uintptr_t usrc, uintptr_t utgt, uintptr_t ufstype) {
+    char tgt[PATH_MAX], abs[PATH_MAX], fst[32] = "";
+    (void)usrc;
+    int r = upath(utgt, tgt);
+    if (r) return r;
+    if (ufstype) {
+        r = ustrcpy(fst, ufstype, sizeof fst);
+        if (r) return r;
+    }
+    r = vfs_resolve(tgt, 1, abs);
+    if (r) return r;
+    struct node *n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (!S_ISDIR(n->mode)) return -ENOTDIR;
+    if (fst[0] && !known_fstype(fst)) return -ENODEV;
+    return -EPERM;
+}
+static long sys_umount2(uintptr_t utgt, int flags) {
+    char tgt[PATH_MAX], abs[PATH_MAX];
+    (void)flags;
+    int r = upath(utgt, tgt);
+    if (r) return r;
+    r = vfs_resolve(tgt, 1, abs);
+    if (r) return r;
+    if (!node_find(abs)) return -ENOENT;
+    if (!strcmp(abs, "/")) return -EBUSY;                 /* the root is never unmounted */
+    return -EINVAL;                                       /* not a mount point (no runtime mounts) */
+}
+
+/* rseq(2).  Registration stores the thread's area; the scheduler publishes the CPU id into it
+ * (rseq_publish).  Restartable critical sections (rseq_cs) are not aborted on preemption yet, so
+ * code that depends on that restart guarantee must not rely on this interface. */
+#define RSEQ_FLAG_UNREGISTER 1u
+#define RSEQ_MIN_LEN 32u
+static long sys_rseq(uintptr_t area, uint32_t len, unsigned flags, uint32_t sig) {
+    if (flags & ~RSEQ_FLAG_UNREGISTER) return -EINVAL;
+    if (flags & RSEQ_FLAG_UNREGISTER) {
+        if (!cur->rseq_area || area != cur->rseq_area || len != cur->rseq_len || sig != cur->rseq_sig)
+            return -EINVAL;
+        uint32_t v[2] = { 0, (uint32_t)-1 };               /* cpu_id = RSEQ_CPU_ID_UNINITIALIZED */
+        memcpy((void *)area, v, sizeof v);
+        cur->rseq_area = 0; cur->rseq_len = 0; cur->rseq_sig = 0;
+        return 0;
+    }
+    if (cur->rseq_area) return -EBUSY;
+    if (len < RSEQ_MIN_LEN || (area & (RSEQ_MIN_LEN - 1))) return -EINVAL;
+    if (!uwok(area, len)) return -EFAULT;
+    cur->rseq_area = area; cur->rseq_len = len; cur->rseq_sig = sig;
+    rseq_publish(cur, this_cpu()->id);
+    return 0;
+}
+
 static long sys_io(long fd, uintptr_t buf, size_t n, int wr) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
@@ -464,6 +573,7 @@ static long sys_execve(struct trapframe *tf, uintptr_t upathp, uintptr_t uargv, 
     if ((r = copy_strv(uenvp, &envp)) < 0) { free_strv(argv); return r; }
     group_quiesce();
     r = proc_exec(cur, p, argv, envp, tf);
+    if (!r) { cur->rseq_area = 0; cur->rseq_len = cur->rseq_sig = 0; }   /* exec unregisters rseq */
     free_strv(argv); free_strv(envp);
     return r;
 }
@@ -473,15 +583,11 @@ static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack
     if (flags == (0x100 | 0x4000 | 17) && (!stack || stack == TF_SP(tf)))
         return proc_fork(tf);
     if (flags & 0x100) {                              /* CLONE_VM: a thread (CLONE_THREAD) or vfork-style sharing */
-        if (!(flags & 0x10000)) return -ENOSYS;
-#if ARCH_AARCH64
+        if (!(flags & 0x10000)) return -ENOSYS;       /* bare CLONE_VM (vfork-style) not supported */
         int tid = proc_thread(tf, flags, stack, tls, ctid);
         if (tid < 0) return tid;
         if ((flags & 0x100000) && uwok(ptid, 4)) *(int *)ptid = tid;       /* CLONE_PARENT_SETTID */
         return tid;
-#else
-        return -ENOSYS;                               /* x86_64 threads need fs_base TLS support first */
-#endif
     }
     int pid = proc_fork(tf);
     if (pid < 0) return pid;
@@ -715,6 +821,172 @@ static long do_poll(uintptr_t ufds, unsigned nfds, long tmo_ms) {
     }
 }
 
+static long sys_flock(long fd, int operation) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    return 0;
+}
+
+static long sys_ftruncate(long fd, long length) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    if (length < 0) return -EINVAL;
+    if (f->type != F_NODE) return -EINVAL;
+    if (f->node->readonly) return -EROFS;
+    f->node->size = length;
+    persist_chmod(f->node);
+    return 0;
+}
+
+static long sys_truncate(uintptr_t up, long length) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 1, abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    if (length < 0) return -EINVAL;
+    n->size = length;
+    persist_chmod(n);
+    return 0;
+}
+
+static long sys_link_common(const char* abs_o, const char* abs_n) {
+    struct node* src = node_find(abs_o);
+    if (!src) return -ENOENT;
+    if (node_find(abs_n)) return -EEXIST;
+    if (src->readonly || ro_parent(abs_n)) return -EROFS;
+    if (S_ISDIR(src->mode)) return -EPERM;
+    struct node* n = node_create(abs_n, src->mode);
+    if (!n) return -ENOMEM;
+    n->size = src->size;
+    n->data = src->data;
+    persist_node_created(n);
+    return 0;
+}
+
+static long sys_link(uintptr_t oldpath, uintptr_t newpath) {
+    char o[PATH_MAX], n[PATH_MAX], abs_o[PATH_MAX], abs_n[PATH_MAX];
+    int r;
+    if ((r = upath(oldpath, o)) || (r = upath(newpath, n))) return r;
+    if ((r = vfs_resolve(o, 1, abs_o)) || (r = vfs_resolve(n, 0, abs_n))) return r;
+    return sys_link_common(abs_o, abs_n);
+}
+
+static long sys_linkat(long olddirfd, uintptr_t oldpath, long newdirfd, uintptr_t newpath, int flags) {
+    char o[PATH_MAX], n[PATH_MAX], abs_o[PATH_MAX], abs_n[PATH_MAX];
+    int r;
+    if ((r = upath(oldpath, o)) || (r = upath(newpath, n))) return r;
+    if ((r = vfs_resolve(o, 1, abs_o)) || (r = vfs_resolve(n, 0, abs_n))) return r;
+    return sys_link_common(abs_o, abs_n);
+}
+
+static long sys_chown(uintptr_t up, uint32_t uid, uint32_t gid) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 1, abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    return 0;
+}
+
+static long sys_lchown(uintptr_t up, uint32_t uid, uint32_t gid) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 0, abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    return 0;
+}
+
+static long sys_fchown(long fd, uint32_t uid, uint32_t gid) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    if (f->type != F_NODE) return -EINVAL;
+    if (f->node->readonly) return -EROFS;
+    return 0;
+}
+
+static long sys_fchownat(long dirfd, uintptr_t up, uint32_t uid, uint32_t gid, int flags) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, !(flags & AT_SYMLINK_NOFOLLOW), abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    return 0;
+}
+
+static long put_statfs(uintptr_t ub) {
+    if (!uwok(ub, 120)) return -EFAULT;
+    uint64_t* b = (uint64_t*)ub;
+    memset(b, 0, 120);
+    b[0] = 0xef53;
+    b[1] = 4096;
+    b[2] = 262144;
+    b[3] = 200000;
+    b[4] = 200000;
+    b[5] = 100000;
+    b[6] = 80000;
+    return 0;
+}
+
+static long sys_statfs(uintptr_t up, uintptr_t ub) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 1, abs))) return r;
+    if (!node_find(abs)) return -ENOENT;
+    return put_statfs(ub);
+}
+
+static long sys_fstatfs(long fd, uintptr_t ub) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    return put_statfs(ub);
+}
+
+static long sys_utimensat(long dirfd, uintptr_t up, uintptr_t utimes, int flags) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, !(flags & AT_SYMLINK_NOFOLLOW), abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    if (utimes) {
+        if (!uok(utimes, 32)) return -EFAULT;
+        uint64_t* ts = (uint64_t*)utimes;
+        n->mtime = ts[2];
+        persist_chmod(n);
+    }
+    else {
+        n->mtime = BOOT_EPOCH + ticks / HZ;
+        persist_chmod(n);
+    }
+    return 0;
+}
+
+static long sys_getgroups(int size, uintptr_t list) {
+    if (size < 0) return -EINVAL;
+    if (size > 0) {
+        if (!uwok(list, 4)) return -EFAULT;
+        *(uint32_t*)list = 0;
+    }
+    return 1;
+}
+
+static long sys_setgroups(int size, uintptr_t list) {
+    if (size < 0 || size > 32) return -EINVAL;
+    return 0;
+}
+
 /* ---- dispatcher ---- */
 #ifdef SYSCALL_TRACE
 #define TRACE(...) kprintf(__VA_ARGS__)
@@ -769,6 +1041,18 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_mprotect: return mm_protect(cur->mm, a0, a1, a2);
     case SYS_madvise: return 0;
     case SYS_mremap: return -ENOMEM;
+
+    case SYS_flock: return sys_flock(a0, a1);
+    case SYS_truncate: return sys_truncate(a0, a1);
+    case SYS_ftruncate: return sys_ftruncate(a0, a1);
+    case SYS_linkat: return sys_linkat(a0, a1, a2, a3, a4);
+    case SYS_fchown: return sys_fchown(a0, a1, a2);
+    case SYS_fchownat: return sys_fchownat(a0, a1, a2, a3, a4);
+    case SYS_statfs: return sys_statfs(a0, a1);
+    case SYS_fstatfs: return sys_fstatfs(a0, a1);
+    case SYS_utimensat: return sys_utimensat(a0, a1, a2, a3);
+    case SYS_getgroups: return sys_getgroups(a0, a1);
+    case SYS_setgroups: return sys_setgroups(a0, a1);
 
     case SYS_clone: return sys_clone(tf, a0, a1, a2, CLONE_TLS_ARG(a3, a4), CLONE_CTID_ARG(a3, a4));
     case SYS_futex: return sys_futex(a0, a1, a2, a3);
@@ -826,18 +1110,23 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
             if (a1 == 7) ((uint64_t *)a3)[0] = ((uint64_t *)a3)[1] = NOFILE;
         }
         return 0; }
+    case SYS_setitimer: {                 /* ITIMER_REAL only; expiry is not delivered yet */
+        if (a0 != 0) return -EINVAL;
+        if (a2 && !uwok(a2, 32)) return -EFAULT;
+        if (a2) memset((void*)a2, 0, 32);   /* previous timer: disarmed */
+        return 0;
+    }
+    case SYS_getitimer: {
+        if (!uwok(a1, 32)) return -EFAULT;
+        memset((void*)a1, 0, 32);
+        return 0;
+    }
     case SYS_getrandom: {
         if (a2 & ~3UL) return -EINVAL;
         if (!uwok(a0, a1)) return -EFAULT;
-        for (long i = 0; i < a1;) {
-            uint64_t word;
-            int err = hardware_random_word(&word);
-            if (err) return i ? i : err;
-            size_t n = a1 - i < 8 ? (size_t)(a1 - i) : sizeof word;
-            memcpy((uint8_t *)a0 + i, &word, n);
-            i += n;
-        }
-        return a1; }
+        kernel_random_fill((void*)a0, (size_t)a1);
+        return a1;
+    }
     case SYS_sysinfo: {
         if (!uwok(a0, 112)) return -EFAULT;
         uint64_t s[14] = {0};
@@ -981,6 +1270,10 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         struct file *f = getfd(a0);
         return f ? sock_getsockopt(f, (int)a1, (int)a2, a3, a4) : -EBADF;
     }
+    case SYS_sendfile: return sys_sendfile(a0, a1, a2, a3);
+    case SYS_mount: return sys_mount(a0, a1, a2);
+    case SYS_umount2: return sys_umount2(a0, (int)a1);
+    case SYS_rseq: return sys_rseq(a0, (uint32_t)a1, (unsigned)a2, (uint32_t)a3);
 
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:
@@ -989,6 +1282,9 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         return -EINVAL;
 #endif
 #ifdef SYS_open
+    case SYS_link: return sys_link(a0, a1);
+    case SYS_chown: return sys_chown(a0, a1, a2);
+    case SYS_lchown: return sys_lchown(a0, a1, a2);
     case SYS_open: return sys_openat(AT_FDCWD, a0, a1, a2);
     case SYS_stat: return stat_path_u(a0, 1, a1);
     case SYS_lstat: return stat_path_u(a0, 0, a1);
@@ -1025,6 +1321,8 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
 
 void syscall_dispatch(struct trapframe *tf) {
     long r = handle(tf, TF_SYSNO(tf), TF_A0(tf), TF_A1(tf), TF_A2(tf), TF_A3(tf), TF_A4(tf), TF_A5(tf));
+    if (r == -ENOSYS)
+        kprintf("[chiffon] ENOSYS: syscall %ld (pid %d)\n", (long)TF_SYSNO(tf), cur->pid);
     TF_RET(tf) = r;
     check_killed();
 }

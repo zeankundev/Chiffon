@@ -1,6 +1,7 @@
 /* Driver registry, ordered bring-up and IRQ routing.  See include/driver.h. */
 #include "kernel.h"
 #include "fb.h"
+#include "drivers/usb.h"
 
 extern struct kdriver *const __kdrivers_start[], *const __kdrivers_end[];
 
@@ -122,8 +123,9 @@ long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2) {
         if ((val1 && val1 != DEV_TYPE_FB) || val2) return -EINVAL;
         if (!target->ncaps || target->caps[0].type != CHI_CAP_MMIO) return -EPERM;
         val1 = DEV_TYPE_FB;
-    } else if (type == CHI_CAP_IRQ || type == CHI_CAP_LOADER) {
-        /* The registered user framebuffer has no IRQ. The loader is boot-only. */
+    } else if (type == CHI_CAP_IRQ || type == CHI_CAP_LOADER || type == CHI_CAP_DMA) {
+        /* The framebuffer has no IRQ, loader authority is boot-only and DMA
+         * remains kernel-owned until a device isolation domain exists. */
         return -EPERM;
     } else {
         return -EINVAL;
@@ -134,7 +136,7 @@ long cap_grant(int pid, uint32_t type, uintptr_t val1, size_t val2) {
         struct proc *owner = &ptable[i];
         for (int j = 0; j < owner->ncaps; j++) {
             const struct proc_cap *cap = &owner->caps[j];
-            if (cap->type != type) continue;
+            if (cap->type != type || (type == CHI_CAP_DRIVER && cap->base != val1)) continue;
             if (owner == target && cap->base == val1 && cap->size == val2) return 0;
             return -EBUSY;
         }
@@ -202,6 +204,9 @@ long dev_irq_wait(unsigned irq) {
 
 void dev_driver_cleanup(struct proc *p) {
     if (!p) return;
+#ifdef __x86_64__
+    if (cap_check(p, CHI_CAP_DRIVER, DEV_TYPE_HID, 0)) usb_hid_reset();
+#endif
     p->ncaps = 0;
     p->is_driver_loader = 0;
     p->driver_bootstrap = 0;

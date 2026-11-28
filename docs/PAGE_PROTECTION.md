@@ -6,7 +6,7 @@ The ELF loader checks the program-header and segment bounds and requires the ent
 
 `mmap` and `mprotect` reject simultaneous write and execute access. `mprotect` changes existing pages in place and checks the full range before updating it. Device mappings reject execute access and retain their memory attributes across protection changes. Fork copies ordinary page contents and protections and skips device mappings. The child must obtain authority to map a device into its own address space. Processes with driver authority or an active driver bootstrap cannot create threads sharing their address space. [Memory management](../kernel/proc.c), [syscalls](../kernel/syscall.c)
 
-The protection applies to user mappings. The trusted kernel uses its direct map to populate new file-backed pages and synchronize instruction caches. Kernel mapping protections and cross-CPU page-table synchronization need separate review. Runtime confirmation is pending for both supported architectures.
+The protection applies to user mappings. The trusted kernel uses its direct map to populate new file-backed pages and synchronize instruction caches. The Demo VM probe exercised W^X request denial, permission transitions and private fork contents in both QEMU guests. The capability probe checked ordinary-process MMIO denial and invalid IPC buffers. The HID service receives copied reports and requires no controller mapping. Kernel mapping protections, cross-CPU synchronization and comprehensive user-pointer coverage still need separate review. [Tested scope](RELEASE_EVIDENCE.md)
 
 ## Kernel stack guard and random bytes
 

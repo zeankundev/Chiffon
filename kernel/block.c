@@ -14,19 +14,12 @@ static uint32_t mbr_u32(const uint8_t *p) {
 }
 
 static int try_volume(uint64_t base, uint64_t limit, uint64_t occupied_end, const char *what) {
-    /* Both probe and ident read the two sectors containing the ext superblock. */
-    if (base > limit || limit - base < 4) return -EINVAL;
     for (int i = 0; drivers[i]; i++) {
         uint64_t end, id;
-        if (drivers[i]->probe(base)) continue;
-        if (!drivers[i]->ident || drivers[i]->ident(base, &end, &id) ||
-            end <= base || end > limit) {
-            kprintf("[block] invalid filesystem extent on %s\n", what);
-            return -EINVAL;
-        }
-        kprintf("[block] found volume %s: %s filesystem\n", what, drivers[i]->name);
-        int r = drivers[i]->mount(base);
+        int r = drivers[i]->mount(base, limit, &end, &id);
+        if (r == -ENOENT) continue;
         if (r == 0) {
+            kprintf("[block] found volume %s: %s filesystem\n", what, drivers[i]->name);
             vfs_mark_base();
             persist_attach_fs(occupied_end > end ? occupied_end : end, id);
         }

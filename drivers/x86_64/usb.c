@@ -5,18 +5,22 @@
 #include "kernel.h"
 #include "fat.h"
 #include "drivers/usb.h"
-#include "drivers/hid_keyboard.h"
+/* One 256-usage bitmap per parsed report slot. Descriptor interpretation is user space. */
+#define USB_REPORT_SLOTS 16
+struct hid_keyboard_keys { uint8_t bits[32]; };
 
 #define USB_MAX_KEYBOARDS 8
 struct usb_keyboard {
     uint8_t ep, iface, boot, active;
     uint16_t report_len;
-    struct hid_keyboard_layout layout;
-    struct hid_keyboard_keys reports[HID_KEYBOARD_MAX_REPORTS];
+    uint32_t descriptor_id;
+    uint8_t *descriptor;
+    struct hid_keyboard_keys reports[USB_REPORT_SLOTS];
 };
 
 struct usbdev {
     int attached, port, speed, unit, unit_set;
+    uint32_t generation;
     uint16_t vid, pid;
     uint8_t mouse_ep, mouse_if, msc_in, msc_out;
     uint8_t prev_btn;
@@ -88,7 +92,7 @@ static void kbd_merge(struct usbdev *d) {
     for (unsigned i = 0; i < d->nkbd; i++) {
         struct usb_keyboard *k = d->keyboards[i];
         if (!k->active) continue;
-        unsigned count = k->boot ? 1 : k->layout.report_count;
+        unsigned count = k->boot ? 1 : USB_REPORT_SLOTS;
         for (unsigned j = 0; j < count; j++)
             for (unsigned b = 0; b < sizeof keys.bits; b++) keys.bits[b] |= k->reports[j].bits[b];
     }
@@ -101,44 +105,114 @@ static void kbd_merge(struct usbdev *d) {
     kbd_transitions(d, &keys, 0xE8, 256, 1);
     d->keys = keys;
 }
-static void kbd_report(struct usbdev *d, struct usb_keyboard *k, const uint8_t *r, uint32_t len) {
-    struct hid_keyboard_keys keys = { { 0 } };
-    unsigned slot = 0;
-    if (k->boot) {
-        if (len < 8) return;
-        for (unsigned i = 2; i < 8; i++) if (r[i] >= 1 && r[i] <= 3) return;
-        for (unsigned i = 0; i < 8; i++) if (r[0] & (1u << i)) keys.bits[(0xE0 + i) >> 3] |= 1u << ((0xE0 + i) & 7);
-        for (unsigned i = 2; i < 8; i++) if (r[i]) keys.bits[r[i] >> 3] |= 1u << (r[i] & 7);
-    } else {
-        uint8_t id;
-        if (hid_keyboard_decode(&k->layout, r, len, &keys, &id)) return;
-        while (slot < k->layout.report_count && k->layout.report_ids[slot] != id) slot++;
-        if (slot == k->layout.report_count) return;
-    }
-    k->reports[slot] = keys;
-    kbd_merge(d);
-}
+/* Only the current transaction can be completed. A generation change invalidates
+ * copies in flight across disconnect/reconnect, even at the same port address. */
+#define HID_QUEUE 32
+struct hid_transfer {
+    unsigned port, endpoint, generation, serial, length;
+    uint8_t bytes[1024];
+};
+static struct hid_transfer hidq[HID_QUEUE];
+static unsigned head, count, next_serial, next_generation, next_descriptor;
+static int notified;
 
-static void mouse_report(struct usbdev *d, const uint8_t *r, uint32_t len) {
-    if (len < 3) return;
-    uint8_t changed = d->prev_btn ^ r[0];
+static void update_buttons(struct usbdev *d, uint8_t buttons) {
+    unsigned others = 0;
+    for (int p = 1; p <= USB_MAX_PORTS; p++)
+        if (&devs[p] != d) others |= devs[p].prev_btn;
+    unsigned change = (d->prev_btn ^ buttons) & ~others;
     for (int b = 0; b < 3; b++)
-        if (changed & (1u << b)) input_btn((unsigned)b, (r[0] >> b) & 1);
-    input_rel(0, (int8_t)r[1]);
-    input_rel(1, (int8_t)r[2]);
-    d->prev_btn = r[0] & 7;
+        if (change & (1u << b)) input_btn(b, !!(buttons & (1u << b)));
+    d->prev_btn = buttons;
 }
-
-void usb_report(int p, uint8_t addr, const uint8_t *data, uint32_t len) {
-    if (p < 1 || p > USB_MAX_PORTS) return;
-    struct usbdev *d = &devs[p];
-    if (!d->attached) return;
+void usb_hid_reset(void) {
+    head = count = notified = 0;
+    for (int p = 1; p <= USB_MAX_PORTS; p++) {
+        struct usbdev *d = &devs[p];
+        if (!d->attached) continue;
+        for (unsigned i = 0; i < d->nkbd; i++)
+            memset(d->keyboards[i]->reports, 0, sizeof d->keyboards[i]->reports);
+        kbd_merge(d);
+        update_buttons(d, 0);
+    }
+}
+static struct usb_keyboard *keyboard_at(struct usbdev *d, unsigned ep) {
     for (unsigned i = 0; i < d->nkbd; i++)
-        if (d->keyboards[i]->active && addr == d->keyboards[i]->ep) {
-            kbd_report(d, d->keyboards[i], data, len);
-            return;
+        if (d->keyboards[i]->active && d->keyboards[i]->ep == ep) return d->keyboards[i];
+    return 0;
+}
+static void consume(void) {
+    head = (head + 1) % HID_QUEUE;
+    count--;
+    if (!count) notified = 0;
+}
+static int hid_bus(const struct chi_ipc_msg *req, struct chi_ipc_msg *rep) {
+    if (!cap_check(cur, CHI_CAP_DRIVER, DEV_TYPE_HID, 0)) return -EPERM;
+    while (count && devs[hidq[head].port].generation != hidq[head].generation) consume();
+    if (!count) return -EAGAIN;
+    struct hid_transfer *t = &hidq[head];
+    struct usbdev *d = &devs[t->port];
+    struct usb_keyboard *k = keyboard_at(d, t->endpoint);
+    if (req->tag == HID_BUS_HEAD && !req->len) {
+        struct chi_hid_report info = { t->serial, !k ? HID_BOOT_MOUSE : k->boot ? HID_BOOT_KEY : HID_REPORT_KEY,
+                                       t->length, k && !k->boot ? k->report_len : 0, k ? k->descriptor_id : 0 };
+        memcpy(rep->data, &info, sizeof info);
+        rep->len = sizeof info;
+        return 0;
+    }
+    if (req->tag == HID_BUS_DESC || req->tag == HID_BUS_REPORT) {
+        struct chi_hid_slice slice;
+        if (req->len != sizeof slice) return -EINVAL;
+        memcpy(&slice, req->data, sizeof slice);
+        if (slice.serial != t->serial) return -EPIPE;
+        const uint8_t *data = t->bytes;
+        unsigned len = t->length;
+        if (req->tag == HID_BUS_DESC) {
+            if (!k || !k->descriptor) return -EINVAL;
+            data = k->descriptor;
+            len = k->report_len;
         }
-    if (addr == d->mouse_ep) mouse_report(d, data, len);
+        if (slice.offset >= len) return -EINVAL;
+        rep->len = len - slice.offset;
+        if (rep->len > IPC_DATA_MAX) rep->len = IPC_DATA_MAX;
+        memcpy(rep->data, data + slice.offset, rep->len);
+        return 0;
+    }
+    struct chi_hid_result result;
+    if (req->tag != HID_BUS_DONE || req->len != sizeof result) return -EINVAL;
+    memcpy(&result, req->data, sizeof result);
+    if (result.serial != t->serial) return -EPIPE;
+    if (result.valid) {
+        if (k) {
+            if (result.slot >= (k->boot ? 1 : USB_REPORT_SLOTS)) return -EINVAL;
+            memcpy(k->reports[result.slot].bits, result.keys, sizeof result.keys);
+            kbd_merge(d);
+        } else {
+            if (result.buttons > 7) return -EINVAL;
+            update_buttons(d, result.buttons);
+            input_rel(0, result.dx);
+            input_rel(1, result.dy);
+        }
+    }
+    consume();
+    return 0;
+}
+void usb_hid_init(void) {
+    ipc_register_service(IPC_SVC_HID_BUS, hid_bus);
+}
+void usb_report(int p, uint8_t addr, const uint8_t *data, uint32_t len) {
+    if (p < 1 || p > USB_MAX_PORTS || !len || len > sizeof hidq[0].bytes) return;
+    struct usbdev *d = &devs[p];
+    if (!d->attached || (!keyboard_at(d, addr) && addr != d->mouse_ep)) return;
+    /* Losing a transition must never strand a key or button in the down state. */
+    if (count == HID_QUEUE) usb_hid_reset();
+    struct hid_transfer *t = &hidq[(head + count++) % HID_QUEUE];
+    t->port = p;
+    t->endpoint = addr;
+    t->generation = d->generation;
+    t->serial = ++next_serial;
+    t->length = len;
+    memcpy(t->bytes, data, len);
 }
 
 /* ---- bulk-only transport for mass storage ---- */
@@ -232,6 +306,8 @@ int usb_attach(int p, int speed) {
     struct usbdev *d = &devs[p];
     memset(d, 0, sizeof *d);
     d->port = p; d->speed = speed; d->attached = 1;
+    if (!++next_generation) ++next_generation;
+    d->generation = next_generation;
     uint8_t dd[18], *cfg = 0;
     int err = -EIO, activated = 0;
     if (ctrl(p, 0x80, 6, 0x0100, 0, dd, 8) != 8) goto fail;
@@ -323,10 +399,13 @@ int usb_attach(int p, int speed) {
             if (report) {
                 int got = ctrl(p, 0x81, 6, 0x2200, k->iface, report, k->report_len);
                 if (got != k->report_len) err = -EIO;
-                else if (!hid_keyboard_parse(&k->layout, report, k->report_len)) {
+                else {
+                    if (!++next_descriptor) ++next_descriptor;
+                    k->descriptor_id = next_descriptor;
+                    k->descriptor = report;
                     k->boot = 0; k->active = 1;
                 }
-                kfree(report);
+                if (!k->descriptor) kfree(report);
             } else err = -ENOMEM;
         } else if (k->boot) {
             err = -EIO;
@@ -363,13 +442,17 @@ void usb_detach(int p) {
     struct usbdev *d = &devs[p];
     for (unsigned i = 0; i < d->nkbd; i++) d->keyboards[i]->active = 0;
     kbd_merge(d);
-    for (unsigned i = 0; i < d->nkbd; i++) kfree(d->keyboards[i]);
-    for (unsigned b = 0; b < 3; b++) if (d->prev_btn & (1u << b)) input_btn(b, 0);
+    for (unsigned i = 0; i < d->nkbd; i++) {
+        kfree(d->keyboards[i]->descriptor);
+        kfree(d->keyboards[i]);
+    }
+    update_buttons(d, 0);
     if (d->vol) { fat_unmount(d->vol); kprintf("[usb] port %d: /media/usb%d unmounted\n", p, d->unit); }
     memset(d, 0, sizeof *d);
 }
 
 void usb_poll(void) {
+    if (count && !notified && !ipc_notify_hid()) notified = 1;
     if (!vfs_ready()) return;                             /* volumes wait until the namespace exists */
     for (int p = 1; p <= USB_MAX_PORTS; p++) {
         struct usbdev *d = &devs[p];
