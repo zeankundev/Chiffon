@@ -13,11 +13,13 @@ import time
 from boot_smoke import qemu_command
 
 
-def verify(arch, kernel, disk, log):
+def verify(arch, kernel, disk, log, primary=False):
     with tempfile.TemporaryDirectory() as temp:
         address = str(Path(temp) / "qmp")
         command = qemu_command(arch, kernel, disk) + ["-qmp", f"unix:{address},server=on,wait=off"]
-        if arch == "x86_64":
+        if primary and arch == "aarch64":
+            command += ["-device", "virtio-keyboard-device", "-device", "ramfb"]
+        if arch == "x86_64" and not primary:
             command += ["-device", "qemu-xhci,id=xhci", "-device", "usb-kbd,bus=xhci.0,id=kb",
                         "-device", "usb-mouse,bus=xhci.0,id=mouse"]
         with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -61,8 +63,20 @@ def verify(arch, kernel, disk, log):
                                     raise RuntimeError(msg["error"])
 
                         qmp("qmp_capabilities")
+                        if primary:
+                            shell("direct-key-probe")
+                            expect(rb"READY direct Ctrl-C")
+                            for key, down in [("ctrl", True), ("c", True), ("c", False), ("ctrl", False)]:
+                                qmp("input-send-event", events=[{"type": "key", "data": {
+                                    "down": down, "key": {"type": "qcode", "data": key}}}])
+                                time.sleep(0.12)
+                            expect(rb"PASS direct Ctrl-C")
+                            expect(rb"hello-init# ")
+                            shell("direct-key-probe restored")
+                            expect(rb"PASS restored TTY")
+                            expect(rb"hello-init# ")
                         previous = 0
-                        for iteration in range(2):
+                        for iteration in range(0 if primary else 2):
                             if iteration:
                                 if arch == "x86_64":
                                     qmp("device_del", id="kb")
@@ -104,7 +118,8 @@ if __name__ == "__main__":
     parser.add_argument("kernel", type=Path)
     parser.add_argument("disk", type=Path)
     parser.add_argument("log", type=Path)
+    parser.add_argument("--primary", action="store_true", help="test Ctrl-C on the primary board keyboard")
     args = parser.parse_args()
     with args.log.open("wb") as output:
-        verify(args.arch, args.kernel, args.disk, output)
-    print("PASS HID service", args.arch)
+        verify(args.arch, args.kernel, args.disk, output, args.primary)
+    print("PASS primary keyboard" if args.primary else "PASS HID service", args.arch)

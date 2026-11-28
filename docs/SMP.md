@@ -48,6 +48,8 @@ audit of memory management, process ownership, IPC, and drivers.
 
 ## Runtime acceptance
 
+The hybrid integration suites use one vCPU per guest. They cover user-server restart while the kernel retains TTY, storage and networking. They provide no multi-CPU stress measurements or cross-CPU teardown evidence. [Integration evidence](RELEASE_EVIDENCE.md)
+
 - AArch64 QEMU virt with one vCPU should stay at one online CPU.
 - With `-smp 4` on the full profile, each initialized secondary should
   announce a distinct logical ID once, and the last announcement should

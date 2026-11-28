@@ -6,6 +6,8 @@ Driver-process crash containment and MMIO/IRQ capabilities do not confine a devi
 
 ## Source inventory
 
+Driver ABI v3 reserves the deny-only `CHI_CAP_DMA` capability. The framebuffer server maps only its granted pixel extent. The USB HID process reads copies of reports and descriptors through its bounded kernel IPC endpoint. The trusted controller driver retains USB transfer buffers and DMA addresses across the service boundary. The QEMU restart tests exercise process isolation and leave the trusted-device deployment restriction in force. [HID transport design](hybrid/P2a.md)
+
 | Platform and path | Device-visible memory and current behavior |
 | --- | --- |
 | AArch64 virtio block (`include/drivers/virtio_mmio_blk.h`) | A static queue, request header, status and bounce buffer are submitted using `V2P`; caller buffers are copied rather than submitted. Calls are serialized by rejecting concurrent requests. Polling is bounded; timeout or an unexpected used-ring completion permanently fails this driver instance, leaving its static DMA storage unused. This does not prove the device has stopped DMA. Writes retain their flush request. |

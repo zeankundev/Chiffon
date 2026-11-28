@@ -45,6 +45,8 @@ The report shows both headers, their CRC and ext UUID match, the slot the kernel
 
 ## Human verification
 
+The two-target automated test boots a scratch disk three times. It checks persistence across framebuffer service death, compacts CHIFLOG2 with 3,000 writes, then verifies rename and unlink replay after a QEMU stop following sync. The block and VFS paths remain in the kernel on both boards. Device cache behavior under physical power loss and interrupted writes still require dedicated testing. [Storage runner](../tools/release/storage_smoke.py) · [Release evidence](RELEASE_EVIDENCE.md)
+
 Use the same disk image for each boot and check both aarch64 virtio-blk and x86_64 ATA PIO. Commit an initial file, overwrite it, and stop the guest during the overwrite's close or fsync. Recovery should preserve the initial file or show the complete replacement. Repeat during compaction and legacy migration and check that an interrupted generation switch preserves the committed tree.
 
 Use a file too large for a journal slot to exercise flush failure. A test program should see `ENOSPC` from fsync, the final close, and the raw sync syscall while that file is dirty. Reboot with the original image and verify that previously committed files remain readable. With an existing journal on a read-only backing device, verify replay still works and that a subsequent durability request fails.

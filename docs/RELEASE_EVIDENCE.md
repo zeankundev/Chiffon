@@ -4,6 +4,14 @@ Use this runbook with the [production readiness roadmap](../ROADMAP.md) and [thr
 
 ## Generate and report evidence
 
+### Hybrid integration on Demo
+
+The P4 run tested the kernel at `9104434` with the P4 guest probe and runners. Both clean Demo ext4 builds used GCC `-Werror` for the kernel and user programs. Both single-vCPU guests booted, ran the four base probes, exercised loader status, a 32-iteration IPC benchmark and ipcdemo, and shut down. Both passed the primary Ctrl-C test and TTY mode restoration, HID lifecycle, framebuffer failure and restart, gateway ICMP, and three-boot storage replay. The x86_64 guest also exercised USB keyboard/mouse delivery and keyboard unplug/replug. The ARM guest used virtio input. Reproduce with the [P4 commands](hybrid/P4.md).
+
+The implemented boundary includes the v2 grant policy (`5e7adf0`), v3 USB HID transport (`91e2274`), bounded filesystem mounts (`8acb2b2`) and in-kernel network checks (`d0f104a`). The tested deployment uses trusted QEMU devices and backends. Physical laptop operation, DMA isolation, SMP stress and production deployment have no support claim from these runs.
+
+### CI smoke procedure
+
 1. A maintainer can manually dispatch **Release readiness smoke checks** for the candidate ref. The [workflow](../.github/workflows/readiness.yml) checks the v1 ABI fixture with both target compilers, runs the boot memory fixture on the Linux host, builds clean Demo images, and boots each image. It has no publishing permissions. The local contributor build remains the command in [.codex/AGENTS.md](../.codex/AGENTS.md).
 2. Download the readiness artifact for each architecture, even on failure. A passing run has `PASS abi`, `PASS bootmem-compile`, `PASS bootmem`, and `PASS build` in `result.txt`, `PASS boot-smoke` in `boot/result.txt`, and `PASS vm-probe` in `boot/qemu.log`. Read `abi.log`, `bootmem-compile.log`, `bootmem.log`, `build.log`, `dependencies.log`, or `boot/qemu.log` for the first failing stage. A skipped step or missing result is incomplete evidence. ABI and build checks each have a five-minute deadline. The smoke check gives QEMU 60 seconds for the expected boot banner, init prompt, `uname`, reading `/etc/chiffon.ini`, running the VM probe, and power-off with a clean QEMU exit.
 3. Record the candidate commit, release tag, ABI baseline, architecture, board, environment, QEMU version, full job URL, and result for each target. Preserve the artifact and record the image hashes from `boot/images.sha256`. Include the first failing stage and any recovery steps when filing a report. Mark runtime behavior verified only after examining both sets of results.
@@ -43,7 +51,7 @@ The maintainer reported a successful build of the clock and pathname changes. Th
 
 ## Removable USB keyboard check (pending)
 
-The Demo serial smoke runner now requires all three guest probe markers (`PASS vm-probe`, `PASS clock-probe`, and `PASS hid-probe`) before power-off.
+The Demo serial smoke runner requires VM, clock, HID and capability probe markers plus the loader and IPC command checks before power-off. The x86_64 automated HID suite exercises an emulated keyboard and mouse. The manual steps below extend coverage to other devices and held-key removal.
 
 Use the x86_64 QEMU board's graphical milkOS configuration. Its `xhci.0` bus starts empty. The built-in keyboard on the AArch64 QEMU board uses virtio-input. The xHCI driver currently binds devices directly connected to a root port and reads the first configuration, alternate setting zero. It supports HID boot keyboards and bounded keyboard/keypad report layouts including arrays, bitmaps, and report IDs. External hubs, vendor-defined key protocols, and arbitrary HID usages are outside this implementation.
 

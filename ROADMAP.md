@@ -28,6 +28,8 @@ The repository describes Chiffon as a Unix-like hybrid kernel for AArch64 and x8
 - [ ] Audit DMA address translation, cache coherency, barriers, ring ownership, and buffer lifetime in all virtio, USB, network, storage, and display drivers.
 - [ ] Validate MMIO/IRQ capabilities against device ownership and address ranges; prevent overlapping or out-of-range grants and stale capabilities after process exit/restart.
 
+Hybrid integration advances the pointer, least-privilege and ownership items above. Both QEMU guests exercise unauthorized service registration and device operations, invalid IPC buffers, framebuffer replacement and HID service restart. Positive IRQ ownership transfer, exhaustive syscall coverage and a DMA-domain implementation remain open. [Release evidence](docs/RELEASE_EVIDENCE.md)
+
 ### SMP correctness and concurrency
 
 - [ ] Reconcile SMP implementation and claims: document which architectures/boards actually start multiple CPUs and which remain single CPU by default. Fix `this_cpu()` and per-CPU setup so CPU identity is reliable on every supported target.

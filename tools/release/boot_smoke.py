@@ -75,6 +75,16 @@ def smoke(command, arch, log, timeout):
                 marker = rb"(?:^|\n)PASS " + re.escape(probe.encode()) + rb"\r?\n"
                 if not re.search(marker, output):
                     raise RuntimeError(f"{probe} did not report success")
+            for cmd, markers in [
+                ("drvloader start fb", [b"fbserver ready (PID "]),
+                ("drvloader status", [b"fbserver PID ", b"Service 'fb':            ACTIVE"]),
+                ("drvloader bench 32", [b"Iterations:       32", b"round-trips/sec"]),
+                ("ipcdemo", [b"console service:", b"bpp", b"client got: HELLO SERVER #3", b"ipcdemo: done"]),
+            ]:
+                guest.stdin.write((cmd + "\n").encode())
+                output = expect(f"{cmd} completion", prompt)
+                if any(marker not in output for marker in markers):
+                    raise RuntimeError(f"missing expected output for {cmd}")
             guest.stdin.write(b"poweroff\n")
             while read_output("poweroff"):
                 pass
