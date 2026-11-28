@@ -136,6 +136,7 @@ void kvprintf(const char *fmt, __builtin_va_list ap);
 int ksnprintf(char *buf, size_t n, const char *fmt, ...);
 void panic(const char *fmt, ...) __attribute__((noreturn));
 int hardware_random_word(uint64_t *out);
+void kernel_random_fill(void* buf, size_t n);
 void stack_guard_init(void);
 
 int kstrcasecmp(const char *a, const char *b);
@@ -256,7 +257,7 @@ int  uok(uintptr_t va, size_t len);
 int  uwok(uintptr_t va, size_t len);
 int  ustrcpy(char *dst, uintptr_t usrc, size_t max);
 
-enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT };
+enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT, DEV_RANDOM };
 struct node {
     char *path; uint32_t mode; int dev;
     int minor;       /* DEV_TTY: which terminal (serial, screen N, or a TTY_*_MINOR alias) */

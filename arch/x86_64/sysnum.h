@@ -89,6 +89,8 @@
 #define SYS_pipe2 293
 #define SYS_prlimit64 302
 #define SYS_getrandom 318
+#define SYS_setitimer 38
+#define SYS_getitimer 36
 
 #define SYS_socket 41
 #define SYS_connect 42

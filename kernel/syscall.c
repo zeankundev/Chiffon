@@ -914,18 +914,23 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
             if (a1 == 7) ((uint64_t *)a3)[0] = ((uint64_t *)a3)[1] = NOFILE;
         }
         return 0; }
+    case SYS_setitimer: {                 /* ITIMER_REAL only; expiry is not delivered yet */
+        if (a0 != 0) return -EINVAL;
+        if (a2 && !uwok(a2, 32)) return -EFAULT;
+        if (a2) memset((void*)a2, 0, 32);   /* previous timer: disarmed */
+        return 0;
+    }
+    case SYS_getitimer: {
+        if (!uwok(a1, 32)) return -EFAULT;
+        memset((void*)a1, 0, 32);
+        return 0;
+    }
     case SYS_getrandom: {
         if (a2 & ~3UL) return -EINVAL;
         if (!uwok(a0, a1)) return -EFAULT;
-        for (long i = 0; i < a1;) {
-            uint64_t word;
-            int err = hardware_random_word(&word);
-            if (err) return i ? i : err;
-            size_t n = a1 - i < 8 ? (size_t)(a1 - i) : sizeof word;
-            memcpy((uint8_t *)a0 + i, &word, n);
-            i += n;
-        }
-        return a1; }
+        kernel_random_fill((void*)a0, (size_t)a1);
+        return a1;
+    }
     case SYS_sysinfo: {
         if (!uwok(a0, 112)) return -EFAULT;
         uint64_t s[14] = {0};
@@ -1112,8 +1117,9 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
 
 void syscall_dispatch(struct trapframe *tf) {
     long r = handle(tf, TF_SYSNO(tf), TF_A0(tf), TF_A1(tf), TF_A2(tf), TF_A3(tf), TF_A4(tf), TF_A5(tf));
+    if (r == -ENOSYS)
+        kprintf("[chiffon] ENOSYS: syscall %ld (pid %d)\n", (long)TF_SYSNO(tf), cur->pid);
     TF_RET(tf) = r;
-    check_killed();
 }
 void trap_user_fault(struct trapframe *tf, const char *why, uintptr_t addr, int sig) {
     kprintf("[chiffon] user fault: pid %d, %s at 0x%lx, rip 0x%lx\n", cur->pid, why, addr, TF_PC(tf));

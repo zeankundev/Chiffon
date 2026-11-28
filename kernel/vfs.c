@@ -299,6 +299,10 @@ ssize_t file_read(struct file *f, void *buf, size_t n) {
     struct node *nd = f->node;
     if (S_ISDIR(nd->mode)) return -EISDIR;
     switch (nd->dev) {
+    case DEV_RANDOM: {
+        kernel_random_fill(buf, n);
+        return n;
+    }
     case DEV_NULL: return 0;
     case DEV_ZERO: memset(buf, 0, n); return n;
     case DEV_TTY: {
@@ -323,7 +327,7 @@ ssize_t file_write(struct file *f, const void *buf, size_t n) {
     if (S_ISDIR(nd->mode)) return -EISDIR;
     if (nd->readonly) return -EROFS;
     switch (nd->dev) {
-    case DEV_NULL: case DEV_ZERO: return n;
+    case DEV_NULL: case DEV_ZERO: case DEV_RANDOM: return n;
     case DEV_TTY: {
         int m = tty_resolve(nd->minor);
         return m < 0 ? m : tty_write(m, buf, n);
@@ -560,6 +564,7 @@ void vfs_finish(void) {
         mkdev(name, DEV_TTY, m);
     }
     mkdev("/dev/null", DEV_NULL, 0); mkdev("/dev/zero", DEV_ZERO, 0);
+    mkdev("/dev/urandom", DEV_RANDOM, 0); mkdev("/dev/random", DEV_RANDOM, 0);
     if (fb_primary()) { mkdev("/dev/fb0", DEV_FB, 0); struct node *fn = node_find("/dev/fb0"); if (fn) fn->size = fb_primary()->info.size; }
     if (!node_find("/dev")) node_create("/dev", S_IFDIR | 0755);
     if (!node_find("/dev/input")) node_create("/dev/input", S_IFDIR | 0755);
