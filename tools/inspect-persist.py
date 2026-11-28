@@ -54,21 +54,32 @@ def ext_identity(image, sectors, base):
 
 
 def find_ext(image, sectors, partition):
-    if not partition:
-        identity = ext_identity(image, sectors, 0)
-        if identity:
-            return (0, *identity)
-
+    extents = {}
     mbr = read_at(image, 0, SECTOR)
     if mbr[510:] == b"\x55\xaa":
-        for number in ([partition] if partition else range(1, 5)):
+        for number in range(1, 5):
             entry = 446 + (number - 1) * 16
+            kind = mbr[entry + 4]
             base = u32(mbr, entry + 8)
-            if not mbr[entry + 4] or not base:
+            size = u32(mbr, entry + 12)
+            if not (kind or base or size):
                 continue
-            identity = ext_identity(image, sectors, base)
+            end = base + size
+            if not kind or not base or not size or end > sectors or kind in (0x05, 0x0F, 0x85, 0xEE):
+                raise ValueError(f"invalid or unsupported MBR partition {number}")
+            if any(base < other_end and other_base < end for other_base, other_end in extents.values()):
+                raise ValueError(f"overlapping MBR partition {number}")
+            extents[number] = (base, end)
+    if not extents and not partition:
+        identity = ext_identity(image, sectors, 0)
+        if identity:
+            return 0, *identity, identity[0]
+    occupied_end = max((end for _, end in extents.values()), default=0)
+    for number, (base, end) in extents.items():
+        if not partition or partition == number:
+            identity = ext_identity(image, end, base)
             if identity:
-                return (base, *identity)
+                return base, *identity, occupied_end
     raise ValueError("could not identify an ext root filesystem")
 
 
@@ -82,6 +93,13 @@ def read_slot_header(data):
     if zlib.crc32(data[:32]) != stored_crc:
         return None, f"{details}, header CRC mismatch"
     return (version, generation, fsid), f"{details}, header CRC valid"
+
+
+def record_path(path):
+    return (2 <= len(path) < PATH_MAX and path.startswith(b"/")
+            and b"\0" not in path
+            and path not in (b"/proc", b"/dev")
+            and not path.startswith((b"/proc/", b"/dev/")))
 
 
 def inspect_records(data, version, records_lba, show_records):
@@ -105,14 +123,14 @@ def inspect_records(data, version, records_lba, show_records):
         if crc != stored_crc:
             reason = "record CRC mismatch"
             break
-        if (not 0 < plen < PATH_MAX or kind not in RECORD_NAMES
-                or (kind == 3 and not 0 < dlen < PATH_MAX)
+        path = bytes(view[body:body + plen])
+        if (kind not in RECORD_NAMES or not record_path(path)
+                or (kind == 3 and not record_path(bytes(view[body + plen:end])))
                 or (kind in (2, 4) and dlen)):
-            reason = "record failed kernel metadata validation"
+            reason = "record failed kernel metadata or path validation (persistence disabled)"
             break
 
         if show_records:
-            path = bytes(view[body:body + plen])
             payload = f"{dlen} data bytes"
             if kind == 3:
                 payload = f"destination {bytes(view[body + plen:end])!r}"
@@ -146,9 +164,9 @@ def inspect_image(image, layout, partition, show_records):
     region = sectors - 2 * slot_sectors
     if region <= 0:
         raise ValueError(f"image is too small for the {layout} journal layout")
-    base, ext_end, fsid = find_ext(image, sectors, partition)
-    if ext_end > region:
-        raise ValueError(f"ext filesystem overlaps the {layout} journal area")
+    base, ext_end, fsid, occupied_end = find_ext(image, sectors, partition)
+    if occupied_end > region:
+        raise ValueError(f"filesystem or partition overlaps the {layout} journal area")
 
     print(f"Image: {sectors} sectors, {layout} journal at LBA {region}")
     print(f"Ext root: LBA {base}, ends before LBA {ext_end}, filesystem ID {fsid:016x}")

@@ -3,13 +3,24 @@
  * and an "extended" (E0) flag; output is what a terminal would send, fed to the tty line discipline:
  * Enter = CR (ICRNL turns it into NL), Backspace = DEL, arrows/Home/End/F-keys = VT100/xterm sequences. */
 #include "kernel.h"
+#include "drivers/usb.h"
 
 static const char km_norm[] = "\0\033" "1234567890-=\177\t" "qwertyuiop[]\r\0" "asdfghjkl;'`\0\\" "zxcvbnm,./\0*\0 ";
 static const char km_shft[] = "\0\033" "!@#$%^&*()_+\177\t" "QWERTYUIOP{}\r\0" "ASDFGHJKL:\"~\0|" "ZXCVBNM<>?\0*\0 ";
 static const char *const fkeys[12] = { "\033OP", "\033OQ", "\033OR", "\033OS", "\033[15~", "\033[17~", "\033[18~", "\033[19~",
                                       "\033[20~", "\033[21~", "\033[23~", "\033[24~" };
 
-static int shift, ctrl, alt, caps, numlock = 1;
+static uint32_t holders[512];   /* one bit per input source for each ordinary or E0 scan code */
+static unsigned long presses[USB_MAX_PORTS + 1];
+_Static_assert(USB_MAX_PORTS < 32, "keyboard source mask must fit all USB root ports");
+static int caps, numlock = 1;
+
+void kbd_sources_dump(char *buf, size_t n) {
+    size_t used = ksnprintf(buf, n, "source presses\nboard %lu\n", presses[0]);
+    for (unsigned port = 1; port <= USB_MAX_PORTS && used < n; port++)
+        if (presses[port])
+            used += ksnprintf(buf + used, n - used, "usb-port-%u %lu\n", port, presses[port]);
+}
 
 static void emit(const char *s) { while (*s) tty_input((unsigned char)*s++); }
 
@@ -39,15 +50,33 @@ ssize_t input_read(void *buf, size_t n, int nonblock) {
 }
 
 void kbd_scancode(uint8_t sc, int release, int e0) {
-    uint16_t code = (uint16_t)(sc | (e0 ? 0x100 : 0));
+    kbd_key_source(0, sc | (e0 ? 0x100u : 0), !release);
+}
+
+void kbd_key_source(unsigned source, unsigned code, int down) {
+    if (source > USB_MAX_PORTS || code >= 512) return;
+    uint32_t mask = 1u << source;
+    int was_held = holders[code] != 0;
+    if (down) {
+        if (!(holders[code] & mask)) presses[source]++;
+        holders[code] |= mask;
+    }
+    else {
+        holders[code] &= ~mask;
+        if (holders[code]) return;
+    }
+    int release = !down, e0 = code >> 8;
+    uint8_t sc = (uint8_t)code;
+    int shift = holders[0x2a] || holders[0x36];
+    int ctrl = holders[0x1d] || holders[0x11d];
+    int alt = holders[0x38] || holders[0x138];
     ev_push(CHI_EV_KEY, code, release ? 0 : 1);
     int modifier = 0;                                       /* state keys: they never type anything */
     switch (sc) {
-    case 0x2A: case 0x36: if (!e0) { shift = !release; modifier = 1; } break;
-    case 0x1D: ctrl = !release; modifier = 1; break;
-    case 0x38: alt = !release; modifier = 1; break;
-    case 0x3A: if (!release) caps = !caps; modifier = 1; break;
-    case 0x45: if (!release && !e0) numlock = !numlock; modifier = 1; break;
+    case 0x2A: case 0x36: modifier = !e0; break;
+    case 0x1D: case 0x38: modifier = 1; break;
+    case 0x3A: if (down && !was_held) caps = !caps; modifier = 1; break;
+    case 0x45: if (down && !was_held && !e0) numlock = !numlock; modifier = 1; break;
     }
     if (alt && !e0 && sc >= 0x3B && sc <= 0x3E) {           /* Alt+F1..F4: kernel hotkey, also in direct mode */
         if (!release) vt_switch(sc - 0x3B);

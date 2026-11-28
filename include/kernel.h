@@ -284,6 +284,9 @@ struct socket;
 struct file { int type, refs, flags; struct node *node; size_t off; struct pipe *pipe; struct socket *sock; };
 
 void vfs_init(void);
+struct vfs_mount_snapshot;
+struct vfs_mount_snapshot *vfs_mount_snapshot(void);
+void vfs_mount_finish(struct vfs_mount_snapshot *snapshot, int rollback);
 int  vfs_ready(void);                                  /* 1 once vfs_init has run */                                   /* empty tree with "/" */
 void vfs_load_cpio(const void *cpio, size_t size);     /* import an initramfs */
 void vfs_finish(void);                                 /* /dev, /tmp */
@@ -335,7 +338,7 @@ struct node *vfs_put_node(const char *abs, uint32_t mode, const uint8_t *data, s
 void kernel_poweroff(void) __attribute__((noreturn));              /* flush persistent state, then power off */
 
 /* persist.c: changes that survive reboot (see the comment at the top of that file) */
-void persist_attach_fs(const struct fs_driver *fs, uint64_t base_lba);
+void persist_attach_fs(uint64_t occupied_end, uint64_t fsid);
 void persist_touch(struct node *n);
 void persist_node_created(struct node *n);
 void persist_deleted(const char *abs);

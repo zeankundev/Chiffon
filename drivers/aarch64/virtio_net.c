@@ -31,6 +31,9 @@ static uint8_t vbuf[2 * VNQ][VN_BUF] __attribute__((aligned(16)));
 static volatile uint32_t *reg;
 static uint32_t hdr_len = 10;                       /* virtio_net_hdr: 10 bytes legacy, 12 modern */
 static uint16_t rx_av, rx_used, tx_av, tx_used;
+/* Timeouts leave the transmit descriptor owned by the device. */
+static int tx_busy, tx_pending, tx_broken, rx_busy, rx_broken;
+static uint32_t rx_posted;
 static struct netdev nd;
 static uint8_t nd_mac[6];
 
@@ -56,9 +59,28 @@ static int setup_queue(int qi, int modern) {
 }
 
 static int vn_send(const uint8_t *frame, size_t len) {
-    if (len > VN_BUF - hdr_len) return -EINVAL;
     struct vqueue *q = &vq[1];
-    uint8_t *b = vbuf[VNQ];                         /* transmit slot 0: one frame in flight */
+    volatile struct vqueue *used = q;
+    int result = -EIO;
+    if (len > VN_BUF - hdr_len) return -EINVAL;
+    if (__atomic_exchange_n(&tx_busy, 1, __ATOMIC_ACQUIRE)) return -EIO;
+    if (tx_broken) goto out;
+    DSB();
+    if (tx_pending) {
+        uint16_t count = (uint16_t)(used->used_idx - tx_used);
+        if (!count) goto out;
+        DSB();
+        if (count != 1 || used->used_ring[tx_used % VNQ].id != 0) {
+            tx_broken = 1;
+            goto out;
+        }
+        tx_used++;
+        tx_pending = 0;
+    } else if (used->used_idx != tx_used) {
+        tx_broken = 1;
+        goto out;
+    }
+    uint8_t *b = vbuf[VNQ];
     memset(b, 0, hdr_len);
     memcpy(b + hdr_len, frame, len);
     q->desc[0].addr = V2P((uintptr_t)b);
@@ -66,34 +88,67 @@ static int vn_send(const uint8_t *frame, size_t len) {
     q->desc[0].flags = 0; q->desc[0].next = 0;
     q->avail_ring[tx_av % VNQ] = 0;
     DSB();
-    tx_av++;
-    q->avail_idx = tx_av;
+    q->avail_idx = ++tx_av;
+    tx_pending = 1;
     DSB();
-    wr(0x50, 1);                                    /* QueueNotify */
-    for (long spin = 0; q->used_idx == tx_used; spin++) {
+    wr(0x50, 1);
+    for (long spin = 0; spin <= 50000000L; spin++) {
         DSB();
-        if (spin > 50000000L) return -EIO;
+        uint16_t count = (uint16_t)(used->used_idx - tx_used);
+        if (count) {
+            DSB();
+            if (count != 1 || used->used_ring[tx_used % VNQ].id != 0) {
+                tx_broken = 1;
+                goto out;
+            }
+            tx_used++;
+            tx_pending = 0;
+            result = 0;
+            break;
+        }
     }
-    tx_used++;
-    return 0;
+out:
+    __atomic_store_n(&tx_busy, 0, __ATOMIC_RELEASE);
+    return result;
 }
 
 static int vn_poll(void) {
     struct vqueue *q = &vq[0];
+    volatile struct vqueue *used = q;
+    uint16_t completed[VNQ];
     int n = 0;
+    if (__atomic_exchange_n(&rx_busy, 1, __ATOMIC_ACQUIRE)) return 0;
+    if (rx_broken) goto out;
     DSB();
-    while (rx_used != q->used_idx) {
+    uint16_t count = (uint16_t)(used->used_idx - rx_used);
+    if (count > VNQ) { rx_broken = 1; goto out; }
+    DSB();
+    while (count--) {
         uint16_t pos = rx_used % VNQ;
-        uint32_t id = q->used_ring[pos].id, len = q->used_ring[pos].len;
-        if (id < VNQ && len > hdr_len && len <= VN_BUF) net_input(vbuf[id] + hdr_len, len - hdr_len);
-        q->avail_ring[rx_av % VNQ] = (uint16_t)id;  /* hand the buffer back to the device */
-        rx_av++;
+        uint32_t id = used->used_ring[pos].id, len = used->used_ring[pos].len;
+        if (id >= VNQ || !(rx_posted & (1u << id))) {
+            rx_broken = 1;
+            break;
+        }
+        rx_posted &= ~(1u << id);
+        rx_used++;
+        completed[n++] = (uint16_t)id;
+        if (len > hdr_len && len <= VN_BUF) net_input(vbuf[id] + hdr_len, len - hdr_len);
+    }
+    /* Do not return any buffers from a corrupt batch. */
+    if (!rx_broken && n) {
+        for (int i = 0; i < n; i++) {
+            uint16_t id = completed[i];
+            q->avail_ring[rx_av++ % VNQ] = id;
+            rx_posted |= 1u << id;
+        }
         DSB();
         q->avail_idx = rx_av;
-        rx_used++;
-        n++;
+        DSB();
+        wr(0x50, 0);
     }
-    if (n) { DSB(); wr(0x50, 0); }
+out:
+    __atomic_store_n(&rx_busy, 0, __ATOMIC_RELEASE);
     return n;
 }
 
@@ -130,6 +185,7 @@ int vnet_probe(uintptr_t mmio_pa) {
         vq[0].desc[i].next = 0;
         vq[0].avail_ring[i] = (uint16_t)i;
     }
+    rx_posted = (1u << VNQ) - 1;
     rx_av = VNQ;
     DSB();
     vq[0].avail_idx = rx_av;

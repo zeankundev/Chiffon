@@ -193,7 +193,12 @@ static long sys_pipe2(uintptr_t ufds, int flags) {
 static long sys_ioctl(long fd, unsigned long cmd, uintptr_t arg) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (f->type == F_SOCKET) return sock_ioctl(f, cmd, arg);
+    if (f->type == F_SOCKET) {
+        file_dup(f);
+        long r = sock_ioctl(f, cmd, arg);
+        file_close(f);
+        return r;
+    }
     if (f->type == F_NODE && f->node->dev == DEV_TTY) {
         int m = tty_resolve(f->node->minor);
         return m < 0 ? m : tty_ioctl(m, cmd, arg);
@@ -290,6 +295,9 @@ static long sys_rename(uintptr_t a, uintptr_t b) {
     if ((r = upath(a, p)) || (r = upath(b, q))) return r;
     if ((r = vfs_resolve(p, 0, x)) || (r = vfs_resolve(q, 0, y))) return r;
     struct node *src = node_find(x);
+    size_t qlen = strlen(q);
+    if (qlen && q[qlen - 1] == '/' && !node_find(y) &&
+        (!src || !S_ISDIR(src->mode))) return -ENOENT;
     if ((src && src->readonly) || ro_parent(x) || ro_parent(y)) return -EROFS;
     return vfs_rename(x, y);
 }
@@ -298,6 +306,8 @@ static long sys_symlink(uintptr_t target, uintptr_t linkp) {
     int r;
     if ((r = upath(target, t)) || (r = upath(linkp, p))) return r;
     if ((r = vfs_resolve(p, 0, abs))) return r;
+    size_t plen = strlen(p);
+    if (plen && p[plen - 1] == '/' && !node_find(abs)) return -ENOENT;
     if (ro_parent(abs)) return -EROFS;
     return vfs_symlink(t, abs);
 }
@@ -544,19 +554,45 @@ static long sys_uname(uintptr_t u) {
     return 0;
 }
 
-static long sys_clock_gettime(uintptr_t u) {
+static long sys_clock_gettime(long clockid, uintptr_t u) {
+    if (clockid != 0 && clockid != 1) return -EINVAL;
     if (!uwok(u, 16)) return -EFAULT;
     uint64_t t = ticks;
-    ((uint64_t *)u)[0] = BOOT_EPOCH + t / HZ;
-    ((uint64_t *)u)[1] = (t % HZ) * (1000000000UL / HZ);
+    uint64_t ts[2] = { (clockid == 0 ? BOOT_EPOCH : 0) + t / HZ,
+                       (t % HZ) * (1000000000UL / HZ) };
+    memcpy((void *)u, ts, sizeof ts);
     return 0;
 }
-static long sys_nanosleep(uintptr_t req) {
+static long sys_nanosleep(long clockid, long flags, uintptr_t req, uintptr_t rem) {
+    if ((clockid != 0 && clockid != 1) || (flags != 0 && flags != 1)) return -EINVAL;
     if (!uok(req, 16)) return -EFAULT;
-    uint64_t s = ((uint64_t *)req)[0], ns = ((uint64_t *)req)[1];
-    uint64_t dl = ticks + s * HZ + (ns + (1000000000UL / HZ) - 1) / (1000000000UL / HZ);
+    int64_t ts[2];
+    memcpy(ts, (const void *)req, sizeof ts);
+    int64_t s = ts[0], ns = ts[1];
+    if (s < 0 || ns < 0 || ns >= 1000000000L) return -EINVAL;
+    if (flags && clockid == 0) {
+        if ((uint64_t)s < BOOT_EPOCH) return 0;
+        s -= BOOT_EPOCH;
+    }
+    uint64_t max = ~(uint64_t)0;
+    uint64_t fraction = ((uint64_t)ns * HZ + 999999999UL) / 1000000000UL;
+    if ((uint64_t)s > (max - fraction) / HZ) return -EINVAL;
+    uint64_t dl = (uint64_t)s * HZ + fraction;
+    if (!flags) {
+        uint64_t now = ticks;
+        if (dl > max - now) return -EINVAL;
+        dl += now;
+    }
     while (ticks < dl) {
-        if (cur->killed) return -EINTR;
+        if (cur->killed) {
+            if (!flags && rem) {
+                if (!uwok(rem, 16)) return -EFAULT;
+                uint64_t now = ticks, left = now < dl ? dl - now : 0;
+                uint64_t remaining[2] = { left / HZ, (left % HZ) * (1000000000UL / HZ) };
+                memcpy((void *)rem, remaining, sizeof remaining);
+            }
+            return -EINTR;
+        }
         sleep_on((void *)&ticks);
     }
     return 0;
@@ -645,9 +681,10 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_clone: return sys_clone(tf, a0, a1, a2, CLONE_TLS_ARG(a3, a4), CLONE_CTID_ARG(a3, a4));
     case SYS_futex: return sys_futex(a0, a1, a2, a3);
     case SYS_getcpu: {
-        uint32_t id = this_cpu()->id;
-        if (a0 && uwok(a0, 4)) *(uint32_t *)a0 = id;
-        if (a1 && uwok(a1, 4)) *(uint32_t *)a1 = 0;
+        uint32_t id = this_cpu()->id, node = 0;
+        if ((a0 && !uwok(a0, sizeof id)) || (a1 && !uwok(a1, sizeof node))) return -EFAULT;
+        if (a0) memcpy((void *)a0, &id, sizeof id);
+        if (a1) memcpy((void *)a1, &node, sizeof node);
         return 0; }
     case SYS_execve: return sys_execve(tf, a0, a1, a2);
     case SYS_exit: proc_exit((a0 & 0xff) << 8);                 /* this thread only */
@@ -677,14 +714,17 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_set_tid_address: cur->clear_child_tid = a0; return cur->pid;
     case SYS_set_robust_list: return 0;
     case SYS_uname: return sys_uname(a0);
-    case SYS_clock_gettime: return sys_clock_gettime(a1);
+    case SYS_clock_gettime: return sys_clock_gettime(a0, a1);
     case SYS_gettimeofday: {
-        if (!a0) return 0;
-        if (!uwok(a0, 16)) return -EFAULT;
-        ((uint64_t *)a0)[0] = BOOT_EPOCH + ticks / HZ; ((uint64_t *)a0)[1] = (ticks % HZ) * (1000000 / HZ);
+        uint64_t t = ticks;
+        uint64_t tv[2] = { BOOT_EPOCH + t / HZ, (t % HZ) * (1000000 / HZ) };
+        int32_t tz[2] = {0, 0};
+        if ((a0 && !uwok(a0, sizeof tv)) || (a1 && !uwok(a1, sizeof tz))) return -EFAULT;
+        if (a0) memcpy((void *)a0, tv, sizeof tv);
+        if (a1) memcpy((void *)a1, tz, sizeof tz);
         return 0; }
-    case SYS_nanosleep: return sys_nanosleep(a0);
-    case SYS_clock_nanosleep: return sys_nanosleep(a2);
+    case SYS_nanosleep: return sys_nanosleep(1, 0, a0, a1);
+    case SYS_clock_nanosleep: return sys_nanosleep(a0, a1, a2, a3);
     case SYS_prlimit64: {
         if (a3) {
             if (!uwok(a3, 16)) return -EFAULT;
@@ -707,9 +747,15 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         return a1; }
     case SYS_sysinfo: {
         if (!uwok(a0, 112)) return -EFAULT;
-        uint64_t *s = (uint64_t *)a0; memset(s, 0, 112);
+        uint64_t s[14] = {0};
         s[0] = ticks / HZ; s[4] = pmm_total_count() * PAGE_SIZE; s[5] = pmm_free_count() * PAGE_SIZE;
-        *(uint16_t *)((char *)s + 80) = NPROC; *(uint32_t *)((char *)s + 104) = 1;
+        uint16_t tasks = 0;
+        for (int i = 0; i < NPROC; i++)
+            if (ptable[i].state != P_UNUSED && ptable[i].state != P_EMBRYO) tasks++;
+        uint32_t mem_unit = 1;
+        memcpy((char *)s + 80, &tasks, sizeof tasks);
+        memcpy((char *)s + 104, &mem_unit, sizeof mem_unit);
+        memcpy((void *)a0, s, sizeof s);
         return 0; }
     case SYS_reboot: kernel_poweroff();
 
@@ -770,7 +816,9 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         if (!f) return -EBADF;
         int fl = (no == SYS_accept4) ? (int)a3 : 0;
         struct file *cf;
+        file_dup(f);
         long r = sock_accept(f, a1, a2, fl, &cf);
+        file_close(f);
         if (r) return r;
         int fd = fd_install(cf, 0, (fl & SOCK_CLOEXEC) != 0);
         if (fd < 0) file_close(cf);
@@ -778,7 +826,11 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     }
     case SYS_connect: {
         struct file *f = getfd(a0);
-        return f ? sock_connect(f, a1, (int)a2) : -EBADF;
+        if (!f) return -EBADF;
+        file_dup(f);
+        long r = sock_connect(f, a1, (int)a2);
+        file_close(f);
+        return r;
     }
     case SYS_getsockname: {
         struct file *f = getfd(a0);
@@ -790,23 +842,43 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     }
     case SYS_sendto: {
         struct file *f = getfd(a0);
-        return f ? sock_sendto(f, a1, (size_t)a2, (int)a3, a4, (int)a5) : -EBADF;
+        if (!f) return -EBADF;
+        file_dup(f);
+        long r = sock_sendto(f, a1, (size_t)a2, (int)a3, a4, (int)a5);
+        file_close(f);
+        return r;
     }
     case SYS_recvfrom: {
         struct file *f = getfd(a0);
-        return f ? sock_recvfrom(f, a1, (size_t)a2, (int)a3, a4, a5) : -EBADF;
+        if (!f) return -EBADF;
+        file_dup(f);
+        long r = sock_recvfrom(f, a1, (size_t)a2, (int)a3, a4, a5);
+        file_close(f);
+        return r;
     }
     case SYS_sendmsg: {
         struct file *f = getfd(a0);
-        return f ? sock_sendmsg(f, a1, (int)a2) : -EBADF;
+        if (!f) return -EBADF;
+        file_dup(f);
+        long r = sock_sendmsg(f, a1, (int)a2);
+        file_close(f);
+        return r;
     }
     case SYS_recvmsg: {
         struct file *f = getfd(a0);
-        return f ? sock_recvmsg(f, a1, (int)a2) : -EBADF;
+        if (!f) return -EBADF;
+        file_dup(f);
+        long r = sock_recvmsg(f, a1, (int)a2);
+        file_close(f);
+        return r;
     }
     case SYS_shutdown: {
         struct file *f = getfd(a0);
-        return f ? sock_shutdown(f, (int)a1) : -EBADF;
+        if (!f) return -EBADF;
+        file_dup(f);
+        long r = sock_shutdown(f, (int)a1);
+        file_close(f);
+        return r;
     }
     case SYS_setsockopt: {
         struct file *f = getfd(a0);
@@ -844,7 +916,13 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         if (!uwok(a1, 16)) return -EFAULT;
         ((uint64_t *)a1)[0] = ((uint64_t *)a1)[1] = a0 == 7 ? NOFILE : ~0UL;
         return 0; }
-    case SYS_time: if (a0 && uwok(a0, 8)) *(uint64_t *)a0 = BOOT_EPOCH + ticks / HZ; return BOOT_EPOCH + ticks / HZ;
+    case SYS_time: {
+        uint64_t seconds = BOOT_EPOCH + ticks / HZ;
+        if (a0) {
+            if (!uwok(a0, sizeof seconds)) return -EFAULT;
+            memcpy((void *)a0, &seconds, sizeof seconds);
+        }
+        return seconds; }
 #endif
     }
     TRACE("[chiffon] unimplemented syscall: %ld (pid %d)\n", no, cur->pid);

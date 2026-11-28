@@ -22,6 +22,7 @@ static uint16_t vavail_idx, vlast_used;
 static int vio_ready;
 static int vio_failed;
 static int vio_writable;
+static int vio_legacy;
 /* One shared queue and bounce buffer: reject concurrent callers rather than reuse them. */
 static int vblk_busy;
 #define DSB() __asm__ volatile("dsb sy" ::: "memory")
@@ -39,6 +40,8 @@ static int vblk_init_at(uintptr_t base) {
     if (!vblk_present(base)) return -1;
     vio = (volatile uint32_t *)P2V(base);
     uint32_t ver = vr(4);
+    if (ver != 1 && ver != 2) return -1;
+    vio_legacy = ver == 1;
     vw(0x70, 0); vw(0x70, 1); vw(0x70, 3);
     vw(0x14, 0);
     uint32_t features = vr(0x10);
@@ -98,6 +101,13 @@ static int vblk_request(uint32_t type, uint64_t lba, uint32_t nsect) {
         vio_ready = 0; vio_failed = 1;
         return -1;
     }
+    /* A modern device reports the bytes written including the status byte.
+     * Legacy transports do not provide a reliable used length. */
+    if (!vio_legacy && type == VBLK_T_IN && vreq_status == 0 &&
+        entry[1] != nsect * 512 + 1) {
+        vio_ready = 0; vio_failed = 1;
+        return -1;
+    }
     vlast_used++;
     return vreq_status == 0 ? 0 : -1;
 }
@@ -107,6 +117,7 @@ static int vblk_xfer(uint64_t lba, void *buf, uint32_t n, int write) {
     while (n) {
         uint32_t c = n > VBLK_MAX_SECTORS ? VBLK_MAX_SECTORS : n;
         if (write) memcpy(vblk_data, b, c * 512);
+        else if (vio_legacy) memset(vblk_data, 0, c * 512);
         if (vblk_request(write ? VBLK_T_OUT : VBLK_T_IN, lba, c)) return -1;
         if (!write) memcpy(b, vblk_data, c * 512);
         lba += c; n -= c; b += c * 512;

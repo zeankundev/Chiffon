@@ -115,7 +115,7 @@ UCFLAGS := -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -f
 USER_SRC := $(wildcard $(ENVDIR)/src/*.c)
 USER_BIN := $(patsubst $(ENVDIR)/src/%.c,$(B)/userland/%,$(USER_SRC))
 ifneq ($(filter $(ENV),demo milkos),)
-USER_BIN += $(B)/userland/vm-probe
+USER_BIN += $(B)/userland/vm-probe $(B)/userland/clock-probe $(B)/userland/hid-probe
 endif
 ENV_FILES := $(shell find $(ENVDIR)/rootfs -type f 2>/dev/null) $(wildcard $(ENVDIR)/build.sh)
 
@@ -165,6 +165,14 @@ $(B)/userland/drvloader $(B)/userland/fbserver: $(B)/userland/%: env/demo/src/%.
 endif
 
 $(B)/userland/vm-probe: tools/release/vm_probe.c userland/libchiffon.h include/uapi/chiffon_abi.h
+	@mkdir -p $(dir $@)
+	$(UCC) $(UCFLAGS) -o $@ $<
+
+$(B)/userland/clock-probe: tools/release/clock_probe.c userland/libchiffon.h include/uapi/chiffon_abi.h
+	@mkdir -p $(dir $@)
+	$(UCC) $(UCFLAGS) -o $@ $<
+
+$(B)/userland/hid-probe: tools/release/hid_probe.c include/drivers/hid_keyboard.h userland/libchiffon.h include/uapi/chiffon_abi.h
 	@mkdir -p $(dir $@)
 	$(UCC) $(UCFLAGS) -o $@ $<
 

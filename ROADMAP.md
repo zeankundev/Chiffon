@@ -10,7 +10,7 @@ The repository describes Chiffon as a Unix-like hybrid kernel for AArch64 and x8
 
 ### Memory safety and privilege boundaries
 
-- [ ] Establish a threat model and supported security boundary: user processes, kernel, device servers, DMA-capable devices, boot chain, and physical attacker assumptions.
+- [x] Establish a threat model and supported security boundary: user processes, kernel, device servers, DMA-capable devices, boot chain, and physical attacker assumptions. [Threat model at `e0ba2aa`](docs/THREAT_MODEL.md) documents the single-vCPU, trusted-host QEMU scope for AArch64 virt and x86_64 PC.
 - [ ] Audit every user-pointer path (syscalls, IPC, `ioctl`, process loading, device mapping): validate lengths, overflow, alignment, permissions, and mapping lifetime; copy data safely so a process cannot change it during validation/use.
 - [ ] Audit every parser and binary boundary (ELF, initramfs, FDT/DTB, Multiboot data, filesystem metadata, network packets, USB descriptors, virtio rings) for bounds checks and integer overflow.
 - [ ] Make page permissions enforceable: user/kernel separation, read-only executable text, non-executable data and stacks, guard pages, and no writable-executable mappings by default. Document architecture-specific protections and fallback behavior.
@@ -24,7 +24,7 @@ The repository describes Chiffon as a Unix-like hybrid kernel for AArch64 and x8
 
 - [ ] Implement and validate IOMMU support for supported platforms (Intel VT-d/AMD-Vi on x86_64; SMMU where present on AArch64), including safe firmware-table discovery and fault handling.
 - [ ] Put devices behind isolated DMA domains before allowing bus mastering; restrict each device to explicitly mapped buffers, revoke mappings on teardown, and test malicious/out-of-range DMA behavior.
-- [ ] Until isolation is implemented, disable bus mastering for untrusted devices or clearly limit support to trusted/emulated devices; do not claim driver crash isolation protects against DMA.
+- [x] Until isolation is implemented, disable bus mastering for untrusted devices or clearly limit support to trusted/emulated devices; do not claim driver crash isolation protects against DMA. [DMA policy at `26ae17d`](docs/DMA.md) limits both targets to trusted devices and host backends. This is an operator-enforced deployment restriction.
 - [ ] Audit DMA address translation, cache coherency, barriers, ring ownership, and buffer lifetime in all virtio, USB, network, storage, and display drivers.
 - [ ] Validate MMIO/IRQ capabilities against device ownership and address ranges; prevent overlapping or out-of-range grants and stale capabilities after process exit/restart.
 

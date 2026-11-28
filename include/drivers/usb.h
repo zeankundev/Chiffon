@@ -16,7 +16,7 @@ struct usb_ep { uint8_t addr, attr; uint16_t mps; uint8_t interval; };
 #define USB_MAX_PORTS 16
 
 /* usb.c, called by xhci.c */
-void usb_attach(int port, int speed);                                    /* slot addressed; enumerate the device */
+int  usb_attach(int port, int speed);                                    /* slot addressed; enumerate the device */
 void usb_detach(int port);                                               /* device removed */
 void usb_report(int port, uint8_t ep_addr, const uint8_t *data, uint32_t len);   /* interrupt IN data */
 void usb_poll(void);                                                     /* mount media waiting for the VFS */

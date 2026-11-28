@@ -14,6 +14,7 @@
 #define SOCK_RXBUF   8192
 #endif
 #define SOCK_BACKLOG 8
+#define SOCK_IO_MAX ((size_t)((unsigned long)-1 >> 1))
 #define TCP_MSS      1400
 #define MS_TO_TICKS(ms) (((ms) + 9) / 10)
 
@@ -987,6 +988,7 @@ long sock_listen(struct file *f, int backlog) {
 
 long sock_accept(struct file *f, uintptr_t uaddr, uintptr_t ulen, int flags, struct file **out) {
     if (f->type != F_SOCKET) return -ENOTSOCK;
+    if (uaddr && !ulen) return -EFAULT;
     struct socket *s = f->sock;
     if (s->state != SS_LISTENING) return -EINVAL;
 
@@ -1006,8 +1008,9 @@ long sock_accept(struct file *f, uintptr_t uaddr, uintptr_t ulen, int flags, str
     c->nonblock = (flags & SOCK_NONBLOCK) ? 1 : 0;
 
     if (uaddr && ulen) {
-        if (!uwok(ulen, 4)) { sock_close(c); return -EFAULT; }
+        if (!uok(ulen, 4) || !uwok(ulen, 4)) { sock_close(c); return -EFAULT; }
         int cap = *(int *)ulen;
+        if (cap < 0) { sock_close(c); return -EINVAL; }
         int cp = c->peer_len < cap ? c->peer_len : cap;
         if (cp > 0) {
             if (!uwok(uaddr, (size_t)cp)) { sock_close(c); return -EFAULT; }
@@ -1114,7 +1117,7 @@ long sock_connect(struct file *f, uintptr_t uaddr, int addrlen) {
 }
 
 static long sock_copyout_addr(const struct sockaddr_storage *addr, int len, uintptr_t uaddr, uintptr_t ulen) {
-    if (!uwok(ulen, 4)) return -EFAULT;
+    if (!uok(ulen, 4) || !uwok(ulen, 4)) return -EFAULT;
     int cap = *(int *)ulen;
     if (cap < 0) return -EINVAL;
     int cp = len < cap ? len : cap;
@@ -1147,6 +1150,7 @@ long sock_getpeername(struct file *f, uintptr_t uaddr, uintptr_t ulen) {
 
 long sock_sendto(struct file *f, uintptr_t ubuf, size_t len, int flags, uintptr_t uaddr, int addrlen) {
     if (f->type != F_SOCKET) return -ENOTSOCK;
+    if (len > SOCK_IO_MAX) return -EMSGSIZE;
     if (len && !uok(ubuf, len)) return -EFAULT;
     struct sockaddr_storage dst;
     memset(&dst, 0, sizeof dst);
@@ -1165,6 +1169,8 @@ long sock_sendto(struct file *f, uintptr_t ubuf, size_t len, int flags, uintptr_
 
 long sock_recvfrom(struct file *f, uintptr_t ubuf, size_t len, int flags, uintptr_t uaddr, uintptr_t ulen) {
     if (f->type != F_SOCKET) return -ENOTSOCK;
+    if (uaddr && !ulen) return -EFAULT;
+    if (len > SOCK_IO_MAX) return -EMSGSIZE;
     if (len && !uwok(ubuf, len)) return -EFAULT;
     uint8_t *kbuf = len ? kmalloc(len) : 0;
     if (len && !kbuf) return -ENOMEM;
@@ -1207,6 +1213,7 @@ long sock_sendmsg(struct file *f, uintptr_t umsg, int flags) {
             if (iov[i].iov_len && !uok((uintptr_t)iov[i].iov_base, iov[i].iov_len)) {
                 kfree(iov); return -EFAULT;
             }
+            if (iov[i].iov_len > SOCK_IO_MAX - tot) { kfree(iov); return -EMSGSIZE; }
             tot += iov[i].iov_len;
         }
     }
@@ -1229,7 +1236,7 @@ long sock_sendmsg(struct file *f, uintptr_t umsg, int flags) {
 
 long sock_recvmsg(struct file *f, uintptr_t umsg, int flags) {
     if (f->type != F_SOCKET) return -ENOTSOCK;
-    if (!uwok(umsg, sizeof(struct msghdr))) return -EFAULT;
+    if (!uok(umsg, sizeof(struct msghdr)) || !uwok(umsg, sizeof(struct msghdr))) return -EFAULT;
     struct msghdr msg;
     memcpy(&msg, (const void *)umsg, sizeof msg);
     if (msg.msg_iovlen > 1024) return -EINVAL;
@@ -1245,6 +1252,7 @@ long sock_recvmsg(struct file *f, uintptr_t umsg, int flags) {
             if (iov[i].iov_len && !uwok((uintptr_t)iov[i].iov_base, iov[i].iov_len)) {
                 kfree(iov); return -EFAULT;
             }
+            if (iov[i].iov_len > SOCK_IO_MAX - tot) { kfree(iov); return -EMSGSIZE; }
             tot += iov[i].iov_len;
         }
     }
@@ -1258,6 +1266,7 @@ long sock_recvmsg(struct file *f, uintptr_t umsg, int flags) {
         size_t rem = (size_t)r, off = 0;
         for (size_t i = 0; i < msg.msg_iovlen && rem > 0; i++) {
             size_t cp = iov[i].iov_len < rem ? iov[i].iov_len : rem;
+            if (cp && !uwok((uintptr_t)iov[i].iov_base, cp)) { r = -EFAULT; break; }
             if (cp) memcpy(iov[i].iov_base, kbuf + off, cp);
             off += cp; rem -= cp;
         }
@@ -1267,15 +1276,16 @@ long sock_recvmsg(struct file *f, uintptr_t umsg, int flags) {
 
     if (r >= 0) {
         if (msg.msg_name && srclen > 0) {
-            int cp = srclen < (int)msg.msg_namelen ? srclen : (int)msg.msg_namelen;
-            if (cp > 0 && uwok((uintptr_t)msg.msg_name, (size_t)cp))
-                memcpy(msg.msg_name, &src, (size_t)cp);
+            size_t cp = (size_t)srclen < msg.msg_namelen ? (size_t)srclen : msg.msg_namelen;
+            if (cp && !uwok((uintptr_t)msg.msg_name, cp)) return -EFAULT;
+            if (cp) memcpy(msg.msg_name, &src, cp);
             msg.msg_namelen = (uint32_t)srclen;
         } else if (msg.msg_name) {
             msg.msg_namelen = 0;
         }
         msg.msg_controllen = 0;
         msg.msg_flags = 0;
+        if (!uwok(umsg, sizeof msg)) return -EFAULT;
         memcpy((void *)umsg, &msg, sizeof msg);
     }
     return r;
@@ -1329,9 +1339,10 @@ long sock_setsockopt(struct file *f, int level, int optname, uintptr_t optval, i
 long sock_getsockopt(struct file *f, int level, int optname, uintptr_t optval, uintptr_t optlen) {
     if (f->type != F_SOCKET) return -ENOTSOCK;
     struct socket *s = f->sock;
-    if (!uwok(optlen, 4)) return -EFAULT;
+    if (!uok(optlen, 4) || !uwok(optlen, 4)) return -EFAULT;
     int cap = *(int *)optlen;
-    if (cap < 4 || !uwok(optval, 4)) return -EINVAL;
+    if (cap < 4) return -EINVAL;
+    if (!uwok(optval, 4)) return -EFAULT;
     int v = 0;
     if (level == SOL_SOCKET) {
         if (optname == SO_TYPE) v = s->type;
@@ -1368,7 +1379,7 @@ long sock_ioctl(struct file *f, unsigned long cmd, uintptr_t arg) {
     }
     if (cmd == SIOCGIFCONF) {
         net_ensure();
-        if (!uwok(arg, sizeof(struct ifconf))) return -EFAULT;
+        if (!uok(arg, sizeof(struct ifconf)) || !uwok(arg, sizeof(struct ifconf))) return -EFAULT;
         struct ifconf *ifc = (struct ifconf *)arg;
         int cnt = net_if_count();
         int max_n = ifc->ifc_len / (int)sizeof(struct ifreq);
@@ -1376,8 +1387,10 @@ long sock_ioctl(struct file *f, unsigned long cmd, uintptr_t arg) {
         for (int i = 0; i < cnt && out_n < max_n; i++) {
             struct net_ifinfo info;
             if (net_if_info(i, &info)) continue;
-            if (!uwok((uintptr_t)&ifc->ifc_req[out_n], sizeof(struct ifreq))) return -EFAULT;
-            struct ifreq *ifr = &ifc->ifc_req[out_n];
+            uintptr_t base = (uintptr_t)ifc->ifc_req;
+            size_t off = (size_t)out_n * sizeof(struct ifreq);
+            if (base > (uintptr_t)-1 - off || !uwok(base + off, sizeof(struct ifreq))) return -EFAULT;
+            struct ifreq *ifr = (struct ifreq *)(base + off);
             memset(ifr, 0, sizeof *ifr);
             strlcpy(ifr->ifr_name, info.name, sizeof ifr->ifr_name);
             struct sockaddr_in *in = (struct sockaddr_in *)&ifr->ifru_addr;
@@ -1390,7 +1403,7 @@ long sock_ioctl(struct file *f, unsigned long cmd, uintptr_t arg) {
     }
     if (cmd >= SIOCGIFNAME && cmd <= SIOCGIFINDEX) {
         net_ensure();
-        if (!uwok(arg, sizeof(struct ifreq))) return -EFAULT;
+        if (!uok(arg, sizeof(struct ifreq)) || !uwok(arg, sizeof(struct ifreq))) return -EFAULT;
         struct ifreq *ifr = (struct ifreq *)arg;
         if (cmd == SIOCGIFNAME) {
             struct net_ifinfo info;

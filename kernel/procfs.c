@@ -38,6 +38,7 @@ void procfs_refresh(void) {
     {
         static char big[2048];
         drivers_dump(big, sizeof big); put("/proc/drivers", big);
+        kbd_sources_dump(big, sizeof big); put("/proc/keyboards", big);
         ipc_dump(big, sizeof big); put("/proc/ipc", big);
         fb_dump(big, sizeof big); put("/proc/fb", big);
         if (!node_find("/proc/net")) node_create("/proc/net", S_IFDIR | 0555);

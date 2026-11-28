@@ -58,6 +58,9 @@ static uintptr_t bar_common, bar_notify, bar_device;
 static uint32_t common_len, notify_len, device_len, notify_mult;
 static uintptr_t notify_queue[2];
 static uint16_t rx_av, rx_used, tx_av, tx_used;
+/* Timeouts leave the transmit descriptor owned by the device. */
+static int tx_busy, tx_pending, tx_broken, rx_busy, rx_broken;
+static uint32_t rx_posted;
 static struct netdev nd;
 static uint8_t nd_mac[6];
 static int device_attached = 0; /* track if device has been successfully attached */
@@ -195,61 +198,97 @@ static int setup_queue(int qi) {
 }
 
 static int vn_send(const uint8_t *frame, size_t len) {
-	if (len > VN_BUF - 12) return -EINVAL;  /* 12-byte header on modern */
-
-	struct vqueue *q = &vq[1];
-	uint8_t *b = vbuf[VNQ];  /* transmit slot 0 */
-	memset(b, 0, 12);        /* clear header */
-	memcpy(b + 12, frame, len);
-
-	q->desc[0].addr = dma_addr((uintptr_t)b);
-	q->desc[0].len = (uint32_t)(12 + len);
-	q->desc[0].flags = 0;
-	q->desc[0].next = 0;
-
-	q->avail_ring[tx_av % VNQ] = 0;
-	mfence();
-	tx_av++;
-	q->avail_idx = tx_av;
-	mfence();
-
-	write_u16(notify_queue[1], 1);  /* notify queue 1 */
-
-	for (long spin = 0; q->used_idx == tx_used; spin++) {
-		mfence();
-		if (spin > 5000000L) { kprintf("vnet: TX completion timeout (used=%u expected=%u)\n", q->used_idx, tx_used); return -EIO; }
-	}
-	tx_used++;
-	return 0;
+    struct vqueue *q = &vq[1];
+    volatile struct vqueue *used = q;
+    int result = -EIO;
+    if (len > VN_BUF - 12) return -EINVAL;
+    if (__atomic_exchange_n(&tx_busy, 1, __ATOMIC_ACQUIRE)) return -EIO;
+    if (tx_broken) goto out;
+    mfence();
+    if (tx_pending) {
+        uint16_t count = (uint16_t)(used->used_idx - tx_used);
+        if (!count) goto out;
+        mfence();
+        if (count != 1 || used->used_ring[tx_used % VNQ].id != 0) {
+            tx_broken = 1;
+            goto out;
+        }
+        tx_used++;
+        tx_pending = 0;
+    } else if (used->used_idx != tx_used) {
+        tx_broken = 1;
+        goto out;
+    }
+    uint8_t *b = vbuf[VNQ];
+    memset(b, 0, 12);
+    memcpy(b + 12, frame, len);
+    q->desc[0].addr = dma_addr((uintptr_t)b);
+    q->desc[0].len = (uint32_t)(12 + len);
+    q->desc[0].flags = 0; q->desc[0].next = 0;
+    q->avail_ring[tx_av % VNQ] = 0;
+    mfence();
+    q->avail_idx = ++tx_av;
+    tx_pending = 1;
+    mfence();
+    write_u16(notify_queue[1], 1);
+    for (long spin = 0; spin <= 5000000L; spin++) {
+        mfence();
+        uint16_t count = (uint16_t)(used->used_idx - tx_used);
+        if (count) {
+            mfence();
+            if (count != 1 || used->used_ring[tx_used % VNQ].id != 0) {
+                tx_broken = 1;
+                goto out;
+            }
+            tx_used++;
+            tx_pending = 0;
+            result = 0;
+            break;
+        }
+    }
+out:
+    __atomic_store_n(&tx_busy, 0, __ATOMIC_RELEASE);
+    return result;
 }
 
 static int vn_poll(void) {
-	struct vqueue *q = &vq[0];
-	int n = 0;
-
-	mfence();
-	while (rx_used != q->used_idx) {
-		uint16_t pos = rx_used % VNQ;
-		uint32_t id = q->used_ring[pos].id;
-		uint32_t len = q->used_ring[pos].len;
-
-		if (id < VNQ && len > 12 && len <= VN_BUF) {
-			net_input(vbuf[id] + 12, len - 12);
-		}
-
-		q->avail_ring[rx_av % VNQ] = (uint16_t)id;
-		rx_av++;
-		mfence();
-		q->avail_idx = rx_av;
-		rx_used++;
-		n++;
-	}
-
-	if (n) {
-		mfence();
-		write_u16(notify_queue[0], 0);  /* notify queue 0 */
-	}
-	return n;
+    struct vqueue *q = &vq[0];
+    volatile struct vqueue *used = q;
+    uint16_t completed[VNQ];
+    int n = 0;
+    if (__atomic_exchange_n(&rx_busy, 1, __ATOMIC_ACQUIRE)) return 0;
+    if (rx_broken) goto out;
+    mfence();
+    uint16_t count = (uint16_t)(used->used_idx - rx_used);
+    if (count > VNQ) { rx_broken = 1; goto out; }
+    mfence();
+    while (count--) {
+        uint16_t pos = rx_used % VNQ;
+        uint32_t id = used->used_ring[pos].id, len = used->used_ring[pos].len;
+        if (id >= VNQ || !(rx_posted & (1u << id))) {
+            rx_broken = 1;
+            break;
+        }
+        rx_posted &= ~(1u << id);
+        rx_used++;
+        completed[n++] = (uint16_t)id;
+        if (len > 12 && len <= VN_BUF) net_input(vbuf[id] + 12, len - 12);
+    }
+    /* Do not return any buffers from a corrupt batch. */
+    if (!rx_broken && n) {
+        for (int i = 0; i < n; i++) {
+            uint16_t id = completed[i];
+            q->avail_ring[rx_av++ % VNQ] = id;
+            rx_posted |= 1u << id;
+        }
+        mfence();
+        q->avail_idx = rx_av;
+        mfence();
+        write_u16(notify_queue[0], 0);
+    }
+out:
+    __atomic_store_n(&rx_busy, 0, __ATOMIC_RELEASE);
+    return n;
 }
 
 /* Hotplug detection: poll for virtio-net device if not yet attached.
@@ -337,7 +376,8 @@ static int init(void) {
 		vq[0].avail_ring[i] = (uint16_t)i;
 	}
 
-	rx_av = VNQ;
+	rx_posted = (1u << VNQ) - 1;
+    rx_av = VNQ;
 	mfence();
 	vq[0].avail_idx = rx_av;
 	mfence();

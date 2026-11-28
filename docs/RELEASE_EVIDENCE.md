@@ -35,6 +35,24 @@ The maintainer confirmed that `make ENV=milkos BUSYBOX=$HOME/busybox/busybox` pa
 | `drvloader test-crash` | The framebuffer replied before termination. The loader reported `-EPIPE`, the test printed its pass message, and the shell accepted another command. |
 | `drvloader start fb` | Replacement server ready with PID 14 on port 66. |
 
+The maintainer subsequently confirmed that the framebuffer client fix worked in the reported `fbview` and Doom use case. The change is recorded in `e0ba2aa`. This is application-level evidence for the milkOS graphics configuration. The report did not include separate AArch64 results.
+
+## Human milkOS guest check, 2026-11-28
+
+The maintainer reported a successful build of the clock and pathname changes. Their screenshot showed `PASS clock-probe`, `cat /etc/chiffon.ini` printing the configuration with `hostname = milkos`, and `cat /etc/chiffon.ini/` returning “Not a directory.” All three commands returned to the shell. The guest architecture and image hash were not supplied for this run.
+
+## Removable USB keyboard check (pending)
+
+The Demo serial smoke runner now requires all three guest probe markers (`PASS vm-probe`, `PASS clock-probe`, and `PASS hid-probe`) before power-off.
+
+Use the x86_64 QEMU board's graphical milkOS configuration. Its `xhci.0` bus starts empty. The built-in keyboard on the AArch64 QEMU board uses virtio-input. The xHCI driver currently binds devices directly connected to a root port and reads the first configuration, alternate setting zero. It supports HID boot keyboards and bounded keyboard/keypad report layouts including arrays, bitmaps, and report IDs. External hubs, vendor-defined key protocols, and arbitrary HID usages are outside this implementation.
+
+1. In the guest, run `clock-probe` and `hid-probe`. Expect `PASS clock-probe` and `PASS hid-probe`. The latter exercises descriptor decoding in memory.
+2. Switch from the QEMU guest display to the monitor (normally Ctrl+Alt+2). Enter `device_add usb-kbd,id=hotkbd,bus=xhci.0`, then `info usb`. Look for a USB keyboard. Return to the guest display (normally Ctrl+Alt+1) and look for the kernel's `keyboard interface` message in the console log.
+3. Type `echo Usb123` in the guest window and press Enter. Expect exactly `Usb123`. Hold and release a letter at the shell prompt. It should repeat, then stop. Clear the line and run `cat /proc/keyboards`. A `usb-port-N` count should increase as you type. Counts are cumulative per root port for the boot.
+4. In the monitor, enter `sendkey shift 30000`, then `device_del hotkbd` before the hold expires. Wait until `info usb` shows the keyboard has gone. Return to the guest and type `echo lower` using the board keyboard. Expect lowercase `lower` and a responsive shell.
+5. Add the keyboard again with the same monitor command. Repeat step 3 and confirm the USB counter advances again. For a report-protocol keyboard or composite receiver, repeat the attach, typing and unplug sequence with that device connected directly to a supported xHCI root port. Record the device ID and which input checks passed.
+
 ## Version release inputs
 
 - Treat [abi_v1.c](../tools/release/abi_v1.c) as the baseline for the checked syscall numbers, constants, structure sizes and offsets in the published [UAPI header](../include/uapi/chiffon_abi.h). Attach any deliberate incompatible change to a new baseline version and document the affected applications and migration. Keep older baselines available for review. The baseline checks declaration compatibility and the smoke test separately exercises a small part of the syscall dispatch.

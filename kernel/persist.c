@@ -260,6 +260,15 @@ static char *dup_n(const uint8_t *s, uint32_t n) {
     return r;
 }
 
+/* Journal paths are length-delimited, but VFS operations consume C strings. */
+static int record_path(const uint8_t *p, uint32_t n) {
+    if (n < 2 || n >= PATH_MAX || p[0] != '/') return 0;
+    for (uint32_t i = 0; i < n; i++) if (!p[i]) return 0;
+    if ((n == 5 || (n > 5 && p[5] == '/')) && !memcmp(p, "/proc", 5)) return 0;
+    if ((n == 4 || (n > 4 && p[4] == '/')) && !memcmp(p, "/dev", 4)) return 0;
+    return 1;
+}
+
 static int apply(uint32_t type, uint32_t mode, const uint8_t *p, uint32_t plen, const uint8_t *d, uint32_t dlen) {
     char *path = dup_n(p, plen);
     if (!path) return -ENOMEM;
@@ -301,20 +310,27 @@ static uint32_t replay_buf(const uint8_t *d, uint32_t len, int version, uint32_t
     while ((uint64_t)pos + REC_HDR <= len) {
         uint32_t magic = get32(d + pos);
         if (!magic) break;
-        if (magic != REC_MAGIC) { P.snapshot = 1; break; }
+        if (magic != REC_MAGIC) { kprintf("[persist] invalid record magic at byte %u; snapshot required\n", pos); P.snapshot = 1; break; }
         uint32_t type = get32(d + pos + 4), mode = get32(d + pos + 8);
         uint32_t plen = get32(d + pos + 12), dlen = get32(d + pos + 16), crc = get32(d + pos + 20);
-        if ((uint64_t)pos + REC_HDR + plen + dlen > len) { P.snapshot = 1; break; }
+        if ((uint64_t)pos + REC_HDR + plen + dlen > len) { kprintf("[persist] truncated record at byte %u; snapshot required\n", pos); P.snapshot = 1; break; }
         const uint8_t *body = d + pos + REC_HDR;
         if (crc32(crc32(0, d + pos, 20), body, plen + dlen) != crc) {
+            kprintf("[persist] record CRC mismatch at byte %u; snapshot required\n", pos);
             P.snapshot = 1;
             break;
         }
-        if (!plen || plen >= PATH_MAX || type < REC_PUT || type > REC_CHMOD ||
-            (type == REC_RENAME && (!dlen || dlen >= PATH_MAX)) ||
-            ((type == REC_DEL || type == REC_CHMOD) && dlen) ||
-            apply(type, mode, body, plen, body + plen, dlen) || P.error) {
+        if (type < REC_PUT || type > REC_CHMOD || !record_path(body, plen) ||
+            (type == REC_RENAME && !record_path(body + plen, dlen)) ||
+            ((type == REC_DEL || type == REC_CHMOD) && dlen)) {
+            kprintf("[persist] invalid record metadata or path at byte %u\n", pos);
             P.error = -EIO;
+            break;
+        }
+        int r = apply(type, mode, body, plen, body + plen, dlen);
+        if (r || P.error) {
+            kprintf("[persist] record application failed at byte %u (%d)\n", pos, -(r ? r : P.error));
+            if (!P.error) P.error = r;
             break;
         }
         uint32_t bytes = REC_HDR + plen + dlen;
@@ -391,10 +407,8 @@ static int attach(uint64_t fs_end, uint64_t fsid) {
 }
 
 /* Called after the filesystem is mounted.  The fsid comes from the ext UUID (see ext_ident). */
-void persist_attach_fs(const struct fs_driver *fs, uint64_t base) {
-    uint64_t end = 0, id = 0;
-    if (!fs->ident || fs->ident(base, &end, &id)) { disable("filesystem has no identity"); return; }
-    attach(end, id);
+void persist_attach_fs(uint64_t occupied_end, uint64_t fsid) {
+    attach(occupied_end, fsid);
 }
 
 /* ---- hooks called from the VFS and syscalls ---- */

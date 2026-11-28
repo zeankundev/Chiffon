@@ -4,6 +4,10 @@ Chiffon mounts ext read-only and applies changes to the in-memory VFS. The journ
 
 ## Commit and recovery
 
+Mounting an ext base requires a clean superblock. Chiffon rejects images requesting ext journal replay, orphan cleanup, or inline-data support. For recovery, preserve the original image and use ext filesystem recovery tools on an offline copy. The Chiffon persistence log is separate from the ext journal.
+
+Partitioned images must use non-overlapping primary MBR partitions. The ext volume must fit inside its selected partition. Chiffon enables persistence only when the entire reserved log area lies beyond all primary partitions, including unused space inside the last partition. GPT and extended partitions currently require a different image layout to boot Chiffon.
+
 Each CHIFLOG2 record begins on a new 512-byte sector. For an append, the kernel clears the next record's first sector, writes the body sectors, and publishes the record's first sector. Each step must complete durably before the next begins. A write touches only sectors outside the committed record prefix. Replay stops at the zero marker or at a torn record that fails validation.
 
 During compaction, the kernel invalidates the inactive slot's header, writes a snapshot of the live changes and deletions, and publishes the higher-generation header last. The active slot remains intact until the new header is durable. A header failure can leave either generation visible on reboot. A retry invalidates the target header before rewriting its snapshot. Boot chooses the newest checksum-valid header matching the ext UUID.

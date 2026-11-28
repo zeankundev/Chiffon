@@ -1,19 +1,34 @@
-/* USB device classes over xhci.c: HID boot-protocol keyboards and mice (keys reach the console and
- * /dev/input/event0 through kbd_scancode(), pointer motion through input_rel()/input_btn()), and
+/* USB device classes over xhci.c: HID keyboards and boot mice (keys reach the console and
+ * /dev/input/event0 through kbd_key_source(), pointer motion through input_rel()/input_btn()), and
  * bulk-only mass storage, mounted read-only under /media/usbN when the VFS is up and unmounted when the
  * device is removed.  Descriptors are parsed by hand; only the interfaces this driver can use are configured. */
 #include "kernel.h"
 #include "fat.h"
 #include "drivers/usb.h"
+#include "drivers/hid_keyboard.h"
+
+#define USB_MAX_KEYBOARDS 8
+struct usb_keyboard {
+    uint8_t ep, iface, boot, active;
+    uint16_t report_len;
+    struct hid_keyboard_layout layout;
+    struct hid_keyboard_keys reports[HID_KEYBOARD_MAX_REPORTS];
+};
 
 struct usbdev {
     int attached, port, speed, unit, unit_set;
     uint16_t vid, pid;
-    uint8_t kbd_ep, kbd_if, mouse_ep, mouse_if, msc_in, msc_out;   /* endpoint addresses; 0 = none */
-    uint8_t prev_kbd[8], prev_btn;
+    uint8_t mouse_ep, mouse_if, msc_in, msc_out;
+    uint8_t prev_btn;
+    struct usb_keyboard *keyboards[USB_MAX_KEYBOARDS];
+    unsigned nkbd;
+    struct hid_keyboard_keys keys;
+    uint16_t repeat_code;
+    uint64_t repeat_at;
     int msc, mount_pending;
     void *vol;
-    uint32_t tag, nblk, blksz;
+    uint32_t tag, blksz;
+    uint64_t nblk;
 };
 static struct usbdev devs[USB_MAX_PORTS + 1];
 
@@ -21,6 +36,7 @@ static const char *speed_name(int s) {
     return s == USB_LS ? "low" : s == USB_FS ? "full" : s == USB_HS ? "high" : "super";
 }
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 
 static int ctrl(int p, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx, void *buf, uint16_t len) {
@@ -47,29 +63,60 @@ static const uint16_t hid_sc[256] = {
     [0x59]=0x4F, [0x5A]=0x50, [0x5B]=0x51, [0x5C]=0x4B, [0x5D]=0x4C, [0x5E]=0x4D, [0x5F]=0x47, [0x60]=0x48,
     [0x61]=0x49, [0x62]=0x52, [0x63]=0x53,
 };
-/* modifier byte bit -> scancode (bit 8 = E0 prefix) */
-static const struct { uint8_t bit; uint16_t sc; } hid_mod[8] = {
-    { 0x01, 0x1D }, { 0x02, 0x2A }, { 0x04, 0x38 }, { 0x08, 0x15B },
-    { 0x10, 0x11D }, { 0x20, 0x36 }, { 0x40, 0x138 }, { 0x80, 0x15C },
-};
-
-static void kbd_key(uint16_t v, int release) { kbd_scancode((uint8_t)(v & 0xFF), release, (v >> 8) & 1); }
-static int in_report(const uint8_t *r, uint8_t k) { for (int i = 2; i < 8; i++) if (r[i] == k) return 1; return 0; }
-
-static void kbd_report(struct usbdev *d, const uint8_t *r, uint32_t len) {
-    if (len < 8) return;
-    const uint8_t *old = d->prev_kbd;
-    for (int i = 0; i < 8; i++)
-        if ((old[0] ^ r[0]) & hid_mod[i].bit) kbd_key(hid_mod[i].sc, !(r[0] & hid_mod[i].bit));
-    for (int i = 2; i < 8; i++) {                        /* releases first, then presses */
-        uint8_t k = old[i];
-        if (k > 3 && !in_report(r, k)) kbd_key(hid_sc[k], 1);
+static uint16_t usage_sc(unsigned usage) {
+    static const uint16_t mods[8] = { 0x1D, 0x2A, 0x38, 0x15B, 0x11D, 0x36, 0x138, 0x15C };
+    return usage >= 0xE0 && usage <= 0xE7 ? mods[usage - 0xE0] : hid_sc[usage];
+}
+static void kbd_transitions(struct usbdev *d, const struct hid_keyboard_keys *keys,
+                            unsigned first, unsigned end, int down) {
+    for (unsigned u = first; u < end; u++) {
+        uint8_t mask = (uint8_t)(1u << (u & 7));
+        int old = !!(d->keys.bits[u >> 3] & mask);
+        int now = !!(keys->bits[u >> 3] & mask);
+        uint16_t sc = usage_sc(u);
+        if (!sc || old == now || now != down) continue;
+        kbd_key_source((unsigned)d->port, sc, down);
+        if (!down && sc == d->repeat_code) d->repeat_code = 0;
+        if (down && u < 0xE0 && u != 0x39 && u != 0x47 && u != 0x53) {
+            d->repeat_code = sc;
+            d->repeat_at = ticks + HZ / 2;
+        }
     }
-    for (int i = 2; i < 8; i++) {
-        uint8_t k = r[i];
-        if (k > 3 && !in_report(old, k)) kbd_key(hid_sc[k], 0);
+}
+static void kbd_merge(struct usbdev *d) {
+    struct hid_keyboard_keys keys = { { 0 } };
+    for (unsigned i = 0; i < d->nkbd; i++) {
+        struct usb_keyboard *k = d->keyboards[i];
+        if (!k->active) continue;
+        unsigned count = k->boot ? 1 : k->layout.report_count;
+        for (unsigned j = 0; j < count; j++)
+            for (unsigned b = 0; b < sizeof keys.bits; b++) keys.bits[b] |= k->reports[j].bits[b];
     }
-    memcpy(d->prev_kbd, r, 8);
+    /* Release ordinary keys before modifiers; press modifiers before ordinary keys. */
+    kbd_transitions(d, &keys, 0, 0xE0, 0);
+    kbd_transitions(d, &keys, 0xE8, 256, 0);
+    kbd_transitions(d, &keys, 0xE0, 0xE8, 0);
+    kbd_transitions(d, &keys, 0xE0, 0xE8, 1);
+    kbd_transitions(d, &keys, 0, 0xE0, 1);
+    kbd_transitions(d, &keys, 0xE8, 256, 1);
+    d->keys = keys;
+}
+static void kbd_report(struct usbdev *d, struct usb_keyboard *k, const uint8_t *r, uint32_t len) {
+    struct hid_keyboard_keys keys = { { 0 } };
+    unsigned slot = 0;
+    if (k->boot) {
+        if (len < 8) return;
+        for (unsigned i = 2; i < 8; i++) if (r[i] >= 1 && r[i] <= 3) return;
+        for (unsigned i = 0; i < 8; i++) if (r[0] & (1u << i)) keys.bits[(0xE0 + i) >> 3] |= 1u << ((0xE0 + i) & 7);
+        for (unsigned i = 2; i < 8; i++) if (r[i]) keys.bits[r[i] >> 3] |= 1u << (r[i] & 7);
+    } else {
+        uint8_t id;
+        if (hid_keyboard_decode(&k->layout, r, len, &keys, &id)) return;
+        while (slot < k->layout.report_count && k->layout.report_ids[slot] != id) slot++;
+        if (slot == k->layout.report_count) return;
+    }
+    k->reports[slot] = keys;
+    kbd_merge(d);
 }
 
 static void mouse_report(struct usbdev *d, const uint8_t *r, uint32_t len) {
@@ -83,10 +130,15 @@ static void mouse_report(struct usbdev *d, const uint8_t *r, uint32_t len) {
 }
 
 void usb_report(int p, uint8_t addr, const uint8_t *data, uint32_t len) {
+    if (p < 1 || p > USB_MAX_PORTS) return;
     struct usbdev *d = &devs[p];
     if (!d->attached) return;
-    if (addr == d->kbd_ep) kbd_report(d, data, len);
-    else if (addr == d->mouse_ep) mouse_report(d, data, len);
+    for (unsigned i = 0; i < d->nkbd; i++)
+        if (d->keyboards[i]->active && addr == d->keyboards[i]->ep) {
+            kbd_report(d, d->keyboards[i], data, len);
+            return;
+        }
+    if (addr == d->mouse_ep) mouse_report(d, data, len);
 }
 
 /* ---- bulk-only transport for mass storage ---- */
@@ -101,17 +153,22 @@ static int bot(struct usbdev *d, const uint8_t *cdb, uint8_t cdblen, void *data,
     cbw[14] = cdblen;
     memcpy(cbw + 15, cdb, cdblen);
     if (xhci_bulk(d->port, d->msc_out, cbw, sizeof cbw) != (int)sizeof cbw) return -EIO;
-    if (dlen && xhci_bulk(d->port, in ? d->msc_in : d->msc_out, data, dlen) < 0) return -EIO;
+    int moved = 0;
+    if (dlen) {
+        moved = xhci_bulk(d->port, in ? d->msc_in : d->msc_out, data, dlen);
+        if (moved < 0) return -EIO;
+    }
     uint8_t csw[13];
     if (xhci_bulk(d->port, d->msc_in, csw, sizeof csw) != (int)sizeof csw) return -EIO;
-    if (csw[0] != 'U' || csw[1] != 'S' || csw[2] != 'B' || csw[3] != 'S' || csw[12] != 0) return -EIO;
+    if (csw[0] != 'U' || csw[1] != 'S' || csw[2] != 'B' || csw[3] != 'S' ||
+        le32(csw + 4) != tag || le32(csw + 8) != 0 || csw[12] != 0 || moved != (int)dlen) return -EIO;
     return 0;
 }
 
 /* sector reader for the FAT driver: READ(10) in runs of up to 64 blocks */
 static int msc_rd(void *ctx, uint64_t lba, uint32_t n, void *buf) {
     struct usbdev *d = ctx;
-    if (!d->attached || !d->msc || d->blksz != 512) return -EIO;
+    if (!d->attached || !d->msc || d->blksz != 512 || lba > d->nblk || n > d->nblk - lba) return -EIO;
     uint8_t *out = buf;
     while (n) {
         uint32_t k = n > 64 ? 64 : n;
@@ -123,7 +180,7 @@ static int msc_rd(void *ctx, uint64_t lba, uint32_t n, void *buf) {
     return 0;
 }
 
-static void msc_init(struct usbdev *d) {
+static int msc_init(struct usbdev *d) {
     for (int i = 0; i < 3; i++) {                        /* devices report "becoming ready" first */
         uint8_t c[6] = { 0 };
         if (!bot(d, c, 6, 0, 0, 0)) break;
@@ -137,16 +194,30 @@ static void msc_init(struct usbdev *d) {
         kprintf("[usb] port %d: mass storage \"%s %s\"\n", d->port, vendor, product);
     }
     uint8_t cap[8] = { 0 }, ccdb[10] = { 0x25 };
-    if (bot(d, ccdb, 10, cap, 8, 1)) { kprintf("[usb] port %d: READ CAPACITY failed\n", d->port); return; }
+    if (bot(d, ccdb, 10, cap, 8, 1)) { kprintf("[usb] port %d: READ CAPACITY failed\n", d->port); return -EIO; }
+    if (be32(cap) == 0xFFFFFFFFu) return -ENODEV; /* READ CAPACITY(16) is not implemented */
     d->nblk = (uint64_t)be32(cap) + 1;
     d->blksz = be32(cap + 4);
-    if (d->blksz != 512) { kprintf("[usb] port %d: %u-byte blocks not supported\n", d->port, d->blksz); return; }
+    if (d->blksz != 512) { kprintf("[usb] port %d: %u-byte blocks not supported\n", d->port, d->blksz); return -ENODEV; }
     d->msc = 1;
     d->mount_pending = 1;
     kprintf("[usb] port %d: %lu MiB of storage\n", d->port, (unsigned long)(d->nblk / 2048));
+    return 0;
 }
 
 /* ---- enumeration ---- */
+static int endpoint_valid(int speed, uint8_t addr, uint8_t attr, uint16_t raw_mps, uint8_t interval) {
+    unsigned mps = raw_mps & 0x7FF;
+    if ((addr & 0x70) || !(addr & 0x0F) || !mps || (raw_mps & 0xF800)) return 0;
+    if (attr == 3) {
+        if (!interval || ((speed == USB_HS || speed == USB_SS) && interval > 16)) return 0;
+        return mps <= (speed == USB_LS ? 8u : speed == USB_FS ? 64u : 1024u);
+    }
+    if (attr != 2 || speed == USB_LS) return 0;
+    if (speed == USB_FS) return mps == 8 || mps == 16 || mps == 32 || mps == 64;
+    return mps == (speed == USB_HS ? 512u : 1024u);
+}
+
 static int unit_alloc(void) {
     for (int u = 0; u < 8; u++) {
         int used = 0;
@@ -156,71 +227,144 @@ static int unit_alloc(void) {
     return -1;
 }
 
-void usb_attach(int p, int speed) {
+int usb_attach(int p, int speed) {
+    if (p < 1 || p > USB_MAX_PORTS || speed < USB_FS || speed > USB_SS) return -EINVAL;
     struct usbdev *d = &devs[p];
     memset(d, 0, sizeof *d);
     d->port = p; d->speed = speed; d->attached = 1;
-    uint8_t dd[18];
-    if (ctrl(p, 0x80, 6, 0x0100, 0, dd, 8) != 8) { kprintf("[usb] port %d: no device descriptor\n", p); return; }
-    uint16_t want = dd[7] ? dd[7] : 8;
+    uint8_t dd[18], *cfg = 0;
+    int err = -EIO, activated = 0;
+    if (ctrl(p, 0x80, 6, 0x0100, 0, dd, 8) != 8) goto fail;
+    if (dd[0] != 18 || dd[1] != 1) goto fail;
+    uint16_t want = speed == USB_SS ? (dd[7] == 9 ? 512 : 0) : dd[7];
+    if ((speed == USB_LS && want != 8) || (speed == USB_FS && want != 8 && want != 16 && want != 32 && want != 64) ||
+        (speed == USB_HS && want != 64) || (speed == USB_SS && want != 512)) goto fail;
     uint16_t def = speed == USB_SS ? 512 : speed == USB_HS ? 64 : 8;
-    if (want != def && xhci_set_ep0_mps(p, want)) { kprintf("[usb] port %d: cannot set control packet size\n", p); return; }
-    if (ctrl(p, 0x80, 6, 0x0100, 0, dd, 18) != 18) { kprintf("[usb] port %d: device descriptor failed\n", p); return; }
+    if (want != def && xhci_set_ep0_mps(p, want)) goto fail;
+    if (ctrl(p, 0x80, 6, 0x0100, 0, dd, 18) != 18) goto fail;
+    if (dd[0] != 18 || dd[1] != 1 || !dd[17] ||
+        (speed == USB_SS ? dd[7] != 9 : dd[7] != want)) goto fail;
     d->vid = le16(dd + 8); d->pid = le16(dd + 10);
     kprintf("[usb] port %d: %s-speed device %04x:%04x\n", p, speed_name(speed), d->vid, d->pid);
-
     uint8_t hdr[9];
-    if (ctrl(p, 0x80, 6, 0x0200, 0, hdr, 9) != 9) return;
+    if (ctrl(p, 0x80, 6, 0x0200, 0, hdr, 9) != 9) goto fail;
     uint16_t total = le16(hdr + 2);
-    if (total < 9 || total > 1024) return;
-    uint8_t *cfg = kmalloc(total);
-    if (!cfg) return;
-    if (ctrl(p, 0x80, 6, 0x0200, 0, cfg, total) != total) { kfree(cfg); return; }
+    if (hdr[0] != 9 || hdr[1] != 2 || !hdr[5] || total < 9) goto fail;
+    if (total > 1024) { err = -ENODEV; goto fail; }
+    cfg = kmalloc(total);
+    if (!cfg) { err = -ENOMEM; goto fail; }
+    if (ctrl(p, 0x80, 6, 0x0200, 0, cfg, total) != total ||
+        cfg[0] != 9 || cfg[1] != 2 || le16(cfg + 2) != total || cfg[5] != hdr[5]) goto fail;
 
-    struct usb_ep eps[8]; int n = 0;
-    int curif = 0, have_kbd = 0, have_mouse = 0, have_msc = 0;
-    for (uint32_t o = 0; o + 2 <= total;) {
+    struct usb_ep eps[8]; int n = 0, curif = 0, have_mouse = 0, have_msc = 0;
+    uint32_t seen_eps = 0;
+    int companion = 0;
+    struct usb_keyboard *k = 0;
+    for (uint32_t o = 0; o < total;) {
+        if (total - o < 2) goto fail;
         uint8_t l = cfg[o], t = cfg[o + 1];
-        if (l < 2 || o + l > total) break;
-        if (t == 4 && l >= 9) {                           /* interface: alternate setting 0 only */
-            curif = 0;
+        if (l < 2 || o + l > total) goto fail;
+        if (companion) {
+            if (t != 0x30 || l < 6 || cfg[o + 2] || cfg[o + 3] ||
+                (eps[n - 1].attr == 3 && le16(cfg + o + 4) > eps[n - 1].mps)) goto fail;
+            companion = 0;
+        }
+        if ((t == 4 && l < 9) || (t == 5 && l < 7)) goto fail;
+        if (t == 4 && l >= 9) {
+            curif = 0; k = 0;
             uint8_t cls = cfg[o + 5], sub = cfg[o + 6], pr = cfg[o + 7];
             if (cfg[o + 3] == 0) {
-                if (cls == 3 && sub == 1 && pr == 1 && !have_kbd) { curif = 1; have_kbd = 1; d->kbd_if = cfg[o + 2]; }
-                else if (cls == 3 && sub == 1 && pr == 2 && !have_mouse) { curif = 2; have_mouse = 1; d->mouse_if = cfg[o + 2]; }
-                else if (cls == 8 && sub == 6 && pr == 0x50 && !have_msc) { curif = 3; have_msc = 1; }
+                if (cls == 3 && sub == 1 && pr == 2 && !have_mouse) {
+                    curif = 2; have_mouse = 1; d->mouse_if = cfg[o + 2];
+                } else if (cls == 3 && d->nkbd < USB_MAX_KEYBOARDS) {
+                    k = kmalloc(sizeof *k);
+                    if (!k) { err = -ENOMEM; goto fail; }
+                    memset(k, 0, sizeof *k);
+                    k->iface = cfg[o + 2]; k->boot = sub == 1 && pr == 1;
+                    d->keyboards[d->nkbd++] = k; curif = 1;
+                } else if (cls == 8 && sub == 6 && pr == 0x50 && !have_msc) {
+                    curif = 3; have_msc = 1;
+                }
             }
-        } else if (t == 5 && l >= 7) {                    /* endpoint of the interface chosen above */
+        } else if (t == 0x21 && l >= 6 && curif == 1 && k) {
+            for (unsigned j = 0; j < cfg[o + 5] && 6 + j * 3 + 3 <= l; j++)
+                if (cfg[o + 6 + j * 3] == 0x22) k->report_len = le16(cfg + o + 7 + j * 3);
+        } else if (t == 5 && l >= 7) {
             uint8_t addr = cfg[o + 2], attr = cfg[o + 3] & 3;
-            uint16_t mps = le16(cfg + o + 4);
-            int use = 0;
-            if (curif == 1 && attr == 3 && (addr & 0x80)) { d->kbd_ep = addr; use = 1; }
-            else if (curif == 2 && attr == 3 && (addr & 0x80)) { d->mouse_ep = addr; use = 1; }
-            else if (curif == 3 && attr == 2) { if (addr & 0x80) d->msc_in = addr; else d->msc_out = addr; use = 1; }
-            if (use && n < 8) eps[n++] = (struct usb_ep){ addr, (uint8_t)attr, mps, cfg[o + 6] };
+            uint16_t mps = le16(cfg + o + 4); int use = 0;
+            if (curif == 1 && k && !k->ep && attr == 3 && (addr & 0x80)) { k->ep = addr; use = 1; }
+            else if (curif == 2 && !d->mouse_ep && attr == 3 && (addr & 0x80)) { d->mouse_ep = addr; use = 1; }
+            else if (curif == 3 && attr == 2) {
+                if ((addr & 0x80) && !d->msc_in) { d->msc_in = addr; use = 1; }
+                else if (!(addr & 0x80) && !d->msc_out) { d->msc_out = addr; use = 1; }
+            }
+            if (use) {
+                unsigned index = (addr & 15) * 2 + !!(addr & 0x80);
+                if (n == 8) { err = -ENODEV; goto fail; }
+                if ((seen_eps & (1u << index)) || !endpoint_valid(speed, addr, attr, mps, cfg[o + 6])) goto fail;
+                seen_eps |= 1u << index;
+                eps[n++] = (struct usb_ep){ addr, attr, mps, cfg[o + 6] };
+                companion = speed == USB_SS;
+            }
         }
         o += l;
     }
-    if (!n) { kprintf("[usb] port %d: no keyboard, mouse or mass storage interface\n", p); kfree(cfg); return; }
-    if (xhci_configure(p, eps, n)) { kprintf("[usb] port %d: configure failed\n", p); kfree(cfg); return; }
-    if (ctrl(p, 0x00, 9, cfg[5], 0, 0, 0)) { kprintf("[usb] port %d: set configuration failed\n", p); kfree(cfg); return; }
-    if (d->kbd_ep) {
-        ctrl(p, 0x21, 0x0B, 0, d->kbd_if, 0, 0);          /* SET_PROTOCOL: boot protocol */
-        ctrl(p, 0x21, 0x0A, 0, d->kbd_if, 0, 0);          /* SET_IDLE: report on change only */
-        xhci_interrupt_start(p, d->kbd_ep);
-        kprintf("[usb] port %d: keyboard\n", p);
+    if (companion) goto fail;
+    if (!n) { err = -ENODEV; goto fail; }
+    if (xhci_configure(p, eps, n) || ctrl(p, 0x00, 9, cfg[5], 0, 0, 0)) goto fail;
+    err = -ENODEV;
+    for (unsigned i = 0; i < d->nkbd; i++) {
+        k = d->keyboards[i];
+        if (!k->ep) continue;
+        if (k->boot && ctrl(p, 0x21, 0x0B, 0, k->iface, 0, 0) == 0) {
+            k->active = 1;
+        } else if (k->report_len && k->report_len <= 4096) {
+            uint8_t *report = kmalloc(k->report_len);
+            if (report) {
+                int got = ctrl(p, 0x81, 6, 0x2200, k->iface, report, k->report_len);
+                if (got != k->report_len) err = -EIO;
+                else if (!hid_keyboard_parse(&k->layout, report, k->report_len)) {
+                    k->boot = 0; k->active = 1;
+                }
+                kfree(report);
+            } else err = -ENOMEM;
+        } else if (k->boot) {
+            err = -EIO;
+        }
+        if (k->active) {
+            ctrl(p, 0x21, 0x0A, 0, k->iface, 0, 0);
+            if (xhci_interrupt_start(p, k->ep)) { k->active = 0; err = -EIO; }
+            else { activated++; kprintf("[usb] port %d: keyboard interface %u\n", p, k->iface); }
+        }
     }
     if (d->mouse_ep) {
-        ctrl(p, 0x21, 0x0B, 0, d->mouse_if, 0, 0);
-        xhci_interrupt_start(p, d->mouse_ep);
-        kprintf("[usb] port %d: mouse\n", p);
+        if (ctrl(p, 0x21, 0x0B, 0, d->mouse_if, 0, 0) || xhci_interrupt_start(p, d->mouse_ep)) {
+            d->mouse_ep = 0; err = -EIO;
+        } else {
+            activated++;
+            kprintf("[usb] port %d: mouse\n", p);
+        }
     }
-    if (d->msc_in && d->msc_out) msc_init(d);
+    if (d->msc_in && d->msc_out) {
+        int r = msc_init(d);
+        if (!r) activated++;
+        else if (r != -ENODEV) err = r;
+    }
+    if (!activated) goto fail;
     kfree(cfg);
+    return 0;
+fail:
+    if (cfg) kfree(cfg);
+    usb_detach(p);
+    return err;
 }
-
 void usb_detach(int p) {
+    if (p < 1 || p > USB_MAX_PORTS) return;
     struct usbdev *d = &devs[p];
+    for (unsigned i = 0; i < d->nkbd; i++) d->keyboards[i]->active = 0;
+    kbd_merge(d);
+    for (unsigned i = 0; i < d->nkbd; i++) kfree(d->keyboards[i]);
+    for (unsigned b = 0; b < 3; b++) if (d->prev_btn & (1u << b)) input_btn(b, 0);
     if (d->vol) { fat_unmount(d->vol); kprintf("[usb] port %d: /media/usb%d unmounted\n", p, d->unit); }
     memset(d, 0, sizeof *d);
 }
@@ -229,6 +373,10 @@ void usb_poll(void) {
     if (!vfs_ready()) return;                             /* volumes wait until the namespace exists */
     for (int p = 1; p <= USB_MAX_PORTS; p++) {
         struct usbdev *d = &devs[p];
+        if (d->attached && d->repeat_code && ticks >= d->repeat_at) {
+            kbd_key_source((unsigned)p, d->repeat_code, 1);
+            d->repeat_at = ticks + (HZ + 24) / 25;
+        }
         if (!d->attached || !d->mount_pending) continue;
         d->mount_pending = 0;
         int u = unit_alloc();

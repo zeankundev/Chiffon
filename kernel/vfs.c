@@ -32,6 +32,43 @@ static void node_free(struct node *n) {
     kfree(n);
 }
 
+/* Root mounting runs before the VFS is exposed to processes. */
+struct vfs_mount_snapshot {
+    uint32_t next_ino;
+    uint32_t count;
+    struct { uint32_t slot; struct node *original; struct node saved; } entries[];
+};
+
+struct vfs_mount_snapshot *vfs_mount_snapshot(void) {
+    uint32_t count = 0;
+    for (int i = 0; i < MAXNODES; i++) if (nodes[i]) count++;
+    struct vfs_mount_snapshot *s = kmalloc(sizeof *s + count * sizeof s->entries[0]);
+    if (!s) return 0;
+    s->next_ino = next_ino;
+    s->count = 0;
+    for (int i = 0; i < MAXNODES; i++) {
+        if (!nodes[i]) continue;
+        uint32_t j = s->count++;
+        s->entries[j].slot = i;
+        s->entries[j].original = nodes[i];
+        s->entries[j].saved = *nodes[i];
+    }
+    return s;
+}
+
+void vfs_mount_finish(struct vfs_mount_snapshot *s, int rollback) {
+    if (rollback) {
+        uint32_t j = 0;
+        for (int i = 0; i < MAXNODES; i++)
+            if (j < s->count && s->entries[j].slot == (uint32_t)i) {
+                nodes[i] = s->entries[j].original;
+                *nodes[i] = s->entries[j++].saved;
+            } else if (nodes[i]) { node_free(nodes[i]); nodes[i] = 0; }
+        next_ino = s->next_ino;
+    }
+    kfree(s);
+}
+
 /* Removes n from the tree.  An open file keeps the node alive until it is closed. */
 int node_unlink(struct node *n) {
     for (int i = 0; i < MAXNODES; i++)
@@ -70,11 +107,13 @@ int vfs_resolve(const char *in, int follow_last, char *out) {
     char work[PATH_MAX * 2], res[PATH_MAX], nw[PATH_MAX * 2];
     int links = 0;
     if (!in[0]) return -ENOENT;
-    if (in[0] == '/') strlcpy(work, in, sizeof work);
+    if (in[0] == '/') {
+        if (strlcpy(work, in, sizeof work) >= sizeof work) return -ENAMETOOLONG;
+    }
     else {
-        strlcpy(work, cur ? cur->cwd : "/", sizeof work);
-        strlcat(work, "/", sizeof work);
-        strlcat(work, in, sizeof work);
+        if (strlcpy(work, cur ? cur->cwd : "/", sizeof work) >= sizeof work ||
+            strlcat(work, "/", sizeof work) >= sizeof work ||
+            strlcat(work, in, sizeof work) >= sizeof work) return -ENAMETOOLONG;
     }
     strlcpy(res, "/", sizeof res);
     if (!strncmp(work, "/proc", 5)) procfs_refresh();
@@ -88,12 +127,13 @@ int vfs_resolve(const char *in, int follow_last, char *out) {
         if (len == 1 && p[0] == '.') { p = e; continue; }
         if (len == 2 && p[0] == '.' && p[1] == '.') { pop_comp(res); p = e; continue; }
         size_t rl = strlen(res);
-        if (len > 200 || rl + len + 2 > PATH_MAX) return -ENAMETOOLONG;
+        if (rl + (rl > 1) + len >= PATH_MAX) return -ENAMETOOLONG;
         if (rl > 1) res[rl++] = '/';
         memcpy(res + rl, p, len); res[rl + len] = 0;
         p = e;
         const char *q = p; while (*q == '/') q++;
         int last = (*q == 0);
+        int trailing_slash = last && q != p;
         struct node *n = node_find(res);
         if (n && S_ISLNK(n->mode) && (!last || follow_last)) {
             if (++links > 16) return -ELOOP;
@@ -101,8 +141,11 @@ int vfs_resolve(const char *in, int follow_last, char *out) {
             if (n->size >= sizeof tgt) return -ENAMETOOLONG;
             size_t tl = n->size;
             memcpy(tgt, n->data, tl); tgt[tl] = 0;
+            if (!tl) return -ENOENT;
             if (tgt[0] == '/') strlcpy(res, "/", sizeof res); else pop_comp(res);
-            strlcpy(nw, tgt, sizeof nw); strlcat(nw, "/", sizeof nw);
+            strlcpy(nw, tgt, sizeof nw);
+            if ((*q || trailing_slash) && strlcat(nw, "/", sizeof nw) >= sizeof nw)
+                return -ENAMETOOLONG;
             if (strlcat(nw, q, sizeof nw) >= sizeof nw) return -ENAMETOOLONG;
             strlcpy(work, nw, sizeof work);
             p = work;
@@ -111,6 +154,9 @@ int vfs_resolve(const char *in, int follow_last, char *out) {
         if (!last) {
             if (!n) return -ENOENT;
             if (!S_ISDIR(n->mode)) return -ENOTDIR;
+        } else if (trailing_slash) {
+            if (!n && follow_last) return -ENOENT;
+            if (n && !S_ISDIR(n->mode)) return -ENOTDIR;
         }
     }
     strlcpy(out, res, PATH_MAX);
@@ -213,6 +259,8 @@ int vfs_open(const char *path, int flags, int mode, struct file **out) {
     struct node *n = node_find(abs);
     int created = 0;
     if (!n) {
+        size_t path_len = strlen(path);
+        if (path_len && path[path_len - 1] == '/') return -ENOENT;
         if (!(flags & O_CREAT)) return -ENOENT;
         char par[PATH_MAX];
         strlcpy(par, abs, sizeof par); pop_comp(par);
@@ -363,15 +411,19 @@ static int hex8(const uint8_t *s, uint32_t *out) {
     *out = v;
     return 0;
 }
-static void mkparents(const char *abs) {
+static int mkparents(const char *abs) {
     char tmp[PATH_MAX];
     strlcpy(tmp, abs, sizeof tmp);
     for (char *s = tmp + 1; *s; s++)
         if (*s == '/') {
             *s = 0;
-            if (!node_find(tmp)) node_create(tmp, S_IFDIR | 0755);
+            struct node *dir = node_find(tmp);
+            if (!dir) dir = node_create(tmp, S_IFDIR | 0755);
+            if (!dir) return -ENOMEM;
+            if (!S_ISDIR(dir->mode)) return -ENOTDIR;
             *s = '/';
         }
+    return 0;
 }
 static void mkdev(const char *path, int dev, int minor) {
     struct node *n = node_find(path);
@@ -412,7 +464,7 @@ struct node *vfs_put_node(const char *abs, uint32_t mode, const uint8_t *data, s
     }
     struct node *n = node_find(abs);
     if (!n) {
-        mkparents(abs);
+        if (mkparents(abs)) { kfree(d); return 0; }
         n = node_create(abs, mode);
         if (!n) { kfree(d); return 0; }
     }
@@ -439,7 +491,7 @@ static void initramfs_shell_link(void) {
 
 /* Validate the entire embedded archive before making any entry visible. */
 static int cpio_walk(const uint8_t *p, size_t remaining, int install) {
-    int count = 0, lost = 0;
+    int count = 0;
     for (;;) {
         uint32_t mode, fsz, nsz;
         if (remaining < 110 || memcmp(p, "070701", 6) ||
@@ -461,27 +513,42 @@ static int cpio_walk(const uint8_t *p, size_t remaining, int install) {
         while (name[0] == '/') name++;
         if (!name[0] || !strcmp(name, ".")) continue;
         if (strlen(name) >= PATH_MAX - 1) return -EINVAL;
+        if (S_ISLNK(mode)) {
+            if (!fsz || fsz >= PATH_MAX) return -EINVAL;
+            for (uint32_t i = 0; i < fsz; i++) if (!data[i]) return -EINVAL;
+        }
+        for (const char *part = name; *part;) {
+            const char *end = part;
+            while (*end && *end != '/') end++;
+            size_t len = end - part;
+            if (!len || (part[0] == '.' && (len == 1 || (len == 2 && part[1] == '.'))))
+                return -EINVAL;
+            if (*end && !end[1]) return -EINVAL;
+            part = *end ? end + 1 : end;
+        }
         if (!install) continue;
         char abs[PATH_MAX];
         abs[0] = '/'; strlcpy(abs + 1, name, sizeof abs - 1);
-        mkparents(abs);
+        int r = mkparents(abs);
+        if (r) return r;
         struct node *n = node_find(abs);
         if (!n) n = node_create(abs, mode);
-        if (!n) { if (lost++ < 8) kprintf("vfs: initramfs: no room for %s\n", abs); continue; }
+        if (!n) return -ENOMEM;
+        if ((n->mode & S_IFMT) != (mode & S_IFMT)) return -EINVAL;
         n->mode = mode;
         if ((mode & S_IFMT) == S_IFREG || S_ISLNK(mode)) { n->data = (uint8_t *)data; n->size = fsz; n->is_static = 1; }
         count++;
     }
     if (!install) return 0;
-    if (lost) kprintf("vfs: initramfs: %d entries did not fit in the file table\n", lost);
     kprintf("vfs: initramfs: %d entries\n", count);
     initramfs_shell_link();
     return 0;
 }
 
 void vfs_load_cpio(const void *cpio, size_t size) {
-    if (cpio_walk(cpio, size, 0) || cpio_walk(cpio, size, 1))
-        panic("vfs: malformed embedded initramfs");
+    int r = cpio_walk(cpio, size, 0);
+    if (!r) r = cpio_walk(cpio, size, 1);
+    if (r) panic("vfs: cannot load embedded initramfs (%d)", r);
 }
 
 void vfs_finish(void) {

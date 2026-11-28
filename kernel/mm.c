@@ -13,7 +13,7 @@ static uint32_t bm[(MAXFRAMES + 31) / 32];
 struct prange { uintptr_t base; size_t first, n; };
 static struct prange pr[MAXPRANGES];
 static int npr;
-static size_t nframes, freec, hint, totalc;
+static size_t nframes, freec, hint;
 
 static inline void bset(size_t i) { bm[i >> 5] |= 1u << (i & 31); }
 static inline void bclr(size_t i) { bm[i >> 5] &= ~(1u << (i & 31)); }
@@ -21,12 +21,13 @@ static inline int  btst(size_t i) { return bm[i >> 5] >> (i & 31) & 1; }
 
 static uintptr_t frame_pa(size_t i) {
     for (int r = 0; r < npr; r++)
-        if (i < pr[r].first + pr[r].n) return pr[r].base + ((uintptr_t)(i - pr[r].first) << 12);
+        if (i >= pr[r].first && i - pr[r].first < pr[r].n)
+            return pr[r].base + ((uintptr_t)(i - pr[r].first) << 12);
     return 0;
 }
 static long frame_index(uintptr_t pa) {
     for (int r = 0; r < npr; r++)
-        if (pa >= pr[r].base && pa < pr[r].base + ((uintptr_t)pr[r].n << 12))
+        if (pa >= pr[r].base && (pa - pr[r].base) / PAGE_SIZE < pr[r].n)
             return (long)(pr[r].first + ((pa - pr[r].base) >> 12));
     return -1;
 }
@@ -57,13 +58,14 @@ size_t pmm_add_range(uintptr_t start, uintptr_t end) {
     }
     if (!n) return 0;
     pr[npr].base = start; pr[npr].first = nframes; pr[npr].n = n; npr++;
-    for (size_t i = nframes; i < nframes + n; i++) { bclr(i); freec++; totalc++; }
+    for (size_t i = nframes; i < nframes + n; i++) bclr(i);
+    freec += n;
     nframes += n;
     return n;
 }
 void pmm_init(uintptr_t start, uintptr_t end) {
     for (size_t i = 0; i < sizeof bm / sizeof bm[0]; i++) bm[i] = ~0u;
-    npr = 0; nframes = 0; freec = 0; totalc = 0; hint = 0;
+    npr = 0; nframes = 0; freec = 0; hint = 0;
     pmm_add_range(start, end);
 }
 uintptr_t pmm_alloc(void) {
@@ -79,12 +81,23 @@ uintptr_t pmm_alloc(void) {
     return 0;
 }
 void pmm_free(uintptr_t pa) {
-    if (pa & (PAGE_SIZE - 1)) return;
+    if (pa & (PAGE_SIZE - 1)) {
+        kprintf("mem: rejecting unaligned frame free %lx\n", pa);
+        return;
+    }
     long i = frame_index(pa);
-    if (i >= 0 && btst((size_t)i)) { bclr((size_t)i); freec++; }
+    if (i < 0) {
+        kprintf("mem: rejecting out-of-range frame free %lx\n", pa);
+        return;
+    }
+    if (!btst((size_t)i)) {
+        kprintf("mem: rejecting already free frame %lx\n", pa);
+        return;
+    }
+    bclr((size_t)i); freec++;
 }
 size_t pmm_free_count(void) { return freec; }
-size_t pmm_total_count(void) { return totalc; }
+size_t pmm_total_count(void) { return nframes; }
 
 struct hdr { size_t size, free; };
 

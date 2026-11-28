@@ -11,6 +11,7 @@ static struct {
 
 struct einode { uint32_t mode, flags; uint64_t size; uint8_t blk[60]; };
 
+/* Directory file types, extents, 64-bit block numbers, flex_bg and large directories. */
 #define INCOMPAT_SUPPORTED (0x2 | 0x4 | 0x40 | 0x80 | 0x200 | 0x2000 | 0x4000)
 
 static int rdblk(uint64_t pblk, void *buf) {
@@ -121,52 +122,84 @@ static int ext_read(struct node *n, void *buf) {
     return read_range(&in, 0, buf, n->size);
 }
 
-static int truncated;
+#define EXT_WALK_MAX_DEPTH 20
+#define EXT_WALK_MAX_BLOCKS 65536
+#define EXT_WALK_MAX_ENTRIES 65536
+struct walk_state {
+    uint32_t blocks, entries, ancestors[EXT_WALK_MAX_DEPTH + 1];
+};
 
-static void walk(uint32_t dino, const char *path, int depth) {
-    struct einode di;
-    if (depth > 20 || get_inode(dino, &di)) return;
+static int walk(uint32_t dino, const char *path, int depth, struct walk_state *state) {
+    struct einode *in = kmalloc(2 * sizeof *in);
+    int err = -EIO;
+    if (!in) return -ENOMEM;
+    if (depth > EXT_WALK_MAX_DEPTH) { kfree(in); return -EIO; }
+    for (int i = 0; i < depth; i++)
+        if (state->ancestors[i] == dino) { kfree(in); return -EIO; }
+    state->ancestors[depth] = dino;
+    if (get_inode(dino, &in[0]) || (in[0].mode & S_IFMT) != S_IFDIR || in[0].size % E.bs) { kfree(in); return -EIO; }
     uint8_t *dbuf = kmalloc(E.bs);
-    char *cp = kmalloc(PATH_MAX + 260);
-    if (!dbuf || !cp) { kfree(dbuf); kfree(cp); return; }
-    for (uint64_t off = 0; off < di.size; off += E.bs) {
-        if (read_range(&di, off, dbuf, E.bs)) break;
-        for (uint32_t p = 0; p + 8 <= E.bs;) {
+    char *cp = kmalloc(PATH_MAX);
+    if (!dbuf || !cp) { err = -ENOMEM; goto out; }
+    for (uint64_t off = 0; off < in[0].size; off += E.bs) {
+        if (state->blocks++ >= EXT_WALK_MAX_BLOCKS || read_range(&in[0], off, dbuf, E.bs)) goto out;
+        for (uint32_t p = 0; p < E.bs;) {
+            if (E.bs - p < 8 || state->entries++ >= EXT_WALK_MAX_ENTRIES) goto out;
             uint32_t ino = le32(dbuf + p), rl = le16(dbuf + p + 4), nl = dbuf[p + 6];
-            if (rl < 8 || (rl & 3) || p + rl > E.bs || nl > rl - 8) break;
+            if (rl < 8 || (rl & 3) || rl > E.bs - p || nl > rl - 8) goto out;
             const char *name = (const char *)dbuf + p + 8;
             int dots = nl == 1 && name[0] == '.' ? 1 : nl == 2 && name[0] == '.' && name[1] == '.' ? 1 : 0;
             int valid = 1;
             for (uint32_t j = 0; j < nl; j++)
                 if (!name[j] || name[j] == '/') { valid = 0; break; }
-            if (ino && nl && valid && !dots && strlen(path) + nl + 2 < PATH_MAX) {
+            if (ino && (!nl || !valid)) goto out;
+            if (ino && !dots) {
+                if (strlen(path) + nl + 2 > PATH_MAX) { err = -ENAMETOOLONG; goto out; }
                 strlcpy(cp, path, PATH_MAX); strlcat(cp, "/", PATH_MAX);
                 size_t l = strlen(cp); memcpy(cp + l, name, nl); cp[l + nl] = 0;
-                struct einode ci;
-                if (!get_inode(ino, &ci)) {
-                    uint32_t t = ci.mode & S_IFMT;
+                struct einode *ci = &in[1];
+                if (get_inode(ino, ci)) goto out;
+                {
+                    uint32_t t = ci->mode & S_IFMT;
                     if (t == S_IFLNK) {
-                        char tgt[PATH_MAX]; size_t tl = ci.size < PATH_MAX - 1 ? ci.size : PATH_MAX - 1;
-                        if (ci.size < 60 && !(ci.flags & 0x80000)) memcpy(tgt, ci.blk, tl);
-                        else if (read_range(&ci, 0, (uint8_t *)tgt, tl)) tl = 0;
+                        if (ci->size >= PATH_MAX) { err = -ENAMETOOLONG; goto out; }
+                        char *tgt = kmalloc(PATH_MAX);
+                        if (!tgt) { err = -ENOMEM; goto out; }
+                        size_t tl = ci->size;
+                        if (ci->size < 60 && !(ci->flags & 0x80000)) memcpy(tgt, ci->blk, tl);
+                        else if (read_range(ci, 0, (uint8_t *)tgt, tl)) { kfree(tgt); goto out; }
                         tgt[tl] = 0;
-                        if (vfs_symlink(tgt, cp)) truncated = 1;
-                    } else if (!vfs_add(cp, ci.mode, t == S_IFREG ? ci.size : 0, ino, &ext_driver)) truncated = 1;
-                    else if (t == S_IFDIR) {
-                        char *sub = kmalloc(strlen(cp) + 1);
-                        if (sub) { strlcpy(sub, cp, strlen(cp) + 1); walk(ino, sub, depth + 1); kfree(sub); }
+                        int r = vfs_symlink(tgt, cp);
+                        kfree(tgt);
+                        if (r) { err = r; goto out; }
+                    } else {
+                        if (!vfs_add(cp, ci->mode, t == S_IFREG ? ci->size : 0, ino, &ext_driver)) { err = -ENOMEM; goto out; }
+                        if (t == S_IFDIR) {
+                            err = walk(ino, cp, depth + 1, state);
+                            if (err) goto out;
+                            err = -EIO;
+                        }
                     }
                 }
             }
             p += rl;
         }
     }
-    kfree(dbuf); kfree(cp);
+    err = 0;
+out:
+    kfree(dbuf); kfree(cp); kfree(in);
+    return err;
 }
 
 static int ext_mount(uint64_t base) {
     uint8_t sb[1024];
     if (board_blk_read(base + 2, sb, 2)) return -EIO;
+    /* No ext journal replay, orphan cleanup or in-inode directory reader. */
+    if (le16(sb + 58) != 1 || le32(sb + 232) ||
+        (le32(sb + 100) & 0x10000)) {
+        kprintf("[ext] volume requires offline recovery\n");
+        return -EINVAL;
+    }
     E.base = base;
     if (le32(sb + 24) > 6) return -EINVAL;
     E.bs = 1024u << le32(sb + 24);
@@ -201,9 +234,12 @@ static int ext_mount(uint64_t base) {
         if (!E.itable[g] || E.itable[g] >= blocks || table_blocks > blocks - E.itable[g]) goto fail;
     }
     kprintf("ext: block size %u, %u groups, inode size %u, features 0x%x\n", E.bs, E.ngroups, E.isz, E.incompat);
-    truncated = 0;
-    walk(2, "", 0);
-    if (truncated) kprintf("ext: warning: tree larger than the VFS node table; some files are missing\n");
+    struct walk_state state = {0};
+    struct vfs_mount_snapshot *snapshot = vfs_mount_snapshot();
+    if (!snapshot) { err = -ENOMEM; goto fail; }
+    err = walk(2, "", 0, &state);
+    vfs_mount_finish(snapshot, err != 0);
+    if (err) goto fail;
     return 0;
 fail:
     kfree(E.itable); kfree(E.blk); kfree(E.xbuf);

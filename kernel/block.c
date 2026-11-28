@@ -8,14 +8,27 @@ int __attribute__((weak)) board_blk_write(uint64_t lba, const void *buf, uint32_
     return -1;
 }
 
-static int try_volume(uint64_t base, const char *what) {
+static uint32_t mbr_u32(const uint8_t *p) {
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
+           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static int try_volume(uint64_t base, uint64_t limit, uint64_t occupied_end, const char *what) {
+    /* Both probe and ident read the two sectors containing the ext superblock. */
+    if (base > limit || limit - base < 4) return -EINVAL;
     for (int i = 0; drivers[i]; i++) {
+        uint64_t end, id;
         if (drivers[i]->probe(base)) continue;
+        if (!drivers[i]->ident || drivers[i]->ident(base, &end, &id) ||
+            end <= base || end > limit) {
+            kprintf("[block] invalid filesystem extent on %s\n", what);
+            return -EINVAL;
+        }
         kprintf("[block] found volume %s: %s filesystem\n", what, drivers[i]->name);
         int r = drivers[i]->mount(base);
         if (r == 0) {
             vfs_mark_base();
-            persist_attach_fs(drivers[i], base);
+            persist_attach_fs(occupied_end > end ? occupied_end : end, id);
         }
         return r;
     }
@@ -24,18 +37,42 @@ static int try_volume(uint64_t base, const char *what) {
 
 int blk_mount_root(int part) {
     if (board_blk_init()) return -ENODEV;
-    kprintf("[block] mounting disk with %lu sectors (%lu MB)\n", (unsigned long)board_blk_sectors(), (unsigned long)(board_blk_sectors() >> 11));
-    int r = -ENOENT;
-    if (part == 0 && (r = try_volume(0, "whole disk")) == 0) return 0;
+    uint64_t sectors = board_blk_sectors();
+    kprintf("[block] mounting disk with %lu sectors (%lu MB)\n", (unsigned long)sectors, (unsigned long)(sectors >> 11));
     uint8_t mbr[512];
-    if (board_blk_read(0, mbr, 1) || mbr[510] != 0x55 || mbr[511] != 0xAA) return r;
+    if (!sectors || board_blk_read(0, mbr, 1)) return -EIO;
+    uint64_t starts[4] = {0}, ends[4] = {0}, occupied_end = 0;
+    int entries = 0;
+    if (mbr[510] == 0x55 && mbr[511] == 0xAA) {
+        for (int i = 0; i < 4; i++) {
+            const uint8_t *e = mbr + 446 + i * 16;
+            uint32_t start = mbr_u32(e + 8), size = mbr_u32(e + 12);
+            if (!e[4] && !start && !size) continue;
+            /* GPT and extended partition layouts are not parsed; their occupied
+             * extents cannot safely be inferred from primary entries alone. */
+            if (!e[4] || !start || !size || e[4] == 0xee || e[4] == 0x05 ||
+                e[4] == 0x0f || e[4] == 0x85 || start >= sectors ||
+                (uint64_t)size > sectors - start) {
+                kprintf("[block] invalid or unsupported partition table\n");
+                return -EINVAL;
+            }
+            starts[i] = start; ends[i] = (uint64_t)start + size;
+            for (int j = 0; j < i; j++) {
+                if (ends[j] && starts[i] < ends[j] && starts[j] < ends[i]) {
+                    kprintf("[block] overlapping partitions\n");
+                    return -EINVAL;
+                }
+            }
+            if (ends[i] > occupied_end) occupied_end = ends[i];
+            entries++;
+        }
+    }
+    if (!entries) return part ? -ENOENT : try_volume(0, sectors, 0, "whole disk");
+    int r = -ENOENT;
     for (int i = 0; i < 4; i++) {
-        if (part && part != i + 1) continue;
-        const uint8_t *e = mbr + 446 + i * 16;
-        uint32_t lba = e[8] | e[9] << 8 | e[10] << 16 | (uint32_t)e[11] << 24;
-        if (!e[4] || !lba) continue;
+        if ((part && part != i + 1) || !ends[i]) continue;
         char what[24]; ksnprintf(what, sizeof what, "partition %d", i + 1);
-        if ((r = try_volume(lba, what)) == 0) return 0;
+        if ((r = try_volume(starts[i], ends[i], occupied_end, what)) == 0) return 0;
     }
     return r;
 }
