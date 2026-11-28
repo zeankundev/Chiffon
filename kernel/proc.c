@@ -564,6 +564,49 @@ extern const uint8_t _driver_loader_start[], _driver_loader_end[];
 extern const uint8_t _hid_server_start[], _hid_server_end[];
 extern const uint8_t _fb_server_start[], _fb_server_end[];
 
+/* #!interp [optarg]: run the interpreter with the script path as the next argument. */
+static int proc_exec_script(struct proc* p, const char* script, const uint8_t* img, size_t sz,
+    char** argv, char** envp, struct trapframe* tf) {
+    static int depth;                       /* nested #! lines: stop at a small limit */
+    if (depth >= 4) return -ENOEXEC;
+
+    char* line = kmalloc(PATH_MAX);
+    if (!line) return -ENOMEM;
+    size_t n = 0;
+    while (n < sz && n < PATH_MAX - 1 && img[n] != '\n') { line[n] = img[n]; n++; }
+    line[n] = 0;
+
+    char* s = line + 2;                     /* skip "#!" */
+    while (*s == ' ' || *s == '\t') s++;
+    char* interp = s;
+    while (*s && *s != ' ' && *s != '\t') s++;
+    char* optarg = 0;
+    if (*s) {
+        *s++ = 0;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s) optarg = s;
+    }
+    if (!*interp) { kfree(line); return -ENOEXEC; }
+
+    int argc = 0;
+    while (argv && argv[argc]) argc++;
+    char** nv = kmalloc(sizeof(char*) * (argc + 4));
+    if (!nv) { kfree(line); return -ENOMEM; }
+    int k = 0;
+    nv[k++] = interp;
+    if (optarg) nv[k++] = optarg;
+    nv[k++] = (char*)script;
+    for (int i = 1; i < argc; i++) nv[k++] = argv[i];
+    nv[k] = 0;
+
+    depth++;
+    int r = proc_exec(p, interp, nv, envp, tf);
+    depth--;
+    kfree(nv);
+    kfree(line);
+    return r;
+}
+
 int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct trapframe *tf) {
     char abs[PATH_MAX];
     int r;
@@ -591,6 +634,8 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
         img = n->data;
         sz = n->size;
     }
+    if (!boot_loader && !fb_server && !hid_server && sz >= 2 && img[0] == '#' && img[1] == '!')
+        return proc_exec_script(p, abs, img, sz, argv, envp, tf);
     const struct ehdr *eh = (const void *)img;
     if (!elf_header_ok(eh, sz) || (eh->type != ET_EXEC && eh->type != ET_DYN)) return -ENOEXEC;
 
