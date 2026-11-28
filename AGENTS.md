@@ -6,10 +6,10 @@ Chiffon is a Unix-like **hybrid kernel** (microkernel core + kernel-space core s
 - **Primary Architecture:** `aarch64` (QEMU `virt`, Cortex-A72, GICv2, PL011 UART). `x86_64` (QEMU PC, Multiboot) supported.
 - **Microkernel Core:** Process scheduler, physical frame allocator (PMM), virtual memory management (VMM), IPC subsystem, and capability manager.
 - **Hybrid Driver Model:**
-  - Essential core services (block, TTY/VT console, base timers) operate in kernel space.
-  - Peripheral device subsystems (such as the framebuffer display server `fbserver`) run as user-space servers in ring 3.
-  - Drivers interact with hardware through explicit kernel capabilities (`CHI_CAP_MMIO`, `CHI_CAP_IRQ`).
-  - Device services are reached only via IPC (`chiffon_ipc_call`).
+  - Boot, exception/IRQ dispatch, process management, VFS, block/storage, the network stack, primary input, TTY/VT and timers operate in kernel space.
+  - Embedded framebuffer and USB HID servers run in user address spaces. Trusted kernel transports retain the controller, DMA queues and block path, including USB mass storage.
+  - The framebuffer server receives exclusive MMIO and registration authority. The HID server receives device-specific authority for bounded report IPC. IRQ, DMA and loader grants are denied.
+  - User-space server requests use IPC. Core services retain their direct kernel interfaces.
   - A crash or termination of a user-space driver server does not crash the kernel; callers receive `-EPIPE` (-32) and the driver loader can restart the server.
 
 ## 2. Verified Subsystems & State Audit
@@ -17,12 +17,12 @@ Chiffon is a Unix-like **hybrid kernel** (microkernel core + kernel-space core s
 | Subsystem | State | Details |
 |---|---|---|
 | **IPC** | Verified | Syscalls 1000–1006. Synchronous & asynchronous message passing. Measured round-trip latency: **88.5 µs** (~11,300 ops/sec). |
-| **User-Space Drivers** | Verified | Driver loader (`drvloader`) and user-space framebuffer server (`fbserver`). Maps device MMIO via capabilities. |
+| **User-Space Drivers** | Tested in QEMU | The loader restarts both framebuffer and HID services on both targets. USB-origin keyboard and mouse delivery through the HID server was exercised on x86_64. |
 | **Crash Resilience** | Verified | Server crash fails blocked and subsequent callers with `-EPIPE`; kernel survives intact. |
-| **VFS & Storage** | Verified (ext read-only; changes logged) | Ext2/3/4 reader mounts read-only. Mutations (create, write, `mkdirat`, `unlinkat`, `renameat`, `symlinkat`, `chmod`) are recorded in a write-ahead log in the last 4 MiB of the disk (`kernel/persist.c`) and replayed at boot. The journal now uses sector-aligned CHIFLOG2 records and migrates CHIFLOG1 on snapshot. The following checks predate CHIFLOG2. Reset by `make` rebuilding the image. Verified on aarch64 (virtio-blk) and x86_64 (ATA PIO): reboot, rename, unlink, compaction and a hard stop. |
+| **VFS & Storage** | Tested on Demo ext4 disks | The core ext reader mounts read-only. The full profile journals changes in the last 4 MiB. The CHIFLOG2 QEMU test verifies compaction, reboot replay, rename, unlink and interruption after sync on both targets. |
 | **Processes** | Earlier single-CPU checks | `fork`, `execve`, `wait4`, `exit`. AArch64 QEMU requests secondary startup through PSCI and counts each secondary after local initialization. x86_64 runs on its boot CPU, including with `smp=on`. Current SMP changes await human checks. [CPU startup and locking](docs/SMP.md) |
-| **Virtual Memory** | Source implementation, pending current checks | Boot memory ranges are clipped to the mapped window and PMM capacity. AArch64 and x86_64 now encode user page permissions and reject writable-executable user mappings. [Page protection](docs/PAGE_PROTECTION.md) |
-| **Keyboard delivery** | Verified in QEMU (x86_64 PS/2, aarch64 virtio-input); test program not committed | Per-tty `CHI_KBDSETMODE` / `CHI_KBDGETMODE` (`include/uapi/chiffon_abi.h`). `CHI_KBDMODE_DIRECT` sends each key press/release as a `chi_input_event` record straight to the reader: no line buffer, no echo, no ^C/^\ signals. Alt+F1..F4 stay a kernel hotkey. The mode ends when the process that set it exits. Default is `CHI_KBDMODE_TTY` (unchanged line discipline). |
+| **Virtual Memory** | Tested subset on both QEMU targets | The VM probe checks writable-executable request denial, permission transitions and private fork contents. The kernel clips boot memory ranges to the mapped window and PMM capacity. [Page protection](docs/PAGE_PROTECTION.md) |
+| **Keyboard delivery** | Tested on QEMU PS/2 and virtio-input | The committed direct-key probe reads ordered Ctrl and C press/release records from tty0 and verifies TTY mode after the owner exits. Alt+F1..F4 remain kernel hotkeys. |
 
 ## 3. Capabilities & Syscall Interface
 
@@ -42,6 +42,8 @@ Chiffon is a Unix-like **hybrid kernel** (microkernel core + kernel-space core s
 | `CSYS_dev_info`   | 1014 | Query hardware device info (`DEV_TYPE_FB`, `DEV_TYPE_UART`) |
 
 ## 4. Verification Commands
+
+The [P4 verification procedure](docs/hybrid/P4.md) exercises these commands on both QEMU targets. Driver ABI v3 also provides `drvloader test-hid` for the bounded USB report service.
 
 Run under QEMU (`make run`):
 - `drvloader status`: View driver subsystem and hardware device status.

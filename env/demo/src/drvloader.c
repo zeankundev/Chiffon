@@ -319,15 +319,64 @@ static long crash_fb(struct chi_ipc_msg *reply) {
     return 0;
 }
 
+static int hid_pid, hid_port;
+static long start_hid(void) {
+    if (hid_pid && !wait_child(hid_pid, 1)) return 0;
+    hid_pid = hid_port = 0;
+    int ready[2];
+    long r = chiffon_pipe(ready);
+    if (r < 0) return r;
+    int loader = ksys(CF_getpid, 0, 0, 0, 0, 0, 0);
+    int pid = chiffon_fork();
+    if (!pid) {
+        chiffon_close(ready[0]);
+        char fd[12], parent[12];
+        decimal_arg(fd, ready[1]);
+        decimal_arg(parent, loader);
+        char *av[] = { "/bin/hidserver", fd, parent, 0 };
+        chiffon_execve(av[0], av, 0);
+        chiffon_exit(1);
+    }
+    chiffon_close(ready[1]);
+    int port;
+    if (pid < 0) r = pid;
+    else if (chiffon_read(ready[0], &port, sizeof port) != sizeof port) r = -32;
+    else if (port <= 0) r = port ? port : -5;
+    else { hid_pid = pid; hid_port = port; }
+    chiffon_close(ready[0]);
+    if (pid > 0 && r < 0) wait_child(pid, 0);
+    return r;
+}
+static long test_hid(void) {
+    long r = start_hid();
+    if (r) return r;
+    int old = hid_port;
+    struct chi_ipc_msg req = { .tag = HID_OP_EXIT }, rep;
+    r = chiffon_ipc_call(old, &req, &rep);
+    if (r != -32 && (r || rep.tag != -32)) return -5;
+    if (wait_child(hid_pid, 0) != hid_pid) return -5;
+    hid_pid = hid_port = 0;
+    req.tag = HID_OP_STATUS;
+    if (chiffon_ipc_call(old, &req, &rep) != -32) return -5;
+    r = start_hid();
+    if (r) return r;
+    if (old == hid_port || chiffon_ipc_call(hid_port, &req, &rep) || rep.src != hid_pid) return -5;
+    return rep.tag;
+}
 static int loader_service(void) {
     long port = chiffon_ipc_create(IPC_SVC_LOADER);
     if (port < 0) return 1;
+    start_hid();
     struct chi_ipc_msg req;
     while (chiffon_ipc_recv(port, &req, 0) == 0) {
         struct chi_ipc_msg rep = { .dst = req.src };
         refresh_fb();
         if (req.len) {
             rep.tag = -22;
+        } else if (req.tag == DRV_OP_HID_TEST) {
+            rep.tag = test_hid();
+        } else if (req.tag == DRV_OP_HID_START) {
+            rep.tag = start_hid();
         } else if (req.tag == DRV_OP_CRASH) {
             rep.tag = crash_fb(&rep);
         } else if (req.tag == DRV_OP_LOAD || req.tag == DRV_OP_STATUS) {
@@ -393,6 +442,15 @@ static int cmd_crash_test(void) {
 int main(int argc, char **argv, char **envp) {
     if (argc > 1) {
         if (!chiffon_strcmp(argv[1], "--service")) return loader_service();
+        if (!chiffon_strcmp(argv[1], "test-hid") ||
+            (!chiffon_strcmp(argv[1], "start") && argc == 3 && !chiffon_strcmp(argv[2], "hid"))) {
+            int test = !chiffon_strcmp(argv[1], "test-hid");
+            struct chi_ipc_msg rep;
+            long r = loader_call(test ? DRV_OP_HID_TEST : DRV_OP_HID_START, &rep);
+            if (r) { chiffon_puts("HID loader error "); put_num(r); chiffon_puts("\n"); return 1; }
+            chiffon_puts(test ? "PASS HID crash and restart\n" : "HID server ready\n");
+            return 0;
+        }
         if (!chiffon_strcmp(argv[1], "status")) {
             cmd_status();
             return 0;
@@ -425,7 +483,7 @@ int main(int argc, char **argv, char **envp) {
         }
     }
 
-    chiffon_puts("Usage: drvloader [status | start fb | bench <n> | test-crash | test]\n");
+    chiffon_puts("Usage: drvloader [status | start fb | start hid | test-hid | bench <n> | test-crash | test]\n");
     cmd_status();
     return 0;
 }

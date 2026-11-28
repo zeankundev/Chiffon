@@ -225,6 +225,15 @@ struct proc *proc_alloc(void) {
     return 0;
 }
 
+/* rseq(2): the kernel writes the CPU a thread runs on into its registered struct rseq.  A thread
+ * stays on one CPU from one schedule-in to the next, so publishing at schedule-in keeps
+ * cpu_id_start and cpu_id correct without work on the syscall path. */
+void rseq_publish(struct proc *p, int cpu) {
+    if (!p->rseq_area || !mm_user_write(p->mm, p->rseq_area, 8)) return;
+    uint32_t v[2] = { (uint32_t)cpu, (uint32_t)cpu };
+    memcpy((void *)p->rseq_area, v, sizeof v);
+}
+
 /* The scheduler loop of one CPU.  It is entered holding the kernel lock and keeps it while it
  * switches to a process (the process resumes holding it); it releases it only while the CPU idles. */
 void scheduler(void) {
@@ -247,6 +256,7 @@ void scheduler(void) {
         }
         c->proc = n; n->state = P_RUNNING;
         arch_aspace_switch(n->mm->root);
+        rseq_publish(n, c->id);
         arch_set_kstack((uintptr_t)n->kstack + KSTACK_SIZE);
         arch_uctx_restore(&n->uctx);
         arch_switch(&c->sched_ctx, n->ksp);
@@ -290,7 +300,8 @@ void proc_signal(struct proc *p, int sig) {
 /* kill(pid): every thread of the process group leader pid (pid > 0), or a process group. */
 int proc_may_control(const struct proc *target) {
     if (target->tgid == cur->tgid || cur->pid == init_pid || cur->is_driver_loader) return 1;
-    return !target->is_driver_loader && !target->ncaps;
+    return !target->is_driver_loader && !target->driver_bootstrap &&
+           !target->is_fb_server && !target->ncaps;
 }
 int proc_kill(int pid, int sig) {
     if (sig < 0 || sig > 64) return -EINVAL;
@@ -560,7 +571,51 @@ static int load_interp(struct mm *nm, const char *path, uintptr_t *entry) {
 }
 
 extern const uint8_t _driver_loader_start[], _driver_loader_end[];
+extern const uint8_t _hid_server_start[], _hid_server_end[];
 extern const uint8_t _fb_server_start[], _fb_server_end[];
+
+/* #!interp [optarg]: run the interpreter with the script path as the next argument. */
+static int proc_exec_script(struct proc* p, const char* script, const uint8_t* img, size_t sz,
+    char** argv, char** envp, struct trapframe* tf) {
+    static int depth;                       /* nested #! lines: stop at a small limit */
+    if (depth >= 4) return -ENOEXEC;
+
+    char* line = kmalloc(PATH_MAX);
+    if (!line) return -ENOMEM;
+    size_t n = 0;
+    while (n < sz && n < PATH_MAX - 1 && img[n] != '\n') { line[n] = img[n]; n++; }
+    line[n] = 0;
+
+    char* s = line + 2;                     /* skip "#!" */
+    while (*s == ' ' || *s == '\t') s++;
+    char* interp = s;
+    while (*s && *s != ' ' && *s != '\t') s++;
+    char* optarg = 0;
+    if (*s) {
+        *s++ = 0;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s) optarg = s;
+    }
+    if (!*interp) { kfree(line); return -ENOEXEC; }
+
+    int argc = 0;
+    while (argv && argv[argc]) argc++;
+    char** nv = kmalloc(sizeof(char*) * (argc + 4));
+    if (!nv) { kfree(line); return -ENOMEM; }
+    int k = 0;
+    nv[k++] = interp;
+    if (optarg) nv[k++] = optarg;
+    nv[k++] = (char*)script;
+    for (int i = 1; i < argc; i++) nv[k++] = argv[i];
+    nv[k] = 0;
+
+    depth++;
+    int r = proc_exec(p, interp, nv, envp, tf);
+    depth--;
+    kfree(nv);
+    kfree(line);
+    return r;
+}
 
 int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct trapframe *tf) {
     char abs[PATH_MAX];
@@ -569,7 +624,12 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     int fb_server = p->driver_bootstrap && !strcmp(path, "/bin/fbserver");
     const uint8_t *img;
     size_t sz;
-    if (boot_loader || fb_server) {
+    int hid_server = p->driver_bootstrap && !strcmp(path, "/bin/hidserver");
+    if (hid_server) {
+        img = _hid_server_start;
+        sz = (uintptr_t)_hid_server_end - (uintptr_t)img;
+        strlcpy(abs, path, sizeof abs);
+    } else if (boot_loader || fb_server) {
         const uint8_t *end = boot_loader ? _driver_loader_end : _fb_server_end;
         img = boot_loader ? _driver_loader_start : _fb_server_start;
         sz = (uintptr_t)end - (uintptr_t)img;
@@ -584,6 +644,8 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
         img = n->data;
         sz = n->size;
     }
+    if (!boot_loader && !fb_server && !hid_server && sz >= 2 && img[0] == '#' && img[1] == '!')
+        return proc_exec_script(p, abs, img, sz, argv, envp, tf);
     const struct ehdr *eh = (const void *)img;
     if (!elf_header_ok(eh, sz) || (eh->type != ET_EXEC && eh->type != ET_DYN)) return -ENOEXEC;
 
@@ -612,8 +674,8 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     nm.brk_start = nm.brk_end = PGUP(hi);
     nm.mmap_next = MMAP_BASE;
     uint64_t placement;
-    if (!hardware_random_word(&placement))
-        nm.mmap_next += (placement & 0xffff) * PAGE_SIZE;
+    kernel_random_fill(&placement, sizeof placement);
+    nm.mmap_next += (placement & 0xffff) * PAGE_SIZE;
 
     int argc = 0, envc = 0; size_t S = 0;
     while (argv && argv[argc]) S += strlen(argv[argc++]) + 1;
@@ -634,13 +696,15 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     w[k++] = 0;
     for (int i = 0; i < envc; i++) { w[k++] = sa; size_t l = strlen(envp[i]) + 1; memcpy(buf + (sa - sp), envp[i], l); sa += l; }
     w[k++] = 0;
+    /* AT_RANDOM: 16 bytes for the libc stack guard and pointer-mangling seeds.  Always provided;
+     * the kernel generator never fails, so glibc/musl no longer fault on a missing pointer. */
     uint64_t random[2];
-    int seeded = !hardware_random_word(&random[0]) && !hardware_random_word(&random[1]);
-    if (seeded) memcpy(buf + (rndp - sp), random, sizeof random);
+    kernel_random_fill(random, sizeof random);
+    memcpy(buf + (rndp - sp), random, sizeof random);
     uint64_t aux[][2] = {
         {AT_PHDR, phdr_va}, {AT_PHENT, sizeof(struct phdr)}, {AT_PHNUM, eh->phnum}, {AT_PAGESZ, PAGE_SIZE},
         {AT_BASE, interp_base}, {AT_ENTRY, eh->entry + bias}, {AT_UID, 0}, {AT_EUID, 0}, {AT_GID, 0}, {AT_EGID, 0},
-        {AT_SECURE, 0}, {seeded ? AT_RANDOM : 1 /* AT_IGNORE */, seeded ? rndp : 0},
+        {AT_SECURE, 0}, {AT_RANDOM, rndp},
         {AT_CLKTCK, HZ}, {AT_HWCAP, AUX_HWCAP}, {AT_NULL, 0},
     };
     for (int i = 0; i < naux; i++) { w[k++] = aux[i][0]; w[k++] = aux[i][1]; }
@@ -660,6 +724,7 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     p->is_driver_loader = boot_loader;
     p->driver_bootstrap = 0;
     p->is_fb_server = fb_server;
+    if (hid_server) p->caps[p->ncaps++] = (struct proc_cap){ CHI_CAP_DRIVER, DEV_TYPE_HID, 0 };
     for (int i = 0; i < NOFILE; i++)
         if (p->ft->f[i] && (p->cloexec >> i & 1)) { file_close(p->ft->f[i]); p->ft->f[i] = 0; }
     p->cloexec = 0;

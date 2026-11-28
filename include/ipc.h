@@ -13,6 +13,7 @@ typedef int (*ipc_handler)(const struct chi_ipc_msg *req, struct chi_ipc_msg *re
 
 struct proc;
 void ipc_init(void);
+int ipc_notify_hid(void);
 int  ipc_register_service(const char *name, ipc_handler h);     /* kernel-side server; -errno or port id */
 long ipc_syscall(long nr, long a0, long a1, long a2);
 void ipc_proc_exit(struct proc *p);                              /* drop ports, fail pending calls */

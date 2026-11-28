@@ -30,6 +30,8 @@ static long port_new(const char *name, int owner, ipc_handler svc) {
     if (!name_ok(name)) return -EINVAL;
     int framebuffer = !strcmp(name, IPC_SVC_FB);
     if (!svc) {
+        if (!strcmp(name, IPC_SVC_HID_BUS)) return -EPERM;
+        if (!strcmp(name, IPC_SVC_HID) && !cap_check(cur, CHI_CAP_DRIVER, DEV_TYPE_HID, 0)) return -EPERM;
         if (!strcmp(name, IPC_SVC_CONSOLE)) return -EPERM;
         if (!strcmp(name, IPC_SVC_LOADER) && !cap_check(cur, CHI_CAP_LOADER, 0, 0)) return -EPERM;
         if (framebuffer && !cap_check(cur, CHI_CAP_DRIVER, DEV_TYPE_FB, 0)) return -EPERM;
@@ -103,6 +105,19 @@ static long ipc_send_k(long id, const struct chi_ipc_msg *m, int flags) {
     return 0;
 }
 
+/* Only the transport can stamp a wakeup with kernel origin. */
+int ipc_notify_hid(void) {
+    for (int i = 0; i < NPORT; i++) {
+        struct port *pt = &ports[i];
+        if (!pt->used || strcmp(pt->name, IPC_SVC_HID)) continue;
+        if (pt->count == QLEN) return -EAGAIN;
+        struct chi_ipc_msg *slot = &pt->q[(pt->head + pt->count++) % QLEN];
+        *slot = (struct chi_ipc_msg){ .tag = HID_OP_WAKE };
+        wakeup(pt);
+        return 0;
+    }
+    return -ENOENT;
+}
 static long ipc_recv_k(long id, struct chi_ipc_msg *out, int flags) {
     struct port *pt = by_id(id);
     if (!pt || pt->svc) return -ENOENT;

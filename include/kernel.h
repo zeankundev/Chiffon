@@ -136,6 +136,7 @@ void kvprintf(const char *fmt, __builtin_va_list ap);
 int ksnprintf(char *buf, size_t n, const char *fmt, ...);
 void panic(const char *fmt, ...) __attribute__((noreturn));
 int hardware_random_word(uint64_t *out);
+void kernel_random_fill(void* buf, size_t n);
 void stack_guard_init(void);
 
 int kstrcasecmp(const char *a, const char *b);
@@ -176,6 +177,8 @@ struct proc {
     int tgid;                /* thread group: the pid of the group leader (getpid) */
     int is_thread;           /* a clone(CLONE_THREAD) thread: not a child for wait4 */
     uintptr_t clear_child_tid;   /* CLONE_CHILD_CLEARTID / set_tid_address: zeroed and woken on exit */
+    uintptr_t rseq_area;     /* rseq(2) registration: the thread's struct rseq, 0 = not registered */
+    uint32_t rseq_len, rseq_sig;
     uint64_t futex_deadline; /* timed FUTEX_WAIT: wake at this tick */
     int futex_woken;         /* set by FUTEX_WAKE */
     int ctty;                /* controlling terminal: minor + 1, 0 = none */
@@ -211,6 +214,7 @@ long dev_irq_claim(unsigned irq);
 long dev_irq_wait(unsigned irq);
 long dev_info_query(int type, void *uinfo);
 void dev_driver_cleanup(struct proc *p);
+void rseq_publish(struct proc *p, int cpu);     /* called when p is scheduled in on CPU cpu */
 
 void sched_init(void);
 void scheduler(void) __attribute__((noreturn));
@@ -256,7 +260,7 @@ int  uok(uintptr_t va, size_t len);
 int  uwok(uintptr_t va, size_t len);
 int  ustrcpy(char *dst, uintptr_t usrc, size_t max);
 
-enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT };
+enum { DEV_NONE, DEV_NULL, DEV_ZERO, DEV_TTY, DEV_FB, DEV_INPUT, DEV_RANDOM };
 struct node {
     char *path; uint32_t mode; int dev;
     int minor;       /* DEV_TTY: which terminal (serial, screen N, or a TTY_*_MINOR alias) */
@@ -271,11 +275,10 @@ struct node {
 };
 struct fs_driver {
     const char *name;
-    int (*probe)(uint64_t base_lba);
-    int (*mount)(uint64_t base_lba);
+    /* Mount within [base_lba, limit_lba); return -ENOENT for an unrecognized
+     * volume. On success publish the exclusive filesystem end and journal ID. */
+    int (*mount)(uint64_t base_lba, uint64_t limit_lba, uint64_t *end_lba, uint64_t *fsid);
     int (*read)(struct node *n, void *buf);
-    /* optional: filesystem identity for the persistence log */
-    int (*ident)(uint64_t base_lba, uint64_t *fs_end_lba, uint64_t *fsid);
 };
 extern const struct fs_driver ext_driver;
 enum { F_NODE = 1, F_PIPE_R, F_PIPE_W, F_SOCKET };

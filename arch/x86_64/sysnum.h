@@ -26,6 +26,7 @@
 #define SYS_dup2 33
 #define SYS_nanosleep 35
 #define SYS_getpid 39
+#define SYS_sendfile 40
 #define SYS_clone 56
 #define SYS_futex 202
 #define SYS_getcpu 309
@@ -49,6 +50,8 @@
 #define SYS_fsync 74
 #define SYS_fdatasync 75
 #define SYS_sync 162
+#define SYS_mount 165
+#define SYS_umount2 166
 #define SYS_fchmod 91
 #define SYS_umask 95
 #define SYS_gettimeofday 96
@@ -89,6 +92,9 @@
 #define SYS_pipe2 293
 #define SYS_prlimit64 302
 #define SYS_getrandom 318
+#define SYS_setitimer 38
+#define SYS_getitimer 36
+#define SYS_rseq 334
 
 #define SYS_socket 41
 #define SYS_connect 42
@@ -106,6 +112,21 @@
 #define SYS_setsockopt 54
 #define SYS_getsockopt 55
 #define SYS_accept4 288
+
+#define SYS_flock 73
+#define SYS_truncate 76
+#define SYS_ftruncate 77
+#define SYS_link 86
+#define SYS_fchown 92
+#define SYS_chown 93
+#define SYS_lchown 94
+#define SYS_getgroups 115
+#define SYS_setgroups 116
+#define SYS_statfs 137
+#define SYS_fstatfs 138
+#define SYS_fchownat 260
+#define SYS_linkat 265
+#define SYS_utimensat 280
 
 #define STAT_SIZE 144
 #define SIGACT_SIZE 32
