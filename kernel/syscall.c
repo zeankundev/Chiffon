@@ -953,10 +953,7 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_flock: return sys_flock(a0, a1);
     case SYS_truncate: return sys_truncate(a0, a1);
     case SYS_ftruncate: return sys_ftruncate(a0, a1);
-    case SYS_link: return sys_link(a0, a1);
     case SYS_linkat: return sys_linkat(a0, a1, a2, a3, a4);
-    case SYS_chown: return sys_chown(a0, a1, a2);
-    case SYS_lchown: return sys_lchown(a0, a1, a2);
     case SYS_fchown: return sys_fchown(a0, a1, a2);
     case SYS_fchownat: return sys_fchownat(a0, a1, a2, a3, a4);
     case SYS_statfs: return sys_statfs(a0, a1);
@@ -1192,6 +1189,9 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         return -EINVAL;
 #endif
 #ifdef SYS_open
+    case SYS_link: return sys_link(a0, a1);
+    case SYS_chown: return sys_chown(a0, a1, a2);
+    case SYS_lchown: return sys_lchown(a0, a1, a2);
     case SYS_open: return sys_openat(AT_FDCWD, a0, a1, a2);
     case SYS_stat: return stat_path_u(a0, 1, a1);
     case SYS_lstat: return stat_path_u(a0, 0, a1);

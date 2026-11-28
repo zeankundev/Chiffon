@@ -2,7 +2,7 @@
 
 ## P0 source inventory
 
-Baseline `b57e409b0489893f1923c485e1605868be047883`. Each row names files relative to its directory. **Core** means privileged implementation or the header governing it. **Modular** means an existing user-space interface or a candidate whose device-specific policy should leave kernel space. Headers carry the placement of the behavior they describe. The rows describe the destination; the last column records relevant baseline behavior and dependencies.
+P0 inventoried 82 files at `b57e409b0489893f1923c485e1605868be047883`. The P3 revision adds the HID server and updates the USB rows to match the integrated boundary. Each row names files relative to its directory. **Core** identifies privileged code and its interfaces. **Modular** identifies user-space components and their headers.
 
 | Directory | Files | Placement | Reason and boundary |
 | --- | --- | --- | --- |
@@ -17,16 +17,17 @@ Baseline `b57e409b0489893f1923c485e1605868be047883`. Each row names files relati
 | drivers/x86_64 | lapic.c, pci.c, ps2_kbd.c, vga_text.c | Core | Platform IRQs, bus discovery, primary keyboard and boot text console. Keep global PCI config access privileged. |
 | drivers/x86_64 | bochs_vbe.c, mb_fb.c, vmsvga.c | Core | These are candidate backends for the primary kernel framebuffer on different machines. Retain boot-console selection and mode setup. Secondary drawing services can use a constrained framebuffer grant. |
 | drivers/x86_64 | nic.c, e1000.c, virtio_net.c | Core | PCI NIC selection and DMA rings are the local transports for the core network stack. |
-| drivers/x86_64 | usb.c | Modular | Currently a kernel driver combining descriptor parsing, HID keyboard/mouse handling and removable-storage attachment. Split class handling from port/endpoint transport. Preserve FAT/block contracts and invalidate pending calls on removal. |
-| drivers/x86_64 | xhci.c | Modular | Optional host-controller service candidate. Keep a trusted kernel transport for DMA rings, addresses, quiescence and IRQ acknowledgement until device isolation exists. A restricted server can own protocol decisions through bounded operations. |
+| drivers/x86_64 | usb.c | Core | Enumerates devices, selects endpoints, queues raw reports, validates decoded results against live attachments and owns removable-storage transport. HID report interpretation runs in the user server. |
+| drivers/x86_64 | xhci.c | Core | Trusted transport owns the controller, PCI bus mastering, polling, rings and DMA buffers. The HID server can consume only the bounded report interface. |
 | include | arch.h, board.h, bootmem.h, smp.h, kernel.h | Core | Architecture, board, memory bounds, synchronization and shared kernel object contracts. |
 | include | console.h, vt.h, font.h, fb.h, driver.h, ipc.h | Core | Kernel console, primary framebuffer, device and IPC implementation interfaces. |
 | include | fat.h, net.h, socket.h | Core | Storage and network data-path interfaces owned by the corresponding kernel subsystems. |
 | include/drivers | armtimer.h, gicv2.h, pic_pit.h, pl011.h, ns16550_io.h, fdt.h, x86_platform.h, x86io.h | Core | Timer, interrupt, serial, boot discovery and privileged platform I/O. |
 | include/drivers | ata_pio.h, virtio_mmio_blk.h, x86_nic.h | Core | Boot disk and NIC hardware interfaces used by the core data paths. |
-| include/drivers | usb.h, hid_keyboard.h | Modular | Currently USB transport/class calls and bounded HID report parsing. Share only value-based messages across IPC. Keep kernel pointers and DMA metadata private. |
+| include/drivers | usb.h | Core | Private USB controller, endpoint and class-transport declarations. The service ABI is in include/uapi. |
+| include/drivers | hid_keyboard.h | Modular | Bounded report descriptor parser and decoder compiled into the HID process and its fixture probe. |
 | include/uapi | chiffon_abi.h | Core | Kernel-owned versioned contract shared with all user clients. Keep existing values, structure sizes and semantics available. |
-| userland | libchiffon.h | Modular | Unprivileged syscall wrappers and freestanding helpers used by clients and servers. |
+| userland | libchiffon.h, hidserver.c | Modular | Unprivileged syscall wrappers and the embedded HID service. The service converts keyboard and mouse reports to bounded input messages. |
 
 ## Integration outside the inventory roots
 
