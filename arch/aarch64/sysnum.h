@@ -72,6 +72,7 @@
 #define SYS_wait4 260
 #define SYS_prlimit64 261
 #define SYS_getrandom 278
+#define SYS_rseq 293
 
 #define SYS_socket 198
 #define SYS_socketpair 199

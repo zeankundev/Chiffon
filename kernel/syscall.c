@@ -96,6 +96,115 @@ static long user_io(struct file *f, uintptr_t buf, size_t n, int wr) {
     kfree(tmp);
     return done ? (long)done : r;
 }
+/* ---- sendfile / mount / umount2 / rseq ---- */
+
+/* sendfile(out, in, *offset, count).  With an offset the input's file position is left alone and
+ * *offset is advanced; without one the position advances as read(2) would.  Data moves through a
+ * page-sized kernel buffer.  On a short write the input position reflects only what was written. */
+static long sys_sendfile(long out_fd, long in_fd, uintptr_t uoff, size_t count) {
+    struct file *in = getfd(in_fd), *out = getfd(out_fd);
+    if (!in || !out) return -EBADF;
+    if (in->type != F_NODE || S_ISDIR(in->node->mode)) return -EINVAL;   /* input must be a regular file */
+    uint64_t start = 0;
+    if (uoff) {
+        if (!uwok(uoff, sizeof start)) return -EFAULT;
+        memcpy(&start, (const void *)uoff, sizeof start);
+        if ((int64_t)start < 0) return -EINVAL;
+    }
+    uint8_t *tmp = kmalloc(PAGE_SIZE);
+    if (!tmp) return -ENOMEM;
+    size_t saved = in->off;
+    if (uoff) in->off = (size_t)start;
+    file_dup(in); file_dup(out);
+    size_t done = 0;
+    long err = 0;
+    while (done < count) {
+        size_t chunk = count - done < PAGE_SIZE ? count - done : PAGE_SIZE;
+        ssize_t r = file_read(in, tmp, chunk);
+        if (r <= 0) { if (r < 0) err = r; break; }
+        ssize_t w = 0;
+        while (w < r) {
+            ssize_t k = file_write(out, tmp + w, (size_t)(r - w));
+            if (k <= 0) { err = k < 0 ? k : -EIO; break; }
+            w += k;
+        }
+        done += (size_t)w;
+        if (w < r) break;
+    }
+    file_close(in); file_close(out);
+    kfree(tmp);
+    if (uoff) {
+        uint64_t next = start + done;
+        memcpy((void *)uoff, &next, sizeof next);
+        in->off = saved;
+    } else {
+        in->off = saved + done;
+    }
+    if (done) return (long)done;
+    return err;
+}
+
+/* Chiffon mounts its root and pseudo filesystems during boot and keeps no mount table yet, so a
+ * runtime mount is refused with EPERM (or ENODEV for an unknown filesystem type).  The argument
+ * checks are real: the target must exist and be a directory. */
+static int known_fstype(const char *t) {
+    static const char *const types[] = { "ext2", "ext3", "ext4", "vfat", "fat", "exfat", "proc",
+                                         "sysfs", "tmpfs", "ramfs", "devtmpfs", 0 };
+    for (int i = 0; types[i]; i++) if (!strcmp(t, types[i])) return 1;
+    return 0;
+}
+static long sys_mount(uintptr_t usrc, uintptr_t utgt, uintptr_t ufstype) {
+    char tgt[PATH_MAX], abs[PATH_MAX], fst[32] = "";
+    (void)usrc;
+    int r = upath(utgt, tgt);
+    if (r) return r;
+    if (ufstype) {
+        r = ustrcpy(fst, ufstype, sizeof fst);
+        if (r) return r;
+    }
+    r = vfs_resolve(tgt, 1, abs);
+    if (r) return r;
+    struct node *n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (!S_ISDIR(n->mode)) return -ENOTDIR;
+    if (fst[0] && !known_fstype(fst)) return -ENODEV;
+    return -EPERM;
+}
+static long sys_umount2(uintptr_t utgt, int flags) {
+    char tgt[PATH_MAX], abs[PATH_MAX];
+    (void)flags;
+    int r = upath(utgt, tgt);
+    if (r) return r;
+    r = vfs_resolve(tgt, 1, abs);
+    if (r) return r;
+    if (!node_find(abs)) return -ENOENT;
+    if (!strcmp(abs, "/")) return -EBUSY;                 /* the root is never unmounted */
+    return -EINVAL;                                       /* not a mount point (no runtime mounts) */
+}
+
+/* rseq(2).  Registration stores the thread's area; the scheduler publishes the CPU id into it
+ * (rseq_publish).  Restartable critical sections (rseq_cs) are not aborted on preemption yet, so
+ * code that depends on that restart guarantee must not rely on this interface. */
+#define RSEQ_FLAG_UNREGISTER 1u
+#define RSEQ_MIN_LEN 32u
+static long sys_rseq(uintptr_t area, uint32_t len, unsigned flags, uint32_t sig) {
+    if (flags & ~RSEQ_FLAG_UNREGISTER) return -EINVAL;
+    if (flags & RSEQ_FLAG_UNREGISTER) {
+        if (!cur->rseq_area || area != cur->rseq_area || len != cur->rseq_len || sig != cur->rseq_sig)
+            return -EINVAL;
+        uint32_t v[2] = { 0, (uint32_t)-1 };               /* cpu_id = RSEQ_CPU_ID_UNINITIALIZED */
+        memcpy((void *)area, v, sizeof v);
+        cur->rseq_area = 0; cur->rseq_len = 0; cur->rseq_sig = 0;
+        return 0;
+    }
+    if (cur->rseq_area) return -EBUSY;
+    if (len < RSEQ_MIN_LEN || (area & (RSEQ_MIN_LEN - 1))) return -EINVAL;
+    if (!uwok(area, len)) return -EFAULT;
+    cur->rseq_area = area; cur->rseq_len = len; cur->rseq_sig = sig;
+    rseq_publish(cur, this_cpu()->id);
+    return 0;
+}
+
 static long sys_io(long fd, uintptr_t buf, size_t n, int wr) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
@@ -446,6 +555,7 @@ static long sys_execve(struct trapframe *tf, uintptr_t upathp, uintptr_t uargv, 
     if ((r = copy_strv(uenvp, &envp)) < 0) { free_strv(argv); return r; }
     group_quiesce();
     r = proc_exec(cur, p, argv, envp, tf);
+    if (!r) { cur->rseq_area = 0; cur->rseq_len = cur->rseq_sig = 0; }   /* exec unregisters rseq */
     free_strv(argv); free_strv(envp);
     return r;
 }
@@ -1070,6 +1180,10 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
         struct file *f = getfd(a0);
         return f ? sock_getsockopt(f, (int)a1, (int)a2, a3, a4) : -EBADF;
     }
+    case SYS_sendfile: return sys_sendfile(a0, a1, a2, a3);
+    case SYS_mount: return sys_mount(a0, a1, a2);
+    case SYS_umount2: return sys_umount2(a0, (int)a1);
+    case SYS_rseq: return sys_rseq(a0, (uint32_t)a1, (unsigned)a2, (uint32_t)a3);
 
 #ifdef SYS_arch_prctl
     case SYS_arch_prctl:
@@ -1116,6 +1230,7 @@ void syscall_dispatch(struct trapframe *tf) {
     if (r == -ENOSYS)
         kprintf("[chiffon] ENOSYS: syscall %ld (pid %d)\n", (long)TF_SYSNO(tf), cur->pid);
     TF_RET(tf) = r;
+    check_killed();
 }
 void trap_user_fault(struct trapframe *tf, const char *why, uintptr_t addr, int sig) {
     kprintf("[chiffon] user fault: pid %d, %s at 0x%lx, rip 0x%lx\n", cur->pid, why, addr, TF_PC(tf));

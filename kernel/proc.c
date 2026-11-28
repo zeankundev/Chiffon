@@ -225,6 +225,15 @@ struct proc *proc_alloc(void) {
     return 0;
 }
 
+/* rseq(2): the kernel writes the CPU a thread runs on into its registered struct rseq.  A thread
+ * stays on one CPU from one schedule-in to the next, so publishing at schedule-in keeps
+ * cpu_id_start and cpu_id correct without work on the syscall path. */
+void rseq_publish(struct proc *p, int cpu) {
+    if (!p->rseq_area || !mm_user_write(p->mm, p->rseq_area, 8)) return;
+    uint32_t v[2] = { (uint32_t)cpu, (uint32_t)cpu };
+    memcpy((void *)p->rseq_area, v, sizeof v);
+}
+
 /* The scheduler loop of one CPU.  It is entered holding the kernel lock and keeps it while it
  * switches to a process (the process resumes holding it); it releases it only while the CPU idles. */
 void scheduler(void) {
@@ -247,6 +256,7 @@ void scheduler(void) {
         }
         c->proc = n; n->state = P_RUNNING;
         arch_aspace_switch(n->mm->root);
+        rseq_publish(n, c->id);
         arch_set_kstack((uintptr_t)n->kstack + KSTACK_SIZE);
         arch_uctx_restore(&n->uctx);
         arch_switch(&c->sched_ctx, n->ksp);
@@ -664,8 +674,8 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     nm.brk_start = nm.brk_end = PGUP(hi);
     nm.mmap_next = MMAP_BASE;
     uint64_t placement;
-    if (!hardware_random_word(&placement))
-        nm.mmap_next += (placement & 0xffff) * PAGE_SIZE;
+    kernel_random_fill(&placement, sizeof placement);
+    nm.mmap_next += (placement & 0xffff) * PAGE_SIZE;
 
     int argc = 0, envc = 0; size_t S = 0;
     while (argv && argv[argc]) S += strlen(argv[argc++]) + 1;
@@ -686,13 +696,15 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     w[k++] = 0;
     for (int i = 0; i < envc; i++) { w[k++] = sa; size_t l = strlen(envp[i]) + 1; memcpy(buf + (sa - sp), envp[i], l); sa += l; }
     w[k++] = 0;
+    /* AT_RANDOM: 16 bytes for the libc stack guard and pointer-mangling seeds.  Always provided;
+     * the kernel generator never fails, so glibc/musl no longer fault on a missing pointer. */
     uint64_t random[2];
-    int seeded = !hardware_random_word(&random[0]) && !hardware_random_word(&random[1]);
-    if (seeded) memcpy(buf + (rndp - sp), random, sizeof random);
+    kernel_random_fill(random, sizeof random);
+    memcpy(buf + (rndp - sp), random, sizeof random);
     uint64_t aux[][2] = {
         {AT_PHDR, phdr_va}, {AT_PHENT, sizeof(struct phdr)}, {AT_PHNUM, eh->phnum}, {AT_PAGESZ, PAGE_SIZE},
         {AT_BASE, interp_base}, {AT_ENTRY, eh->entry + bias}, {AT_UID, 0}, {AT_EUID, 0}, {AT_GID, 0}, {AT_EGID, 0},
-        {AT_SECURE, 0}, {seeded ? AT_RANDOM : 1 /* AT_IGNORE */, seeded ? rndp : 0},
+        {AT_SECURE, 0}, {AT_RANDOM, rndp},
         {AT_CLKTCK, HZ}, {AT_HWCAP, AUX_HWCAP}, {AT_NULL, 0},
     };
     for (int i = 0; i < naux; i++) { w[k++] = aux[i][0]; w[k++] = aux[i][1]; }

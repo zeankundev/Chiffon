@@ -177,6 +177,8 @@ struct proc {
     int tgid;                /* thread group: the pid of the group leader (getpid) */
     int is_thread;           /* a clone(CLONE_THREAD) thread: not a child for wait4 */
     uintptr_t clear_child_tid;   /* CLONE_CHILD_CLEARTID / set_tid_address: zeroed and woken on exit */
+    uintptr_t rseq_area;     /* rseq(2) registration: the thread's struct rseq, 0 = not registered */
+    uint32_t rseq_len, rseq_sig;
     uint64_t futex_deadline; /* timed FUTEX_WAIT: wake at this tick */
     int futex_woken;         /* set by FUTEX_WAKE */
     int ctty;                /* controlling terminal: minor + 1, 0 = none */
@@ -212,6 +214,7 @@ long dev_irq_claim(unsigned irq);
 long dev_irq_wait(unsigned irq);
 long dev_info_query(int type, void *uinfo);
 void dev_driver_cleanup(struct proc *p);
+void rseq_publish(struct proc *p, int cpu);     /* called when p is scheduled in on CPU cpu */
 
 void sched_init(void);
 void scheduler(void) __attribute__((noreturn));
