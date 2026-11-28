@@ -11,8 +11,8 @@ typedef long ssize_t;
 typedef long off_t;
 
 #define HZ 100
-#define VERSION "0.5"
-#define VERNAME "miruku"
+#define VERSION "0.6"
+#define VERNAME "salt"
 
 #define EPERM 1
 #define ENOENT 2
