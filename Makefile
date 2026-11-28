@@ -145,6 +145,20 @@ $(B)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DINITRD_FILE='"$(abspath $(B)/initramfs.cpio)"' -c $< -o $@
 $(B)/kernel/initrd.o: $(B)/initramfs.cpio
+ifneq ($(filter x86_64,$(ARCH))$(filter $(B)/userland/drvloader,$(USER_BIN)),)
+$(B)/kernel/initrd.o: CFLAGS += -DHID_SERVER_FILE='"$(abspath $(B)/embedded/hidserver)"'
+$(B)/kernel/initrd.o: $(B)/embedded/hidserver
+$(B)/embedded/hidserver: userland/hidserver.c include/drivers/hid_keyboard.h userland/libchiffon.h include/uapi/chiffon_abi.h
+	@mkdir -p $(dir $@)
+	$(UCC) $(UCFLAGS) -o $@ $<
+ifeq ($(filter $(B)/userland/drvloader,$(USER_BIN)),)
+$(B)/kernel/initrd.o: CFLAGS += -DDRIVER_LOADER_FILE='"$(abspath $(B)/embedded/drvloader)"'
+$(B)/kernel/initrd.o: $(B)/embedded/drvloader
+$(B)/embedded/drvloader: env/demo/src/drvloader.c userland/libchiffon.h include/uapi/chiffon_abi.h
+	@mkdir -p $(dir $@)
+	$(UCC) $(UCFLAGS) -o $@ $<
+endif
+endif
 ifneq ($(filter $(B)/userland/drvloader,$(USER_BIN)),)
 ifneq ($(filter $(B)/userland/fbserver,$(USER_BIN)),)
 $(B)/kernel/initrd.o: CFLAGS += -DDRIVER_LOADER_FILE='"$(abspath $(B)/userland/drvloader)"' -DFB_SERVER_FILE='"$(abspath $(B)/userland/fbserver)"'

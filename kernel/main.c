@@ -1,4 +1,5 @@
 #include "kernel.h"
+#include "drivers/usb.h"
 
 extern const uint8_t _initrd_start[], _initrd_end[];
 
@@ -168,6 +169,9 @@ void kmain(uintptr_t bootinfo) {
     arch_init();
     board_init();
     ipc_init();
+#ifdef __x86_64__
+    usb_hid_init();
+#endif
     console_services_init();
     drivers_init();                                  /* PCI, keyboard, display, ... (bound to the console + IPC services) */
     tty_init();

@@ -18,3 +18,10 @@ _fb_server_start:
 #endif
 _fb_server_end:
     .balign 4
+    .globl _hid_server_start, _hid_server_end
+_hid_server_start:
+#ifdef HID_SERVER_FILE
+    .incbin HID_SERVER_FILE
+#endif
+_hid_server_end:
+    .balign 4

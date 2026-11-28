@@ -564,6 +564,9 @@ static int init(void) {
     if (!erst) goto alloc_fail;
     uint8_t *e = P2V(erst);
     *(uint64_t *)e = evt_ring.pa; *(uint32_t *)(e + 8) = RING_TRBS;
+    /* Controllers can fetch the segment table when ERSTBA is written. */
+    barrier();
+    pci_write32(d.bus, d.dev, d.fn, 0x04, cmd | 6u);
     w32(op, OP_CONFIG, (uint32_t)slots);
     w64(op, OP_CRCR, cmd_ring.pa | 1);
     w32(rt, IR0 + IR_ERSTSZ, 1);
@@ -571,7 +574,6 @@ static int init(void) {
     w64(rt, IR0 + IR_ERDP, evt_ring.pa);
     w64(op, OP_DCBAAP, dcbaa_pa);
     barrier();
-    pci_write32(d.bus, d.dev, d.fn, 0x04, cmd | 6u);
     w32(op, OP_USBCMD, r32(op, OP_USBCMD) | USBCMD_RS);
     for (long i = 0; i < WAIT_LIMIT && (r32(op, OP_USBSTS) & USBSTS_HCH); i++) { }
     if (r32(op, OP_USBSTS) & USBSTS_HCH) {

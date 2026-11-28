@@ -19,6 +19,8 @@ struct usb_ep { uint8_t addr, attr; uint16_t mps; uint8_t interval; };
 int  usb_attach(int port, int speed);                                    /* slot addressed; enumerate the device */
 void usb_detach(int port);                                               /* device removed */
 void usb_report(int port, uint8_t ep_addr, const uint8_t *data, uint32_t len);   /* interrupt IN data */
+void usb_hid_reset(void);
+void usb_hid_init(void);
 void usb_poll(void);                                                     /* mount media waiting for the VFS */
 
 /* xhci.c services for the device classes; all synchronous.  Return bytes moved, or -errno. */

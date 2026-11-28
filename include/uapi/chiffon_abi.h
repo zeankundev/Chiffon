@@ -48,14 +48,15 @@ struct chi_netinfo {
     chi_u8  _pad;
 };
 
-#define CHI_DRIVER_ABI_VERSION 2 /* v2 reserves the deny-only DMA grant type */
+#define CHI_DRIVER_ABI_VERSION 3 /* v3 adds bounded USB HID IPC */
 #define CHI_CAP_MMIO     1      /* MMIO physical mapping */
 #define CHI_CAP_IRQ      2      /* Hardware IRQ binding */
-#define CHI_CAP_DRIVER   4      /* Register the framebuffer IPC service */
+#define CHI_CAP_DRIVER   4      /* Own a single device service identity */
 #define CHI_CAP_LOADER   8      /* Grant capabilities to other processes */
 #define CHI_CAP_DMA     16      /* Reserved. No user DMA domain on either target. */
 
 #define DEV_TYPE_FB      1      /* Primary framebuffer */
+#define DEV_TYPE_HID     3      /* copied USB input reports */
 #define DEV_TYPE_UART    2      /* Primary serial / UART */
 
 struct chi_dev_fb_info {
@@ -88,6 +89,28 @@ struct chi_ipc_msg {
 };
 
 /* Well-known services (registered by kernel or userspace driver servers). */
+#define IPC_SVC_HID      "usb.hid"
+#define IPC_SVC_HID_BUS  "usb.hid.transport"
+#define HID_OP_WAKE      1 /* kernel has queued input */
+#define HID_OP_STATUS    2 /* no payload; health check */
+#define HID_OP_EXIT      3 /* loader-only resilience test */
+#define HID_BUS_HEAD     1 /* returns chi_hid_report */
+#define HID_BUS_REPORT   2 /* chi_hid_slice -> raw bytes */
+#define HID_BUS_DESC     3 /* chi_hid_slice -> descriptor bytes */
+#define HID_BUS_DONE     4 /* chi_hid_result consumes this transaction */
+#define HID_BOOT_KEY     1
+#define HID_REPORT_KEY   2
+#define HID_BOOT_MOUSE   3
+struct chi_hid_report { chi_u32 serial, kind, length, descriptor_length, descriptor_id; };
+struct chi_hid_slice { chi_u32 serial, offset; };
+struct chi_hid_result {
+    chi_u32 serial;
+    chi_u8 valid, slot, buttons;
+    __INT8_TYPE__ dx, dy;
+    chi_u8 keys[32];
+};
+#define DRV_OP_HID_START 5
+#define DRV_OP_HID_TEST  6
 #define IPC_SVC_FB       "fb"
 #define IPC_SVC_CONSOLE  "console"
 #define IPC_SVC_LOADER   "driver.loader"

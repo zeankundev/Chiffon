@@ -561,6 +561,7 @@ static int load_interp(struct mm *nm, const char *path, uintptr_t *entry) {
 }
 
 extern const uint8_t _driver_loader_start[], _driver_loader_end[];
+extern const uint8_t _hid_server_start[], _hid_server_end[];
 extern const uint8_t _fb_server_start[], _fb_server_end[];
 
 int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct trapframe *tf) {
@@ -570,7 +571,12 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     int fb_server = p->driver_bootstrap && !strcmp(path, "/bin/fbserver");
     const uint8_t *img;
     size_t sz;
-    if (boot_loader || fb_server) {
+    int hid_server = p->driver_bootstrap && !strcmp(path, "/bin/hidserver");
+    if (hid_server) {
+        img = _hid_server_start;
+        sz = (uintptr_t)_hid_server_end - (uintptr_t)img;
+        strlcpy(abs, path, sizeof abs);
+    } else if (boot_loader || fb_server) {
         const uint8_t *end = boot_loader ? _driver_loader_end : _fb_server_end;
         img = boot_loader ? _driver_loader_start : _fb_server_start;
         sz = (uintptr_t)end - (uintptr_t)img;
@@ -661,6 +667,7 @@ int proc_exec(struct proc *p, const char *path, char **argv, char **envp, struct
     p->is_driver_loader = boot_loader;
     p->driver_bootstrap = 0;
     p->is_fb_server = fb_server;
+    if (hid_server) p->caps[p->ncaps++] = (struct proc_cap){ CHI_CAP_DRIVER, DEV_TYPE_HID, 0 };
     for (int i = 0; i < NOFILE; i++)
         if (p->ft->f[i] && (p->cloexec >> i & 1)) { file_close(p->ft->f[i]); p->ft->f[i] = 0; }
     p->cloexec = 0;
