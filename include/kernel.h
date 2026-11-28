@@ -271,11 +271,10 @@ struct node {
 };
 struct fs_driver {
     const char *name;
-    int (*probe)(uint64_t base_lba);
-    int (*mount)(uint64_t base_lba);
+    /* Mount within [base_lba, limit_lba); return -ENOENT for an unrecognized
+     * volume. On success publish the exclusive filesystem end and journal ID. */
+    int (*mount)(uint64_t base_lba, uint64_t limit_lba, uint64_t *end_lba, uint64_t *fsid);
     int (*read)(struct node *n, void *buf);
-    /* optional: filesystem identity for the persistence log */
-    int (*ident)(uint64_t base_lba, uint64_t *fs_end_lba, uint64_t *fsid);
 };
 extern const struct fs_driver ext_driver;
 enum { F_NODE = 1, F_PIPE_R, F_PIPE_W, F_SOCKET };
