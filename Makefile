@@ -177,6 +177,17 @@ $(B)/userland/hid-probe: tools/release/hid_probe.c include/drivers/hid_keyboard.
 	$(UCC) $(UCFLAGS) -o $@ $<
 
 # root filesystem tree = env rootfs/ overlay + compiled programs (+ optional env/<ENV>/build.sh hook)
+ifneq ($(filter $(ENV),busybox milkos2),)
+export BUSYBOX OPENSSL_BIN CA_CERTS DEVICE
+$(B)/busybox-inputs.stamp: FORCE
+	@mkdir -p $(B)
+	@printf '%s\n' "$$BUSYBOX" "$$OPENSSL_BIN" "$$CA_CERTS" > $@.new
+	@cmp -s $@.new $@ && rm -f $@.new || mv $@.new $@
+$(B)/rootfs.stamp: tools/rootfs-https.sh $(B)/busybox-inputs.stamp $(wildcard $(BUSYBOX) $(OPENSSL_BIN) $(CA_CERTS))
+endif
+ifeq ($(ENV),busybox)
+$(B)/rootfs.stamp: tools/populate-busybox.sh
+endif
 $(B)/rootfs.stamp: $(USER_BIN) $(ENV_FILES) tools/mkrootfs.sh
 	sh tools/mkrootfs.sh "$(ENVDIR)" "$(B)/rootfs" "$(B)/userland" "$(ARCH)" "$(CROSS)"
 	@touch $@

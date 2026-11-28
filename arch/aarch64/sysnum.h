@@ -24,6 +24,7 @@
 #define SYS_write 64
 #define SYS_readv 65
 #define SYS_writev 66
+#define SYS_pselect6 72
 #define SYS_ppoll 73
 #define SYS_readlinkat 78
 #define SYS_newfstatat 79
@@ -35,6 +36,7 @@
 #define SYS_nanosleep 101
 #define SYS_clock_gettime 113
 #define SYS_clock_nanosleep 115
+#define SYS_sched_getaffinity 123
 #define SYS_sched_yield 124
 #define SYS_kill 129
 #define SYS_tgkill 131

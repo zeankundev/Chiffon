@@ -33,9 +33,14 @@ int main(int argc, char **argv, char **envp) {
     if (gettime(1, mono) || gettime(0, real) || gettime(1, after)) return fail("clock read");
     if (mono[0] < 0 || mono[1] < 0 || mono[1] >= BILLION ||
         real[1] < 0 || real[1] >= BILLION ||
-        real[0] - mono[0] < 1700000000L || real[0] - after[0] > 1700000000L)
+        real[0] - after[0] < 946684800L)
         return fail("clock epochs");
     if (gettime(-1, after) != -EINVAL) return fail("clock id");
+
+    long coarse[2];
+    if (gettime(5, coarse) || coarse[0] < real[0] || coarse[0] > real[0] + 1 ||
+        gettime(6, coarse) || coarse[0] < after[0] || coarse[0] > after[0] + 1)
+        return fail("coarse clocks");
 
     long before_real[2], after_real[2], tv[2] = { -1, -1 };
     int tz[2] = { -1, -1 };

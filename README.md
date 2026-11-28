@@ -24,6 +24,32 @@ make run ENV=<my-env>     # Standard boot: serial console (UART)
 make run-gfx ENV=<my-env>  # Graphical boot: framebuffer window + keyboard
 ```
 
+### HTTPS in BusyBox and milkOS 2
+
+Build a target-matched static BusyBox with `tools/chiffon-busybox-config.sh`.
+Use a BusyBox source revision whose OpenSSL Wget backend supports
+`-verify_hostname`. The config selects that backend and disables the internal TLS fallback.
+Build OpenSSL for the same Linux architecture with `no-shared no-module -static`.
+Supply a PEM bundle of trusted roots from your host or organization.
+
+```sh
+make run ENV=busybox ARCH=x86_64 \
+  BUSYBOX=/path/to/static/busybox \
+  OPENSSL_BIN=/path/to/static/openssl \
+  CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+```
+
+Use `ARCH=aarch64` with AArch64 binaries. The image installs the bundle as
+`/etc/ssl/cert.pem`. The QEMU launch uses a CPU that supplies entropy through
+RDRAND on x86_64 or RNDR on AArch64. The guest reads the UTC hardware clock for
+certificate validity checks. The QEMU image defaults to the user-network DNS
+server at `10.0.2.3` when the rootfs overlay supplies no `/etc/resolv.conf`.
+In the guest, `wget https://example.com/` should succeed and
+`wget https://wrong.host.badssl.com/` should fail.
+
+For milkOS 2, use `ENV=milkos2` with the same TLS inputs and supply the
+environment's `MUSL` and `OPENRC_STAGE` paths.
+
 ## Bootable x86_64 ISO on Windows
 
 `make iso` creates `build/<environment>/x86_64-<device>/chiffon-x86_64.iso`.

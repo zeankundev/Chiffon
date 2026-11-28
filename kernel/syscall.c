@@ -10,7 +10,12 @@ static void group_quiesce(void);
 #define AT_REMOVEDIR 0x200
 #define AT_EMPTY_PATH 0x1000
 #define O_CLOEXEC 0x80000
-#define BOOT_EPOCH 1700000000UL
+
+static uint64_t boot_epoch = 1700000000UL;  /* fallback for boards without a usable RTC */
+
+void clock_set_boot_epoch(uint64_t seconds) {
+    if (seconds) boot_epoch = seconds;
+}
 
 static struct file *getfd(long fd) { return (fd < 0 || fd >= NOFILE) ? 0 : cur->ft->f[fd]; }
 static int fd_install(struct file *f, int minfd, int cloexec) {
@@ -22,6 +27,19 @@ static int upath(uintptr_t u, char *buf) { return ustrcpy(buf, u, PATH_MAX); }
 static struct proc *find_proc(int pid) {
     for (int i = 0; i < NPROC; i++) if (ptable[i].state != P_UNUSED && ptable[i].pid == pid) return &ptable[i];
     return 0;
+}
+
+static long sys_sched_getaffinity(int pid, unsigned len, uintptr_t buf) {
+    unsigned long mask = 0;
+    _Static_assert(MAX_CPUS <= sizeof mask * 8, "CPU affinity mask is too small");
+    if (len < sizeof mask || len % sizeof mask) return -EINVAL;
+    struct proc *p = pid ? find_proc(pid) : cur;
+    if (!p || p->state == P_EMBRYO) return -ESRCH;
+    if (!uwok(buf, sizeof mask)) return -EFAULT;
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (cpus[i].online) mask |= 1UL << i;
+    memcpy((void *)buf, &mask, sizeof mask);
+    return sizeof mask;
 }
 
 /* ---- stat ---- */
@@ -44,8 +62,8 @@ static void put_stat(uintptr_t u, uint32_t mode, uint64_t size, uint64_t ino, ui
 }
 static long stat_file(struct file *f, uintptr_t ub) {
     if (!uwok(ub, STAT_SIZE)) return -EFAULT;
-    if (f->type == F_SOCKET) { put_stat(ub, S_IFSOCK | 0666, 0, 1, BOOT_EPOCH); return 0; }
-    if (f->type != F_NODE) { put_stat(ub, S_IFIFO | 0600, 0, 1, BOOT_EPOCH); return 0; }
+    if (f->type == F_SOCKET) { put_stat(ub, S_IFSOCK | 0666, 0, 1, boot_epoch); return 0; }
+    if (f->type != F_NODE) { put_stat(ub, S_IFIFO | 0600, 0, 1, boot_epoch); return 0; }
     put_stat(ub, f->node->mode, f->node->size, f->node->ino, f->node->mtime);
     return 0;
 }
@@ -450,6 +468,10 @@ static long sys_execve(struct trapframe *tf, uintptr_t upathp, uintptr_t uargv, 
     return r;
 }
 static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t ptid, uintptr_t tls, uintptr_t ctid) {
+    /* arm64 libc implements vfork as clone(CLONE_VM | CLONE_VFORK | SIGCHLD).
+     * Use the same private copy as the x86_64 vfork syscall. */
+    if (flags == (0x100 | 0x4000 | 17) && (!stack || stack == TF_SP(tf)))
+        return proc_fork(tf);
     if (flags & 0x100) {                              /* CLONE_VM: a thread (CLONE_THREAD) or vfork-style sharing */
         if (!(flags & 0x10000)) return -ENOSYS;
 #if ARCH_AARCH64
@@ -555,10 +577,13 @@ static long sys_uname(uintptr_t u) {
 }
 
 static long sys_clock_gettime(long clockid, uintptr_t u) {
+    /* The tick-based clocks already have coarse resolution. */
+    if (clockid == 5) clockid = 0;  /* CLOCK_REALTIME_COARSE */
+    if (clockid == 6) clockid = 1;  /* CLOCK_MONOTONIC_COARSE */
     if (clockid != 0 && clockid != 1) return -EINVAL;
     if (!uwok(u, 16)) return -EFAULT;
     uint64_t t = ticks;
-    uint64_t ts[2] = { (clockid == 0 ? BOOT_EPOCH : 0) + t / HZ,
+    uint64_t ts[2] = { (clockid == 0 ? boot_epoch : 0) + t / HZ,
                        (t % HZ) * (1000000000UL / HZ) };
     memcpy((void *)u, ts, sizeof ts);
     return 0;
@@ -571,8 +596,8 @@ static long sys_nanosleep(long clockid, long flags, uintptr_t req, uintptr_t rem
     int64_t s = ts[0], ns = ts[1];
     if (s < 0 || ns < 0 || ns >= 1000000000L) return -EINVAL;
     if (flags && clockid == 0) {
-        if ((uint64_t)s < BOOT_EPOCH) return 0;
-        s -= BOOT_EPOCH;
+        if ((uint64_t)s < boot_epoch) return 0;
+        s -= boot_epoch;
     }
     uint64_t max = ~(uint64_t)0;
     uint64_t fraction = ((uint64_t)ns * HZ + 999999999UL) / 1000000000UL;
@@ -598,7 +623,72 @@ static long sys_nanosleep(long clockid, long flags, uintptr_t req, uintptr_t rem
     return 0;
 }
 
-/* ---- poll ---- */
+/* ---- descriptor readiness ---- */
+static long sys_select(int nfds, uintptr_t rd, uintptr_t wr, uintptr_t ex,
+                       uintptr_t timeout, uint64_t units_per_second) {
+    _Static_assert(NOFILE <= 64, "select requires a single-word descriptor table");
+    if (nfds < 0) return -EINVAL;
+    if (nfds > 64) nfds = 64;  /* Linux limits the scan to the allocated descriptor table. */
+    uint64_t requested[3] = {0};
+    uintptr_t sets[3] = {rd, wr, ex};
+    for (int i = 0; nfds && i < 3; i++) {
+        if (!sets[i]) continue;
+        if (!uok(sets[i], sizeof requested[i]) || !uwok(sets[i], sizeof requested[i]))
+            return -EFAULT;
+        memcpy(&requested[i], (const void *)sets[i], sizeof requested[i]);
+    }
+
+    uint64_t start = ticks, duration = 0;
+    int64_t ts[2] = {0};
+    if (timeout) {
+        if (!uok(timeout, sizeof ts) || !uwok(timeout, sizeof ts)) return -EFAULT;
+        memcpy(ts, (const void *)timeout, sizeof ts);
+        if (ts[0] < 0 || ts[1] < 0 || (uint64_t)ts[1] >= units_per_second) return -EINVAL;
+        uint64_t fraction = ((uint64_t)ts[1] * HZ + units_per_second - 1) / units_per_second;
+        if ((uint64_t)ts[0] > (UINT64_MAX - fraction) / HZ) return -EINVAL;
+        duration = (uint64_t)ts[0] * HZ + fraction;
+    }
+
+    for (;;) {
+        uint64_t result[3] = {0};
+        long ready = 0;
+        for (int fd = 0; fd < nfds; fd++) {
+            uint64_t bit = 1ULL << fd;
+            if (!((requested[0] | requested[1] | requested[2]) & bit)) continue;
+            struct file *f = getfd(fd);
+            if (!f) return -EBADF;
+            if ((requested[0] & bit) && file_readable(f)) { result[0] |= bit; ready++; }
+            if ((requested[1] & bit) && file_writable(f)) { result[1] |= bit; ready++; }
+            /* Chiffon sockets do not implement out-of-band data. */
+        }
+        uint64_t elapsed = ticks - start;
+        if (ready || (timeout && elapsed >= duration) || cur->killed) {
+            if (timeout) {
+                if (elapsed >= duration) {
+                    ts[0] = ts[1] = 0;
+                } else {
+                    ts[0] -= (int64_t)(elapsed / HZ);
+                    ts[1] -= (int64_t)((elapsed % HZ) * units_per_second / HZ);
+                    if (ts[1] < 0) {
+                        ts[0]--;
+                        ts[1] += (int64_t)units_per_second;
+                    }
+                }
+                if (!uwok(timeout, sizeof ts)) return -EFAULT;
+                memcpy((void *)timeout, ts, sizeof ts);
+            }
+            if (!ready && cur->killed) return -EINTR;
+            for (int i = 0; nfds && i < 3; i++) {
+                if (!sets[i]) continue;
+                if (!uwok(sets[i], sizeof result[i])) return -EFAULT;
+                memcpy((void *)sets[i], &result[i], sizeof result[i]);
+            }
+            return ready;
+        }
+        sleep_on((void *)&ticks);
+    }
+}
+
 static long do_poll(uintptr_t ufds, unsigned nfds, long tmo_ms) {
     if (nfds > NOFILE * 4) return -EINVAL;
     uint64_t dl = tmo_ms > 0 ? ticks + (tmo_ms * HZ + 999) / 1000 : 0;
@@ -666,6 +756,8 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_fsync: case SYS_fdatasync: return sys_fsync(a0);
     case SYS_sync: return persist_sync_all();
     case SYS_umask: { int o = cur->umask; cur->umask = a0 & 0777; return o; }
+    case SYS_pselect6:  /* Signal masks follow the existing rt_sigprocmask stub. */
+        return sys_select(a0, a1, a2, a3, a4, 1000000000UL);
     case SYS_ppoll: {
         long ms = -1;
         if (a2) { if (!uok(a2, 16)) return -EFAULT; ms = ((long *)a2)[0] * 1000 + ((long *)a2)[1] / 1000000; }
@@ -711,13 +803,14 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_getpgid: { struct proc *p = a0 ? find_proc(a0) : cur; return p ? p->pgid : -ESRCH; }
     case SYS_setsid: cur->pgid = cur->pid; cur->ctty = 0; return cur->pid;
     case SYS_sched_yield: yield(); return 0;
+    case SYS_sched_getaffinity: return sys_sched_getaffinity(a0, a1, a2);
     case SYS_set_tid_address: cur->clear_child_tid = a0; return cur->pid;
     case SYS_set_robust_list: return 0;
     case SYS_uname: return sys_uname(a0);
     case SYS_clock_gettime: return sys_clock_gettime(a0, a1);
     case SYS_gettimeofday: {
         uint64_t t = ticks;
-        uint64_t tv[2] = { BOOT_EPOCH + t / HZ, (t % HZ) * (1000000 / HZ) };
+        uint64_t tv[2] = { boot_epoch + t / HZ, (t % HZ) * (1000000 / HZ) };
         int32_t tz[2] = {0, 0};
         if ((a0 && !uwok(a0, sizeof tv)) || (a1 && !uwok(a1, sizeof tz))) return -EFAULT;
         if (a0) memcpy((void *)a0, tv, sizeof tv);
@@ -911,13 +1004,14 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_symlink: return sys_symlink(a0, a1);
     case SYS_chmod: return sys_chmod(a0, a1);
     case SYS_poll: return do_poll(a0, a1, a2);
+    case SYS_select: return sys_select(a0, a1, a2, a3, a4, 1000000UL);
     case SYS_getpgrp: return cur->pgid;
     case SYS_getrlimit: {
         if (!uwok(a1, 16)) return -EFAULT;
         ((uint64_t *)a1)[0] = ((uint64_t *)a1)[1] = a0 == 7 ? NOFILE : ~0UL;
         return 0; }
     case SYS_time: {
-        uint64_t seconds = BOOT_EPOCH + ticks / HZ;
+        uint64_t seconds = boot_epoch + ticks / HZ;
         if (a0) {
             if (!uwok(a0, sizeof seconds)) return -EFAULT;
             memcpy((void *)a0, &seconds, sizeof seconds);

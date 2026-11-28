@@ -1,5 +1,5 @@
 #!/bin/sh
-# Finalized BusyBox config for Chiffon (aarch64, static, musl).
+# Static BusyBox config for Chiffon (x86_64 or aarch64).
 # Usage: cd ~/busybox && sh ~/chiffon-busybox-config.sh
 set -e
 
@@ -13,6 +13,15 @@ make defconfig
 # linking / build behavior
 set_cfg CONFIG_STATIC y
 set_cfg CONFIG_WERROR n
+
+# Use OpenSSL for HTTPS with chain and hostname verification.
+if ! grep -q -- '"-verify_hostname"' networking/wget.c; then
+    echo "Use a BusyBox revision with OpenSSL hostname verification in wget." >&2
+    exit 1
+fi
+set_cfg CONFIG_WGET y
+set_cfg CONFIG_FEATURE_WGET_OPENSSL y
+set_cfg CONFIG_FEATURE_WGET_HTTPS n
 
 # features Chiffon doesn't have
 set_cfg CONFIG_PAM n

@@ -183,7 +183,7 @@ static struct file *sock_wrap_file(struct socket *s, int nonblock) {
     memset(f, 0, sizeof *f);
     f->type = F_SOCKET;
     f->refs = 1;
-    f->flags = nonblock ? O_NONBLOCK : 0;
+    f->flags = O_RDWR | (nonblock ? O_NONBLOCK : 0);
     f->sock = s;
     return f;
 }

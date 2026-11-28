@@ -12,6 +12,7 @@
 #include "drivers/fdt.h"
 
 #define UART_BASE   0x09000000UL
+#define RTC_BASE    0x09010000UL                       /* PL031 RTC data register */
 #define GICD_BASE   0x08000000UL
 #define GICC_BASE   0x08010000UL
 #define VIRTIO_BASE 0x0a000000UL
@@ -113,6 +114,7 @@ void board_console_putc(int c) { pl011_putc(UART_BASE, c); }
 int board_console_getc(void) { return pl011_getc(UART_BASE); }
 
 void board_init(void) {
+    clock_set_boot_epoch(*(volatile uint32_t *)P2V(RTC_BASE));
     gicv2_init(GICD_BASE, GICC_BASE, TIMER_INTID);
     gicv2_cpu_init(GICD_BASE, GICC_BASE, TIMER_INTID, SGI_RESCHED);
     cpu_gic_target[0] = gicv2_cpu_target(GICD_BASE);

@@ -79,6 +79,7 @@ typedef long off_t;
 #define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 
 #define O_ACCMODE 3
+#define O_RDWR    2
 #define O_CREAT   0x40
 #define O_EXCL    0x80
 #define O_TRUNC   0x200
@@ -202,6 +203,7 @@ struct proc {
 };
 extern struct proc ptable[NPROC];
 extern volatile uint64_t ticks;
+void clock_set_boot_epoch(uint64_t seconds);
 
 /* Hybrid driver subsystem */
 int  cap_check(struct proc *p, uint32_t type, uintptr_t val1, size_t val2);

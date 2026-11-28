@@ -1,23 +1,22 @@
+#!/bin/sh
 set -e
 ROOT=${1:?usage: populate-busybox.sh ROOTFS}
+. "$(dirname "$0")/rootfs-https.sh"
 BB=${BUSYBOX:-$(command -v busybox || true)}
 [ -n "$BB" ] && [ -f "$BB" ] || { echo "populate-busybox: no BusyBox found. Set BUSYBOX=/path/to/static/busybox (see README)." >&2; exit 1; }
-if command -v readelf >/dev/null 2>&1 && readelf -l "$BB" 2>/dev/null | grep -q INTERP; then
-    echo "populate-busybox: $BB is dynamically linked; Chiffon needs a STATIC BusyBox." >&2; exit 1
-fi
-if [ -n "$ARCH" ] && command -v readelf >/dev/null 2>&1; then
-    m=$(readelf -h "$BB" 2>/dev/null | sed -n 's/^ *Machine: *//p')
-    case "$ARCH:$m" in
-        x86_64:*X86-64*|aarch64:*AArch64*) ;;
-        *) echo "populate-busybox: $BB is '$m' but the target is $ARCH. Provide a matching static BusyBox via BUSYBOX=." >&2; exit 1;;
-    esac
-fi
+
+check_static_elf "$BB"
+install_https "$ROOT"
 mkdir -p "$ROOT/bin" "$ROOT/sbin" "$ROOT/usr/bin" "$ROOT/etc" "$ROOT/tmp" "$ROOT/dev" "$ROOT/root"
+if [ "${DEVICE:-}" = qemu ] && [ ! -e "$ROOT/etc/resolv.conf" ]; then
+    # glibc can send separate queries without the sendmmsg syscall.
+    printf '%s\n' 'nameserver 10.0.2.3' 'options single-request' > "$ROOT/etc/resolv.conf"
+fi
 cp "$BB" "$ROOT/bin/busybox"; chmod 755 "$ROOT/bin/busybox" 2>/dev/null || true
 APPLETS=$("$BB" --list 2>/dev/null || true)       # works when host arch == target arch
 [ -n "$APPLETS" ] || APPLETS="sh ash cat ls echo mkdir rmdir rm cp mv ln pwd ps kill sleep date uname env \
   head tail wc grep sed sort uniq tr cut chmod touch true false test [ expr basename dirname dmesg \
-  df free uptime whoami id hostname vi less more find xargs tee mount umount reboot poweroff halt"
+  df free uptime whoami id hostname vi less more find xargs tee mount umount reboot poweroff halt wget"
 # Applets are symlinks to busybox.  Some filesystems refuse symlinks (e.g. a Windows drive under WSL);
 # then the applet is skipped with a warning.  /bin/sh is never skipped: it gets a copy of the binary
 # when a symlink cannot be made, so the shell exists whatever the host filesystem supports.

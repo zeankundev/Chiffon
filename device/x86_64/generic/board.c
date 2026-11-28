@@ -11,9 +11,7 @@
 #include "drivers/pic_pit.h"
 #include "drivers/ata_pio.h"
 #include "drivers/x86_platform.h"
-#ifdef BOARD_QEMU
 #include "drivers/x86io.h"
-#endif
 
 #define COM1 0x3F8
 static struct bootmem memory;
@@ -126,7 +124,53 @@ const char *board_cmdline(void) { return cmdline_buf; }
 void board_console_putc(int c) { if (com1_ok) ns16550_io_putc(COM1, c); }
 int board_console_getc(void) { return com1_ok ? ns16550_io_getc(COM1) : -1; }
 
+static uint8_t cmos_read(uint8_t reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+static unsigned rtc_value(uint8_t value, int binary) {
+    return binary ? value : (value >> 4) * 10 + (value & 15);
+}
+
+static int leap_year(unsigned year) {
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+static uint64_t rtc_epoch(void) {
+    static const unsigned month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (unsigned attempt = 0; attempt < 10000; attempt++) {
+        if (cmos_read(0x0a) & 0x80) continue;           /* update in progress */
+        uint8_t sec = cmos_read(0), min = cmos_read(2), hour = cmos_read(4);
+        uint8_t day = cmos_read(7), month = cmos_read(8), year = cmos_read(9);
+        uint8_t century = cmos_read(0x32), status = cmos_read(0x0b);
+        if ((cmos_read(0x0a) & 0x80) || cmos_read(0) != sec) continue;
+        if (!(cmos_read(0x0d) & 0x80)) return 0;        /* RTC contents invalid */
+
+        int binary = status & 4, pm = hour & 0x80;
+        unsigned s = rtc_value(sec, binary), m = rtc_value(min, binary);
+        unsigned h = rtc_value(hour & 0x7f, binary);
+        if (!(status & 2)) {
+            if (h < 1 || h > 12) return 0;
+            h = h % 12 + (pm ? 12 : 0);
+        }
+        unsigned c = rtc_value(century, binary), yy = rtc_value(year, binary);
+        unsigned y = (c >= 19 && c <= 21 ? c : (yy < 70 ? 20 : 19)) * 100 + yy;
+        unsigned mo = rtc_value(month, binary), d = rtc_value(day, binary);
+        if (yy > 99 || y < 1970 || mo < 1 || mo > 12 || d < 1 ||
+            d > month_days[mo - 1] + (mo == 2 && leap_year(y)) ||
+            h >= 24 || m >= 60 || s >= 60) return 0;
+
+        uint64_t days = d - 1;
+        for (unsigned i = 1970; i < y; i++) days += 365 + leap_year(i);
+        for (unsigned i = 1; i < mo; i++) days += month_days[i - 1] + (i == 2 && leap_year(y));
+        return days * 86400 + h * 3600 + m * 60 + s;
+    }
+    return 0;
+}
+
 void board_init(void) {
+    clock_set_boot_epoch(rtc_epoch());
     pic_pit_init(HZ);
     if (com1_ok) driver_note("ns16550", "COM1 serial console 115200 8N1", DRV_CHAR);
     driver_note("pic-pit", "8259 PIC + 8254 PIT, 100 Hz tick", DRV_MISC);

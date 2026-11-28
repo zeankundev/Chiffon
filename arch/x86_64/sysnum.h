@@ -22,12 +22,14 @@
 #define SYS_sched_yield 24
 #define SYS_mremap 25
 #define SYS_madvise 28
+#define SYS_select 23
 #define SYS_dup 32
 #define SYS_dup2 33
 #define SYS_nanosleep 35
 #define SYS_getpid 39
 #define SYS_clone 56
 #define SYS_futex 202
+#define SYS_sched_getaffinity 204
 #define SYS_getcpu 309
 #define SYS_fork 57
 #define SYS_vfork 58
@@ -83,6 +85,7 @@
 #define SYS_readlinkat 267
 #define SYS_fchmodat 268
 #define SYS_faccessat 269
+#define SYS_pselect6 270
 #define SYS_ppoll 271
 #define SYS_set_robust_list 273
 #define SYS_dup3 292
