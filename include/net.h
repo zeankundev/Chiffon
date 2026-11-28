@@ -13,6 +13,8 @@
 struct netdev {
     const char *name;
     uint8_t mac[6];
+    /* The stack reuses its TX buffer after send returns. Copy the frame or
+     * finish consuming it before returning. The driver owns its DMA rings. */
     int (*send)(const uint8_t *frame, size_t len);   /* transmit one Ethernet frame: 0 or -errno */
     int (*poll)(void);                               /* deliver pending frames via net_input(): count */
     int (*link)(void);                               /* optional: 1 = carrier, 0 = none; NULL = always up.
@@ -24,7 +26,8 @@ int  net_attach(const struct netdev *dev);           /* a driver found a NIC: 0 
                                                       * first one that has carrier and answers DHCP. */
 size_t net_dump(char *buf, size_t n);                /* /proc/net/chiffon: interfaces, link state, IPv4 */
 size_t net_proc_dev(char *buf, size_t n);            /* /proc/net/dev: Linux-formatted interface stats */
-void net_input(const uint8_t *frame, size_t len);    /* one Ethernet frame from the driver */
+/* Consume one borrowed RX frame synchronously, before the driver recycles it. */
+void net_input(const uint8_t *frame, size_t len);
 int  vnet_probe(uintptr_t mmio_pa);                 /* drivers/aarch64/virtio_net.c */
 int  board_net_probe(void);                          /* board: attach the NIC(s); weak default: none */
 long net_syscall(long nr, long a0, long a1, long a2, long a3);   /* CSYS_net_* numbers */
