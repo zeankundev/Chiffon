@@ -967,7 +967,7 @@ static long sys_utimensat(long dirfd, uintptr_t up, uintptr_t utimes, int flags)
         persist_chmod(n);
     }
     else {
-        n->mtime = BOOT_EPOCH + ticks / HZ;
+        n->mtime = boot_epoch + ticks / HZ;
         persist_chmod(n);
     }
     return 0;
