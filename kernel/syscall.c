@@ -451,15 +451,11 @@ static long sys_execve(struct trapframe *tf, uintptr_t upathp, uintptr_t uargv, 
 }
 static long sys_clone(struct trapframe *tf, unsigned long flags, uintptr_t stack, uintptr_t ptid, uintptr_t tls, uintptr_t ctid) {
     if (flags & 0x100) {                              /* CLONE_VM: a thread (CLONE_THREAD) or vfork-style sharing */
-        if (!(flags & 0x10000)) return -ENOSYS;
-#if ARCH_AARCH64
+        if (!(flags & 0x10000)) return -ENOSYS;       /* bare CLONE_VM (vfork-style) not supported */
         int tid = proc_thread(tf, flags, stack, tls, ctid);
         if (tid < 0) return tid;
         if ((flags & 0x100000) && uwok(ptid, 4)) *(int *)ptid = tid;       /* CLONE_PARENT_SETTID */
         return tid;
-#else
-        return -ENOSYS;                               /* x86_64 threads need fs_base TLS support first */
-#endif
     }
     int pid = proc_fork(tf);
     if (pid < 0) return pid;

@@ -26,6 +26,7 @@
 #define SYS_dup2 33
 #define SYS_nanosleep 35
 #define SYS_getpid 39
+#define SYS_sendfile 40
 #define SYS_clone 56
 #define SYS_futex 202
 #define SYS_getcpu 309
@@ -49,6 +50,8 @@
 #define SYS_fsync 74
 #define SYS_fdatasync 75
 #define SYS_sync 162
+#define SYS_mount 165
+#define SYS_umount2 166
 #define SYS_fchmod 91
 #define SYS_umask 95
 #define SYS_gettimeofday 96

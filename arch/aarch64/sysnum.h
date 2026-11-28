@@ -7,9 +7,12 @@
 #define SYS_mkdirat 34
 #define SYS_unlinkat 35
 #define SYS_symlinkat 36
+#define SYS_umount2 39
+#define SYS_mount 40
 #define SYS_renameat 38
 #define SYS_faccessat 48
 #define SYS_chdir 49
+#define SYS_sendfile 71
 #define SYS_sync 81
 #define SYS_fsync 82
 #define SYS_fdatasync 83
