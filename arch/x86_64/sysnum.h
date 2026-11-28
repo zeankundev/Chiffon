@@ -107,6 +107,21 @@
 #define SYS_getsockopt 55
 #define SYS_accept4 288
 
+#define SYS_flock 73
+#define SYS_truncate 76
+#define SYS_ftruncate 77
+#define SYS_link 86
+#define SYS_fchown 92
+#define SYS_chown 93
+#define SYS_lchown 94
+#define SYS_getgroups 115
+#define SYS_setgroups 116
+#define SYS_statfs 137
+#define SYS_fstatfs 138
+#define SYS_fchownat 260
+#define SYS_linkat 265
+#define SYS_utimensat 280
+
 #define STAT_SIZE 144
 #define SIGACT_SIZE 32
 #define CLONE_CTID_ARG(a3, a4) (a3)

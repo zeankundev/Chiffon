@@ -625,6 +625,172 @@ static long do_poll(uintptr_t ufds, unsigned nfds, long tmo_ms) {
     }
 }
 
+static long sys_flock(long fd, int operation) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    return 0;
+}
+
+static long sys_ftruncate(long fd, long length) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    if (length < 0) return -EINVAL;
+    if (f->type != F_NODE) return -EINVAL;
+    if (f->node->readonly) return -EROFS;
+    f->node->size = length;
+    persist_chmod(f->node);
+    return 0;
+}
+
+static long sys_truncate(uintptr_t up, long length) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 1, abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    if (length < 0) return -EINVAL;
+    n->size = length;
+    persist_chmod(n);
+    return 0;
+}
+
+static long sys_link_common(const char* abs_o, const char* abs_n) {
+    struct node* src = node_find(abs_o);
+    if (!src) return -ENOENT;
+    if (node_find(abs_n)) return -EEXIST;
+    if (src->readonly || ro_parent(abs_n)) return -EROFS;
+    if (S_ISDIR(src->mode)) return -EPERM;
+    struct node* n = node_create(abs_n, src->mode);
+    if (!n) return -ENOMEM;
+    n->size = src->size;
+    n->data = src->data;
+    persist_node_created(n);
+    return 0;
+}
+
+static long sys_link(uintptr_t oldpath, uintptr_t newpath) {
+    char o[PATH_MAX], n[PATH_MAX], abs_o[PATH_MAX], abs_n[PATH_MAX];
+    int r;
+    if ((r = upath(oldpath, o)) || (r = upath(newpath, n))) return r;
+    if ((r = vfs_resolve(o, 1, abs_o)) || (r = vfs_resolve(n, 0, abs_n))) return r;
+    return sys_link_common(abs_o, abs_n);
+}
+
+static long sys_linkat(long olddirfd, uintptr_t oldpath, long newdirfd, uintptr_t newpath, int flags) {
+    char o[PATH_MAX], n[PATH_MAX], abs_o[PATH_MAX], abs_n[PATH_MAX];
+    int r;
+    if ((r = upath(oldpath, o)) || (r = upath(newpath, n))) return r;
+    if ((r = vfs_resolve(o, 1, abs_o)) || (r = vfs_resolve(n, 0, abs_n))) return r;
+    return sys_link_common(abs_o, abs_n);
+}
+
+static long sys_chown(uintptr_t up, uint32_t uid, uint32_t gid) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 1, abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    return 0;
+}
+
+static long sys_lchown(uintptr_t up, uint32_t uid, uint32_t gid) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 0, abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    return 0;
+}
+
+static long sys_fchown(long fd, uint32_t uid, uint32_t gid) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    if (f->type != F_NODE) return -EINVAL;
+    if (f->node->readonly) return -EROFS;
+    return 0;
+}
+
+static long sys_fchownat(long dirfd, uintptr_t up, uint32_t uid, uint32_t gid, int flags) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, !(flags & AT_SYMLINK_NOFOLLOW), abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    return 0;
+}
+
+static long put_statfs(uintptr_t ub) {
+    if (!uwok(ub, 120)) return -EFAULT;
+    uint64_t* b = (uint64_t*)ub;
+    memset(b, 0, 120);
+    b[0] = 0xef53;
+    b[1] = 4096;
+    b[2] = 262144;
+    b[3] = 200000;
+    b[4] = 200000;
+    b[5] = 100000;
+    b[6] = 80000;
+    return 0;
+}
+
+static long sys_statfs(uintptr_t up, uintptr_t ub) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, 1, abs))) return r;
+    if (!node_find(abs)) return -ENOENT;
+    return put_statfs(ub);
+}
+
+static long sys_fstatfs(long fd, uintptr_t ub) {
+    struct file* f = getfd(fd);
+    if (!f) return -EBADF;
+    return put_statfs(ub);
+}
+
+static long sys_utimensat(long dirfd, uintptr_t up, uintptr_t utimes, int flags) {
+    char p[PATH_MAX], abs[PATH_MAX];
+    int r = upath(up, p);
+    if (r) return r;
+    if ((r = vfs_resolve(p, !(flags & AT_SYMLINK_NOFOLLOW), abs))) return r;
+    struct node* n = node_find(abs);
+    if (!n) return -ENOENT;
+    if (n->readonly || ro_parent(abs)) return -EROFS;
+    if (utimes) {
+        if (!uok(utimes, 32)) return -EFAULT;
+        uint64_t* ts = (uint64_t*)utimes;
+        n->mtime = ts[2];
+        persist_chmod(n);
+    }
+    else {
+        n->mtime = BOOT_EPOCH + ticks / HZ;
+        persist_chmod(n);
+    }
+    return 0;
+}
+
+static long sys_getgroups(int size, uintptr_t list) {
+    if (size < 0) return -EINVAL;
+    if (size > 0) {
+        if (!uwok(list, 4)) return -EFAULT;
+        *(uint32_t*)list = 0;
+    }
+    return 1;
+}
+
+static long sys_setgroups(int size, uintptr_t list) {
+    if (size < 0 || size > 32) return -EINVAL;
+    return 0;
+}
+
 /* ---- dispatcher ---- */
 #ifdef SYSCALL_TRACE
 #define TRACE(...) kprintf(__VA_ARGS__)
@@ -677,6 +843,21 @@ static long handle(struct trapframe *tf, long no, long a0, long a1, long a2, lon
     case SYS_mprotect: return mm_protect(cur->mm, a0, a1, a2);
     case SYS_madvise: return 0;
     case SYS_mremap: return -ENOMEM;
+
+    case SYS_flock: return sys_flock(a0, a1);
+    case SYS_truncate: return sys_truncate(a0, a1);
+    case SYS_ftruncate: return sys_ftruncate(a0, a1);
+    case SYS_link: return sys_link(a0, a1);
+    case SYS_linkat: return sys_linkat(a0, a1, a2, a3, a4);
+    case SYS_chown: return sys_chown(a0, a1, a2);
+    case SYS_lchown: return sys_lchown(a0, a1, a2);
+    case SYS_fchown: return sys_fchown(a0, a1, a2);
+    case SYS_fchownat: return sys_fchownat(a0, a1, a2, a3, a4);
+    case SYS_statfs: return sys_statfs(a0, a1);
+    case SYS_fstatfs: return sys_fstatfs(a0, a1);
+    case SYS_utimensat: return sys_utimensat(a0, a1, a2, a3);
+    case SYS_getgroups: return sys_getgroups(a0, a1);
+    case SYS_setgroups: return sys_setgroups(a0, a1);
 
     case SYS_clone: return sys_clone(tf, a0, a1, a2, CLONE_TLS_ARG(a3, a4), CLONE_CTID_ARG(a3, a4));
     case SYS_futex: return sys_futex(a0, a1, a2, a3);
